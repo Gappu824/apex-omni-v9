@@ -1,0 +1,14 @@
+# Apex Omni v9 — RTX 4060 / i7-13650HX laptop
+# The scenario simulator needs ONLY numpy. Everything else is for live/training.
+
+numpy>=1.26
+
+# Broker (live + paper-with-live-quotes)
+kiteconnect>=5.0.1          # >=5.x exposes market_protection on place_order
+
+# Training stack (nightly_forge_v9 / SB3 policy in apex_main_v9)
+# For the RTX 4060 install the CUDA build first, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.2
+stable-baselines3>=2.3
+gymnasium>=0.29

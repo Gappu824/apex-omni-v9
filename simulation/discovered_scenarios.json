@@ -1,0 +1,12 @@
+{
+ "scenarios": [
+  {
+   "kind": "stale",
+   "hm": "09:25",
+   "dur_s": 82,
+   "date": "2026-06-17",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-06-17_0925"
+  }
+ ]
+}
