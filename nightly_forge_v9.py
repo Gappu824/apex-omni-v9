@@ -9,13 +9,23 @@ The four fixes that make "train on everything you've ever harvested" true:
   2. ONE FEATURE DIALECT. The replay pushes raw ticks through the exact
      core.market_state.StateBuilder the live brain runs. No second
      implementation exists to drift.
-  3. REALIZED-EXIT REWARD. Reward = simulated 1-lot option PnL of the trade the
-     strategy ACTUALLY makes: BUY at the mid (the engine posts a maker buy and
-     walks if unfilled), HOLD under the constitution's risk-managed exit — a
-     +BASE_TP_PCT target / -BASE_SL_PCT stop, whichever the bid touches first
+  3. REALIZED-EXIT REWARD, SHAPED TARGET. Reward = simulated 1-lot option PnL of
+     the trade the strategy ACTUALLY makes: BUY at the mid (the engine posts a
+     maker buy and walks if unfilled), HOLD under the constitution's risk-managed
+     exit — a SHAPED target / -BASE_SL_PCT stop, whichever the bid touches first
      over MAX_HOLD_MINUTES, else the theta-guillotine last bid — minus the full
-     Zerodha+statutory toll. This is the IDENTICAL triple-barrier rule the
-     meta-labeler grades on, so the SIDE (bandit) and SIZE (meta) models share
+     Zerodha+statutory toll. The target is the live PositionManager's, not a flat
+     +BASE_TP_PCT: entry + max(delta · expected_move, entry · BASE_TP_PCT), where
+     the 1σ expected move uses the REAL ATM IV Newton-inverted from the leg's own
+     mid, and is capped by the GEX walls (call_wall/put_wall) exactly as live —
+     both read from the macro vault archive the radar now persists. That same
+     archive is fit into the StateBuilder surface during replay (warm-started, the
+     way live fits it every tick), so the iv/delta/gamma/theta FEATURES are the
+     live ones too, not the seed surface. On days harvested before the archive
+     existed there is no snapshot: the surface stays seed and the room is uncapped
+     — the prior behaviour — so this is purely additive and sharpens as archived
+     days accumulate. This is the IDENTICAL shaped triple-barrier
+     the meta-labeler grades on, so the SIDE (bandit) and SIZE (meta) models share
      one realized payoff. It replaces the old REWARD_HORIZON_S (60s) symmetric
      mark, which graded a trade that is never held: at 60s the result is pure
      spread + cost, every entry "loses", and the model correctly collapses to
@@ -50,6 +60,16 @@ import config
 from core.instruments import AsOfMapper
 from core.market_state import StateBuilder
 from core.execution_engine import round_trip_costs
+from core.quant_core import implied_vol_newton, black76_greeks
+
+# The macro vault archive (per-strike IVs + GEX walls) the radar now persists.
+# If running an older macro_gex_v9 without it, the forge degrades cleanly to its
+# prior seed-surface / no-wall behaviour (load returns [] ⇒ every consumer no-ops).
+try:
+    from macro_gex_v9 import load_macro_archive
+except Exception:                                         # noqa: BLE001
+    def load_macro_archive(con, day, index):              # type: ignore
+        return []
 
 log = logging.getLogger("forge")
 
@@ -76,9 +96,65 @@ def spot_token_for(con, day: str, index: str) -> int | None:
                     (day, index)).fetchone()
     return int(r[0]) if r else None
 
+def _latest_at(lst, ptr_box, value, keyfn):
+    """Latest item in the time-sorted `lst` whose keyfn(item) <= value, via a
+    monotonically advancing pointer (callers sweep `value` upward). None when
+    `value` precedes the first item. A right-continuous step — the way the live
+    brain reads the latest published macro JSON."""
+    if not lst:
+        return None
+    p = ptr_box[0]
+    while p + 1 < len(lst) and keyfn(lst[p + 1]) <= value:
+        p += 1
+    ptr_box[0] = p
+    return lst[p] if keyfn(lst[p]) <= value else None
+
+
+def _make_surface_fitter():
+    """Reconstructs, during replay, the SVI surface the live brain fits every tick
+    from the macro radar's per-strike IVs (apex_main_v9.fit_surface). The forge
+    replay otherwise NEVER fits it, so iv/delta/gamma/theta — four of the nineteen
+    node features — train on the SVISurface DEFAULT (≈70-190% intraday IV vs the
+    real ~15%), a train/serve skew. Each NEW archived snapshot is fit once into the
+    shared StateBuilder, warm-started exactly as live converges over a 3-min macro
+    window: the first snapshot per (index,expiry) converges from DEFAULT over
+    PASSES_COLD passes, later ones refine the converged surface over PASSES_WARM.
+    No-op when `snap` is None (older days without an archive) ⇒ the forge keeps its
+    prior seed-surface behaviour, so this is purely additive. Validate the pass
+    counts on the box: a single fit does NOT converge on tiny intraday total
+    variance (the warm-start is why live's every-tick fit does)."""
+    fitted_ts: dict = {}
+    cold_done: set = set()
+    cold = int(getattr(config, "FORGE_SURFACE_FIT_PASSES_COLD", 150))
+    warm = int(getattr(config, "FORGE_SURFACE_FIT_PASSES_WARM", 12))
+    enabled = bool(getattr(config, "FORGE_SURFACE_FIT", True))
+
+    def fit(builder, index, expiry, T, snap):
+        if not (enabled and snap and snap.get("strikes")) or T <= 0:
+            return
+        key = (index, expiry)
+        if fitted_ts.get(key) == snap["ts"]:              # this snapshot already fit
+            return
+        spot = float(snap.get("spot") or 0.0)
+        F = spot * float(np.exp(config.RISK_FREE_RATE * T))
+        if F <= 0:
+            return
+        K = np.asarray(snap["strikes"], float)
+        iv = np.asarray(snap["iv"], float)
+        for _ in range(cold if key not in cold_done else warm):
+            builder.fit_surface(index, expiry, K, iv, F, T)
+        fitted_ts[key] = snap["ts"]
+        cold_done.add(key)
+
+    return fit
+
+
 def replay_day(con, day: str):
-    """Yields (ts, obs_5700, market) second by second through ONE shared
-    StateBuilder — identical to live."""
+    """Yields (ts, obs_5700, market, macro_now) second by second through ONE
+    shared StateBuilder — identical to live. macro_now[idx] is the latest archived
+    macro snapshot at-or-before ts (or None on days with no archive), carrying the
+    GEX walls the shaped-target cap reads; the surface is also fit from it here so
+    the obs iv/delta/gamma/theta are the live ones, not the seed surface."""
     mapper = AsOfMapper(dt.date.fromisoformat(day))
     if mapper.snapshot_used is None:
         log.warning("%s: no instrument snapshot ≤ this date — spot-only day "
@@ -92,10 +168,23 @@ def replay_day(con, day: str):
     builder = StateBuilder()
     cur_sec, snaps = None, {}
     chains: dict[str, dict] = {}
-    last_fit = 0
+    # macro archive (per-strike IVs + GEX walls): fit the REAL surface during
+    # replay and surface the walls for the shaped-target cap. [] on older days.
+    macro = {i: load_macro_archive(con, day, i) for i in config.INDEX_ORDER}
+    mptr = {i: [0] for i in config.INDEX_ORDER}
+    fit_surface = _make_surface_fitter()
+    _nsnap = {i: len(v) for i, v in macro.items() if v}
+    if _nsnap:
+        log.info("%s: macro archive HIT — %s snapshot(s) → REAL SVI surface fit + "
+                 "GEX-wall target cap ACTIVE", day,
+                 " ".join(f"{i}:{n}" for i, n in _nsnap.items()))
+    else:
+        log.info("%s: macro archive empty → seed surface, no wall cap (prior "
+                 "behaviour — run the new macro_gex_v9.py live to start recording)",
+                 day)
 
     def emit(sec):
-        market = {}
+        market, macro_now = {}, {}
         for idx in config.INDEX_ORDER:
             st = spot_toks.get(idx)
             sp = snaps.get(st) if st else None
@@ -110,6 +199,10 @@ def replay_day(con, day: str):
                 ch = mapper.chain(idx, sp["ltp"]) or ch
                 if ch:
                     chains[idx] = ch
+            snap = _latest_at(macro[idx], mptr[idx], sec, lambda s: s["ts"])
+            macro_now[idx] = snap
+            if ch and snap:                               # REAL surface before push
+                fit_surface(builder, idx, ch["expiry"], ch["T"], snap)
             entry = {"spot": sp}
             if ch:
                 legs = {}
@@ -122,38 +215,114 @@ def replay_day(con, day: str):
                               "lot": ch["lot"], "legs": legs})
             market[idx] = entry
         obs = builder.push(market, float(sec))
-        return obs, market
+        return obs, market, macro_now
 
     for ts, tok, ltp, bid, ask, bq, aq, vd, oi, ice in cur:
         sec = int(ts)
         if cur_sec is None:
             cur_sec = sec
         while sec > cur_sec:
-            obs, market = emit(cur_sec)
+            obs, market, macro_now = emit(cur_sec)
             if obs is not None:
-                yield cur_sec, obs, market
+                yield cur_sec, obs, market, macro_now
             cur_sec += 1
         snaps[tok] = {"ltp": ltp, "bid": bid, "ask": ask, "bid_qty": bq,
                       "ask_qty": aq, "vol_delta": vd, "oi": oi, "iceberg": ice}
     if cur_sec is not None:
-        obs, market = emit(cur_sec)
+        obs, market, macro_now = emit(cur_sec)
         if obs is not None:
-            yield cur_sec, obs, market
+            yield cur_sec, obs, market, macro_now
+
+
+def _session_minutes_left(ts):
+    """Minutes from the bar's IST wall-clock to the SESSION_CLOSE (15:30 IST),
+    clamped ≥1 — the `minutes_to_close` the live PositionManager feeds into the
+    expected move. `ts` is UTC epoch seconds (the vault stores the exchange
+    timestamp; on the IST trading host that is true UTC epoch). India has no DST,
+    fixed UTC+5:30, so IST-seconds-of-day = (ts + 19800) mod 86400. Vectorized."""
+    ch, cm = (int(x) for x in config.SESSION_CLOSE.split(":"))
+    close_sod = ch * 3600 + cm * 60
+    ist_sod = (np.asarray(ts, np.float64) + 19800.0) % 86400.0
+    return np.maximum((close_sod - ist_sod) / 60.0, 1.0)
+
+
+def _shaped_barriers(e, spot, K, T, mins, is_call, call_wall=None, put_wall=None):
+    """The live PositionManager.try_enter exit target, reproduced for the reward.
+
+        em        = spot · atm_iv · √(minutes_to_close / (252·375))   # 1σ move
+        spot_room = min(em, runway)                                   # GEX cap
+        prem_room = delta_at_entry · spot_room                        # → premium
+        target    = entry + max(prem_room, entry · BASE_TP_PCT)       # floored
+        stop      = entry · (1 − BASE_SL_PCT)                         # NOT widened
+
+    atm_iv is the REAL implied vol Newton-inverted from the ATM leg's OWN mid
+    (`e`); delta is Black-76 on that same iv, `abs(delta) or 0.4` exactly as live.
+    `runway` is the distance to the blocking GEX wall — (call_wall − spot) for a
+    call, (spot − put_wall) for a put — when a wall sits inside the move; otherwise
+    the room is the full `em`, which is exactly what live does with no wall. The
+    walls come from the macro archive (call_wall/put_wall); when none is archived
+    (older days) they are None and the cap is skipped — identical to before.
+    Vectorized (grid) or scalar (per-bar)."""
+    r = config.RISK_FREE_RATE
+    e = np.asarray(e, float); spot = np.asarray(spot, float)
+    K = np.asarray(K, float); T = np.maximum(np.asarray(T, float), 1e-6)
+    F = spot * np.exp(r * T)
+    iv = implied_vol_newton(e, F, K, T, is_call, r)
+    delta = np.abs(np.asarray(black76_greeks(F, K, T, iv, is_call, r)["delta"], float))
+    delta = np.where(delta > 1e-9, delta, 0.4)             # live: abs(q.delta) or 0.4
+    em = spot * iv * np.sqrt(np.maximum(mins, 1.0) / (252.0 * 375.0))
+    spot_room = em
+    if is_call and call_wall is not None and call_wall > 0:
+        runway = call_wall - spot                          # wall above ⇒ caps a call
+        spot_room = np.where(runway > 0, np.minimum(em, runway), em)
+    elif (not is_call) and put_wall is not None and put_wall > 0:
+        runway = spot - put_wall                            # wall below ⇒ caps a put
+        spot_room = np.where(runway > 0, np.minimum(em, runway), em)
+    prem_room = delta * spot_room
+    tp = e + np.maximum(prem_room, e * config.BASE_TP_PCT)
+    sl = e * (1.0 - config.BASE_SL_PCT)
+    return tp, sl
 
 
 def build_dataset(con, day: str):
-    """Returns obs (N,5700) and a premium table for cost-aware rewards:
-    prem[idx_i] = dict(ts → {leg: (bid, ask, lot)})."""
+    """Returns obs (N,5700) and a premium/barrier table for the realized-exit
+    reward: prem[idx_i] = dict(ts → {leg: (bid, ask, lot, tp, sl)}).
+
+    (tp, sl) are the SHAPED exit barriers the live PositionManager would arm for
+    a 1-lot ATM entry at that second — the +BASE_TP_PCT target WIDENED to the
+    expected-move premium room (delta × 1σ move over the remaining session, real
+    ATM IV from the leg's own mid), floored at base, with the fixed -BASE_SL_PCT
+    stop. So the bandit is now graded on the live asymmetric target (winners that
+    run to +60-70% on conviction days are scored as such) rather than a flat
+    +30% that understated exactly the trades the policy should learn to hold."""
     obs_list, ts_list, prem = [], [], {i: {} for i in config.INDEX_ORDER}
-    for ts, obs, market in replay_day(con, day):
+    for ts, obs, market, macro_now in replay_day(con, day):
         obs_list.append(obs); ts_list.append(ts)
+        mins = _session_minutes_left(ts)
         for idx, ctx in market.items():
             legs = ctx.get("legs") or {}
+            spot = float((ctx.get("spot") or {}).get("ltp") or 0.0)
+            T = float(ctx.get("T") or 0.0)
+            lot = ctx.get("lot", 0)
+            snap = (macro_now or {}).get(idx)
+            cw = snap.get("call_wall") if snap else None   # GEX walls cap the room
+            pw = snap.get("put_wall") if snap else None     # (None ⇒ no cap, as before)
             row = {}
             for leg in ("atm_ce", "atm_pe"):
                 s = (legs.get(leg) or {}).get("snap")
-                if s and s["bid"] and s["ask"]:
-                    row[leg] = (s["bid"], s["ask"], ctx.get("lot", 0))
+                if not (s and s["bid"] and s["ask"]):
+                    continue
+                bid, ask = s["bid"], s["ask"]
+                e = (bid + ask) / 2.0
+                K = float((legs.get(leg) or {}).get("strike") or 0.0)
+                if spot > 0 and K > 0 and T > 0 and e > 0:
+                    tp, sl = _shaped_barriers(e, spot, K, T, mins,
+                                              leg == "atm_ce", cw, pw)
+                    tp, sl = float(tp), float(sl)
+                else:                                     # missing context ⇒ base
+                    tp = e * (1.0 + config.BASE_TP_PCT)
+                    sl = e * (1.0 - config.BASE_SL_PCT)
+                row[leg] = (bid, ask, lot, tp, sl)
             if row:
                 prem[idx][ts] = row
     if not obs_list:
@@ -161,18 +330,16 @@ def build_dataset(con, day: str):
     return np.stack(obs_list), np.array(ts_list), prem
 
 
-def _exit_price_from_path(bids: np.ndarray, e: float):
-    """First-touch triple barrier on a forward BID path for a long entry at
-    price e. Returns the realized exit PRICE: the +BASE_TP_PCT target if the bid
-    reaches it before the -BASE_SL_PCT stop, the stop if hit first, else the last
-    valid bid (theta / max-hold exit). NaNs (data gaps) are skipped. Returns None
-    if the path holds no valid bid. This is the SAME rule the meta-labeler uses
-    in _gen_meta_samples — so the SIDE (bandit) and SIZE (meta) models are graded
-    on one identical realized payoff instead of two different rewards."""
+def _exit_price_from_path(bids: np.ndarray, tp: float, sl: float):
+    """First-touch triple barrier on a forward BID path for a long entry whose
+    SHAPED target is `tp` and stop is `sl` (computed at entry by _shaped_barriers).
+    Returns the realized exit PRICE: `tp` if the bid reaches it before `sl`, `sl`
+    if hit first, else the last valid bid (theta / max-hold exit). NaNs (data
+    gaps) are skipped. Returns None if the path holds no valid bid. Same rule the
+    meta-labeler uses in _gen_meta_samples — so the SIDE (bandit) and SIZE (meta)
+    models are graded on one identical realized payoff."""
     if bids.size == 0:
         return None
-    tp = e * (1.0 + config.BASE_TP_PCT)
-    sl = e * (1.0 - config.BASE_SL_PCT)
     hit_tp = bids >= tp
     hit_sl = bids <= sl
     itp = int(np.argmax(hit_tp)) if hit_tp.any() else None
@@ -192,22 +359,24 @@ def reward_fn(prem_idx: dict, ts: float, direction: int) -> float:
     exit, SELL at the triple-barrier exit price. ₹ per lot.
 
     This replaces the old REWARD_HORIZON_S (60s) symmetric mark: the policy is now
-    graded on the trade it ACTUALLY makes — a conviction entry held to a +BASE_TP_PCT
+    graded on the trade it ACTUALLY makes — a conviction entry held to its SHAPED
     target / -BASE_SL_PCT stop over MAX_HOLD_MINUTES (the theta guillotine) — rather
     than a cost-dominated snapshot it never holds. A 60s mark threw away the entire
     asymmetric payoff (cut losers at the stop, let winners run to the target), which
-    is why the model collapsed to abstention: on that metric every entry loses."""
+    is why the model collapsed to abstention: on that metric every entry loses.
+    The (tp, sl) carried on each row are the expected-move-shaped barriers from
+    build_dataset (see _shaped_barriers) — the live target, not a flat +30%."""
     leg = "atm_ce" if direction > 0 else "atm_pe"
     now = prem_idx.get(ts, {}).get(leg)
     if not now:
         return 0.0
-    bid0, ask0, lot = now
+    bid0, ask0, lot, tp, sl = now
     e = (bid0 + ask0) / 2.0
     horizon = int(config.MAX_HOLD_MINUTES * 60)
     bids = np.fromiter(
         (prem_idx.get(ts + k, {}).get(leg, (np.nan,))[0]
          for k in range(1, horizon + 1)), dtype=np.float64, count=horizon)
-    exitp = _exit_price_from_path(bids, e)
+    exitp = _exit_price_from_path(bids, tp, sl)
     if exitp is None:
         return 0.0
     return (exitp - e) * lot - round_trip_costs(e * lot, exitp * lot)
@@ -248,6 +417,20 @@ def _gen_meta_samples(con, day: str, index: str):
     budget = _kelly_budget(config.TRADING_CAPITAL)
     X, Y, R = [], [], []
     horizon = int(config.MAX_HOLD_MINUTES * 60)
+    # macro archive in t-space (t = seconds from the 09:15 open, like this loop):
+    # snapshot t = IST-seconds-of-day(snap) − open_sod. Fit the REAL surface here
+    # too so the meta-model's features (and the drift reference it seeds) are the
+    # live greeks, and read the GEX walls for the shaped-target cap. [] ⇒ no-op.
+    _oh, _om = (int(x) for x in config.SESSION_OPEN.split(":"))
+    _open_sod = _oh * 3600 + _om * 60
+    macro = load_macro_archive(con, day, index)
+    if macro:
+        log.debug("%s %s: meta-labeler on %d macro snapshot(s) — real surface + walls",
+                  day, index, len(macro))
+    for _s in macro:
+        _s["_t"] = int((_s["ts"] + 19800) % 86400) - _open_sod
+    mptr = [0]
+    fit_surface = _make_surface_fitter()
     for t in range(N):
         for tok, sn in by_sec.get(t, {}).items():
             snaps[tok] = sn
@@ -276,6 +459,9 @@ def _gen_meta_samples(con, day: str, index: str):
                                   "dte": chain["dte"], "T": chain["T"],
                                   "is_weekly": chain["is_weekly"],
                                   "legs": legs})
+        snap = _latest_at(macro, mptr, t, lambda s: s["_t"]) if macro else None
+        if chain and snap:                                # REAL surface before push
+            fit_surface(builder, index, chain["expiry"], chain["T"], snap)
         obs = builder.push(market, float(t))
         if obs is None or chain is None:
             continue
@@ -296,12 +482,25 @@ def _gen_meta_samples(con, day: str, index: str):
                 continue
             mid = (b_ + a_) / 2
             if mid * r["lot"] <= budget:
-                pick = (k, float(mid), int(r["lot"]))
+                pick = (k, float(mid), int(r["lot"]), float(r["strike"]))
                 break
         if pick is None:
             continue
-        k, e, lot = pick
-        tp, sl = e * (1 + config.BASE_TP_PCT), e * (1 - config.BASE_SL_PCT)
+        k, e, lot, Kstrike = pick
+        # SAME shaped target as the bandit reward (build_dataset/_shaped_barriers),
+        # so the meta-labeler's P(win) is the probability of hitting the exact
+        # barrier the SIDE model is graded on — not a flat +30%. minutes_to_close
+        # here is the 09:15→15:30 anchor: t is seconds-from-open (N=22500=375min).
+        mins_left = max((N - t) / 60.0, 1.0)
+        T_mlc = float(chain.get("T") or 0.0)
+        cw = snap.get("call_wall") if snap else None
+        pw = snap.get("put_wall") if snap else None
+        if spot > 0 and Kstrike > 0 and T_mlc > 0 and e > 0:
+            tp, sl = _shaped_barriers(e, spot, Kstrike, T_mlc, mins_left,
+                                      d == "CE", cw, pw)
+            tp, sl = float(tp), float(sl)
+        else:
+            tp, sl = e * (1 + config.BASE_TP_PCT), e * (1 - config.BASE_SL_PCT)
         seg = bidA[k, t + 1:t + 1 + horizon]
         if seg.size == 0 or np.all(np.isnan(seg)):
             continue
@@ -593,19 +792,18 @@ def _round_trip_costs_vec(buy_v, sell_v):
 
 
 def _barrier_exit_grid(bid_g: np.ndarray, ask_g: np.ndarray,
+                       tp_g: np.ndarray, sl_g: np.ndarray,
                        horizon: int) -> np.ndarray:
     """Vectorized first-touch triple barrier over a dense per-second grid. Entry
-    is the mid (bid+ask)/2 at each start; returns the realized exit PRICE for
-    every start at once (NaN where no valid entry or no valid forward bid). Same
-    rule as _exit_price_from_path, evaluated for all starts by sweeping the
-    forward offset and recording the first barrier each start touches. O(horizon
-    × grid) numpy ops — a few seconds for one trading day."""
+    is the mid (bid+ask)/2 at each start; tp_g/sl_g are the per-start SHAPED
+    barriers (from build_dataset). Returns the realized exit PRICE for every start
+    at once (NaN where no valid entry or no valid forward bid). Same rule as
+    _exit_price_from_path, evaluated for all starts by sweeping the forward offset
+    and recording the first barrier each start touches. O(horizon × grid)."""
     G = bid_g.shape[0]
     e = (bid_g + ask_g) / 2.0                             # mid entry per start
-    tp = e * (1.0 + config.BASE_TP_PCT)
-    sl = e * (1.0 - config.BASE_SL_PCT)
     exitp = np.full(G, np.nan)
-    done = np.isnan(e)                                    # no valid entry ⇒ NaN
+    done = np.isnan(e) | np.isnan(tp_g)                   # no valid entry ⇒ NaN
     last_bid = np.full(G, np.nan)
     maxj = min(horizon, G - 1)
     for j in range(1, maxj + 1):
@@ -613,10 +811,10 @@ def _barrier_exit_grid(bid_g: np.ndarray, ask_g: np.ndarray,
         b[:G - j] = bid_g[j:]                             # b[s] = bid at sec s+j
         valid = ~done & ~np.isnan(b)
         last_bid[valid] = b[valid]                        # latest bid in window
-        tgt = valid & (b >= tp)
-        stp = valid & (b <= sl)                           # tp>e>sl ⇒ never both
-        exitp[tgt] = tp[tgt]
-        exitp[stp] = sl[stp]
+        tgt = valid & (b >= tp_g)
+        stp = valid & (b <= sl_g)                         # tp>e>sl ⇒ never both
+        exitp[tgt] = tp_g[tgt]
+        exitp[stp] = sl_g[stp]
         done |= tgt | stp
         if done.all():
             break
@@ -629,7 +827,7 @@ def _reward_table(prem: dict, ts) -> np.ndarray:
     """(N, K, 2) realized after-cost ₹ for a 1-lot ATM trade at each second, per
     index, both directions: [...,0] = long CE (dir>0), [...,1] = long PE (dir<0).
     Uses the SAME triple-barrier realized exit as reward_fn / the meta-labeler
-    (mid entry, +BASE_TP_PCT / -BASE_SL_PCT barriers, MAX_HOLD_MINUTES hold), built
+    (mid entry, SHAPED tp / -BASE_SL_PCT stop, MAX_HOLD_MINUTES hold), built
     vectorized so the whole table is one cheap precompute rather than N×K×2 forward
     walks. Numerically identical to calling reward_fn per cell (asserted in tests)."""
     K, N = len(config.INDEX_ORDER), len(ts)
@@ -642,22 +840,25 @@ def _reward_table(prem: dict, ts) -> np.ndarray:
             continue
         smin, smax = min(pidx), max(pidx)
         G = smax - smin + 1
-        grids = {leg: [np.full(G, np.nan), np.full(G, np.nan), np.zeros(G)]
+        grids = {leg: [np.full(G, np.nan), np.full(G, np.nan), np.zeros(G),
+                       np.full(G, np.nan), np.full(G, np.nan)]
                  for leg in ("atm_ce", "atm_pe")}
         for s, row in pidx.items():
             g = s - smin
             for leg in ("atm_ce", "atm_pe"):
                 if leg in row:
-                    b, a, lot = row[leg]
+                    b, a, lot, tp, sl = row[leg]
                     grids[leg][0][g] = b
                     grids[leg][1][g] = a
                     grids[leg][2][g] = lot
+                    grids[leg][3][g] = tp
+                    grids[leg][4][g] = sl
         gpos = ts_i - smin
         inside = np.nonzero((gpos >= 0) & (gpos < G))[0]
         gp = gpos[inside]
         for d_idx, leg in ((0, "atm_ce"), (1, "atm_pe")):
-            bid_g, ask_g, lot_g = grids[leg]
-            ex = _barrier_exit_grid(bid_g, ask_g, horizon)        # (G,)
+            bid_g, ask_g, lot_g, tp_g, sl_g = grids[leg]
+            ex = _barrier_exit_grid(bid_g, ask_g, tp_g, sl_g, horizon)  # (G,)
             e = (bid_g + ask_g) / 2.0
             pnl = (ex - e) * lot_g - _round_trip_costs_vec(e * lot_g, ex * lot_g)
             good = ~np.isnan(pnl[gp])
@@ -826,6 +1027,33 @@ def train_bandit(model, vec, obs, ts, prem, vobs, vts, vprem, log) -> None:
             "train_trade_rate": tr_rate, "holdout_trade_rate": hv_rate}
 
 
+def _score_incumbent_on(vo, vt, vp, log):
+    """Re-score the currently-PROMOTED model on the SAME held-out day the
+    candidate is graded on, so the two are compared apples-to-apples instead of
+    against a score the incumbent earned on a different day (and possibly a
+    different reward). Loads the manifest's model+norm pair, runs the identical
+    evaluate() harness, returns ₹ — or None if there is no incumbent or it can't
+    be loaded (caller then falls back to the stored score / the heuristic)."""
+    if not config.MODEL_MANIFEST.exists():
+        return None
+    try:
+        man = json.loads(config.MODEL_MANIFEST.read_text())
+        mp = config.MODEL_DIR / man.get("model", "")
+        npth = config.MODEL_DIR / man.get("norm", "")
+        if not (mp.exists() and npth.exists()):
+            return None
+        inc_env = DummyVecEnv([lambda: ForgeEnv(vo, vt, vp)])
+        inc_vec = VecNormalize.load(str(npth), inc_env)
+        inc_vec.training = False
+        inc_model = SAC.load(str(mp), device="cpu")      # CPU: tiny eval, no GPU fight
+        return float(evaluate(inc_model, inc_vec, vo, vt, vp))
+    except Exception as e:                                # noqa: BLE001
+        log.warning("incumbent re-score failed (%s) — using its stored val_score "
+                    "for the bar instead (share the brain's model-load snippet "
+                    "and I'll match it for a clean same-day benchmark)", e)
+        return None
+
+
 def main():
     con = sqlite3.connect(config.DB_PATH)
     days = trading_days(con)
@@ -833,11 +1061,19 @@ def main():
         raise SystemExit("Need ≥2 harvested days (train + held-out).")
     val_day = days[-1]
     pool = days[:-1]
-    recent = pool[-config.FORGE_LOOKBACK_DAYS:]
-    older = pool[:-config.FORGE_LOOKBACK_DAYS]
-    train_days = recent + random.sample(older, min(len(older),
-                                                   config.FORGE_RESERVOIR_DAYS))
-    log.info("train days %s | held-out %s", train_days, val_day)
+    # TRAIN ON ALL DATA: every harvested day except the held-out one feeds the
+    # candidate — no lookback cap, no reservoir subsample. With a small history
+    # this is trivially "all of it"; once the day count grows large enough that
+    # the per-day dataset build (~replay cost, linear in days) becomes the
+    # wall-clock bottleneck, re-enable a FORGE_LOOKBACK_DAYS + FORGE_RESERVOIR_DAYS
+    # split here. The bandit trainer itself is O(rows) on the GPU, so the binding
+    # cost is the replay/build, not the fit.
+    cap = getattr(config, "FORGE_MAX_TRAIN_DAYS", 0)     # 0 ⇒ unbounded (all days)
+    train_days = pool if cap <= 0 else (
+        pool[-cap:] + random.sample(pool[:-cap],
+                                    min(len(pool[:-cap]),
+                                        config.FORGE_RESERVOIR_DAYS)))
+    log.info("train days %s (all data) | held-out %s", train_days, val_day)
 
     # 1) META-LABELER first — numpy-only, needs no GPU, feeds Kelly tomorrow
     try:
@@ -932,12 +1168,27 @@ def main():
              val_day, score, heur, diag["train_trade_rate"] * 100,
              diag["holdout_trade_rate"] * 100)
 
-    incumbent = -1e18
+    # BENCHMARK THE TWO MODELS ON THE SAME DAY. Re-score the currently-promoted
+    # model on THIS held-out day (not the stored score from whatever day it was
+    # promoted on) so candidate-vs-incumbent is apples-to-apples. Fall back to the
+    # stored score only if the incumbent can't be loaded, and to the heuristic when
+    # there is no incumbent at all.
+    inc_today = _score_incumbent_on(vo, vt, vp, log)
+    inc_stored = -1e18
     if config.MODEL_MANIFEST.exists():
-        incumbent = json.loads(config.MODEL_MANIFEST.read_text()).get(
-            "val_score", -1e18)
+        inc_stored = float(json.loads(config.MODEL_MANIFEST.read_text()).get(
+            "val_score", -1e18))
+    if inc_today is not None:
+        incumbent, inc_src = inc_today, "re-scored on this held-out day"
+    elif inc_stored > -1e17:
+        incumbent, inc_src = inc_stored, "stored val_score (could not reload)"
+    else:
+        incumbent, inc_src = -1e18, "none yet"
     has_champ = incumbent > -1e17
-    champ_str = f"₹{incumbent:+,.2f}" if has_champ else "none yet"
+    champ_str = f"₹{incumbent:+,.2f} ({inc_src})" if has_champ else "none yet"
+    if has_champ:
+        log.info("incumbent benchmarked on %s: ₹%.2f (%s) | candidate ₹%.2f",
+                 val_day, incumbent, inc_src, score)
 
     # ALWAYS save the candidate and record its score, promoted or not, so every
     # model is kept and the held-out curve stays visible over time (the old code

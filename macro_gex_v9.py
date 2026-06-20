@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import sqlite3
 import tempfile
 import time
 from collections import deque
@@ -68,6 +69,103 @@ def atomic_write(path: str, payload: dict):
     with os.fdopen(fd, "w") as f:
         json.dump(payload, f)
     os.replace(tmp, path)
+
+
+# --------------------------------------------------------------- vault archive
+# WHY THIS EXISTS. The live brain fits its per-expiry SVI surface from the macro
+# radar's full per-strike IVs (apex_main_v9.fit_surface ← mac["strikes"]/["iv"]),
+# and shapes every exit target with the GEX walls (call_wall / put_wall). The
+# nightly forge replays raw ticks but has NO macro JSON for a past second — it is
+# overwritten every loop — so its StateBuilder surface is never fit: iv/delta/
+# gamma/theta train on the SVISurface DEFAULT (≈70-190% intraday IV, not the real
+# ~15%), and the reward's shaped target falls back to the no-wall expected move.
+# Persisting each snapshot to the SAME tick vault, timestamped, lets the forge
+# reconstruct the real surface and the real walls AS OF each second — closing a
+# train/serve skew across the four greeks features and the target's wall cap.
+# Future tape only (you can't archive a past macro state); start now.
+#
+# Best-effort by construction: the vault write is wrapped so a locked/again-busy
+# DB can NEVER delay or break the live JSON the brain reads. WAL + busy_timeout
+# let it coexist with the harvester writing ticks to the same file.
+MACRO_ARCHIVE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS macro_snapshots_v9 (
+    ts_ms       INTEGER, index_name TEXT, spot REAL, expiry TEXT, dte REAL,
+    flip        REAL, flip_width REAL, call_wall REAL, put_wall REAL,
+    net_gex     REAL, net_dex REAL, pcr REAL, max_pain REAL,
+    atm_iv      REAL, iv_rank REAL, strikes_json TEXT, iv_json TEXT,
+    PRIMARY KEY (ts_ms, index_name));
+CREATE INDEX IF NOT EXISTS idx_macro_idx_ts
+    ON macro_snapshots_v9 (index_name, ts_ms);
+"""
+_MACRO_COLS = ("ts_ms", "index_name", "spot", "expiry", "dte", "flip",
+               "flip_width", "call_wall", "put_wall", "net_gex", "net_dex",
+               "pcr", "max_pain", "atm_iv", "iv_rank", "strikes_json", "iv_json")
+
+
+class MacroArchive:
+    """Persists each radar snapshot to the tick vault (config.DB_PATH). One lazy
+    connection, reused; ts stored as ts_ms to match ticks_v9 so the forge can
+    line snapshots up with ticks on the same clock."""
+
+    def __init__(self):
+        self.con: sqlite3.Connection | None = None
+
+    def _ensure(self) -> sqlite3.Connection:
+        if self.con is None:
+            con = sqlite3.connect(str(config.DB_PATH), timeout=5.0,
+                                  check_same_thread=False)
+            con.execute("PRAGMA journal_mode=WAL;")
+            con.execute("PRAGMA busy_timeout=5000;")     # wait, don't error, on lock
+            con.executescript(MACRO_ARCHIVE_SCHEMA)
+            self.con = con
+        return self.con
+
+    def write(self, p: dict) -> None:
+        try:
+            con = self._ensure()
+            row = (int(float(p["ts"]) * 1000), p["index"], p.get("spot"),
+                   p.get("expiry"), p.get("dte"), p.get("flip"),
+                   p.get("flip_width"), p.get("call_wall"), p.get("put_wall"),
+                   p.get("net_gex"), p.get("net_dex"), p.get("pcr"),
+                   p.get("max_pain"), p.get("atm_iv"), p.get("iv_rank"),
+                   json.dumps(p.get("strikes") or []),
+                   json.dumps(p.get("iv") or []))
+            con.execute(
+                f"INSERT OR REPLACE INTO macro_snapshots_v9 VALUES "
+                f"({','.join('?' * len(_MACRO_COLS))})", row)
+            con.commit()
+        except Exception as e:                            # noqa: BLE001
+            log.warning("macro vault archive skipped (live JSON unaffected): %s", e)
+
+
+_ARCHIVE = MacroArchive()
+
+
+def load_macro_archive(con: sqlite3.Connection, day: str, index: str) -> list[dict]:
+    """Forge-side reader. Every archived snapshot for (day, index), oldest first,
+    strikes/iv parsed back to lists. The replay uses the latest snapshot
+    at-or-before each second — a right-continuous step, exactly how the brain
+    reads the latest published JSON — to fit the surface and read the walls.
+    Returns [] when nothing was archived (older days): the forge then keeps its
+    current seed-surface / no-wall behaviour, so this is purely additive."""
+    try:
+        rows = con.execute(
+            "SELECT ts_ms, spot, expiry, dte, call_wall, put_wall, atm_iv, "
+            "iv_rank, pcr, max_pain, net_gex, strikes_json, iv_json "
+            "FROM macro_snapshots_v9 WHERE index_name=? AND "
+            "date(ts_ms/1000,'unixepoch','localtime')=? ORDER BY ts_ms",
+            (index, day)).fetchall()
+    except sqlite3.OperationalError:                      # table absent ⇒ no archive
+        return []
+    out = []
+    for (ts_ms, spot, expiry, dte, cw, pw, aiv, ivr, pcr, mp, ng,
+         sj, ij) in rows:
+        out.append({"ts": ts_ms / 1000.0, "spot": spot, "expiry": expiry,
+                    "dte": dte, "call_wall": cw, "put_wall": pw, "atm_iv": aiv,
+                    "iv_rank": ivr, "pcr": pcr, "max_pain": mp, "net_gex": ng,
+                    "strikes": json.loads(sj or "[]"),
+                    "iv": json.loads(ij or "[]")})
+    return out
 
 
 def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
@@ -187,6 +285,7 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
                "strikes": K.tolist(), "iv": iv.round(4).tolist(),
                "gex": gex.round(2).tolist(), "doi15": doi15}
     atomic_write(config.MACRO_STATE_TMPL.format(idx=index), payload)
+    _ARCHIVE.write(payload)                               # vault: forge surface + walls
     log.info("%s spot %.1f flip %s±%s walls %s/%s PCR %s maxpain %s "
              "IVrank %s netGEX %.2e",
              index, spot, f"{flip:.0f}" if flip else "—",
