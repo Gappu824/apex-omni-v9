@@ -544,6 +544,9 @@ VOL_FCAST_MIN_SAMPLES = 120   # intraday IV samples before a forecast is trusted
 VOL_FCAST_REVERT_K    = 0.15  # per-step mean-reversion strength toward recent IV
 VOL_FCAST_CRUSH_Z     = 1.5   # |z| of IV vs its band beyond which crush/expansion
 #                               is flagged (drives the regime layer + exit shaping)
+VOL_FCAST_SD_FLOOR_FRAC = 0.05  # floor the IV-band std at this fraction of the IV
+#                               level so a dead-calm day can't saturate the z-score
+#                               on noise and jam the regime (raise → less sensitive)
 VOL_FCAST_MODEL_PATH  = str(STATE_DIR / "vol_forecast_model.json")  # learned
 #                               mean-reversion + vol-of-vol params, refit nightly
 
@@ -553,12 +556,27 @@ VOL_FCAST_MODEL_PATH  = str(STATE_DIR / "vol_forecast_model.json")  # learned
 # start fixed and are refit nightly to the empirical percentiles of THIS market.
 REGIME_TE_TREND     = 0.55    # |trend efficiency| ≥ this → trending (fallback)
 REGIME_TE_CHOP      = 0.30    # |trend efficiency| ≤ this → chop (fallback)
-REGIME_GEX_SQUEEZE  = -2.0e12 # net GEX ≤ this (deep negative) → squeeze-prone
+REGIME_GEX_SQUEEZE  = -2.0e10 # net GEX ≤ this (deep negative) → squeeze-prone.
+#                               Net GEX in THIS market lives at the e10 scale (the
+#                               nightly refit's 20th pct logged ≈ -1.6e10); the old
+#                               -2e12 was ~100× too extreme and never fired. This
+#                               fixed fallback sits just below the typical 20th pct
+#                               so it means "deep". SANITY-CHECK against your own
+#                               net_gex distribution and adjust if your scale differs.
 REGIME_RV_HIGH      = 0.22    # realized vol (annualized) ≥ this → high-vol
 REGIME_WALL_PROX_PCT = 0.004  # within this % of a GEX wall counts as "at a wall"
 REGIME_MIN_SAMPLES  = 300     # feature rows before percentile refit is trusted
 REGIME_MODEL_PATH   = str(STATE_DIR / "regime_model.json")
 REGIME_FEATURE_LOG  = str(STATE_DIR / "regime_features.jsonl")
+REGIME_LOG_EVERY_S  = 30      # write at most one feature row per index per N s
+#                               (keeps the JSONL append off the live hot path;
+#                               30 s snapshots are plenty for percentile fitting)
+REGIME_FEATURE_LOG_MAX = 60000  # cap retained feature rows (read + on-disk trim);
+#                               ~tens of sessions of history, refit needs only 300
+REGIME_HYSTERESIS_N = 1       # consecutive ticks on a NEW regime before switching.
+#                               1 = OFF (stateless, current behaviour). Raise to
+#                               2–3 to kill single-tick label/multiplier flicker
+#                               near a cut boundary.
 # conviction multipliers per regime (scale the brain's conviction; 1.0 = neutral)
 REGIME_MULT_TREND   = 1.15    # clean trend → momentum favored
 REGIME_MULT_CHOP    = 0.70    # chop → momentum bleeds, dampen

@@ -142,7 +142,14 @@ def forecast(index: str, iv_now: float,
     # restrict to the trailing window that matters (most recent session-ish)
     iv_recent = iv[-config.VOL_FCAST_MIN_SAMPLES * 3:]
     mu = float(np.mean(iv_recent))
-    sd = float(np.std(iv_recent)) or 1e-6
+    # Floor the dispersion at a fraction of the IV LEVEL. On a calm day the raw
+    # std collapses toward zero, which made the z-score saturate on noise and flip
+    # the regime every tick; requiring a deviation of at least a few % of the IV
+    # level keeps CRUSH/EXPANSION meaning a genuine move, not jitter.
+    raw_sd = float(np.std(iv_recent))
+    sd = max(raw_sd,
+             float(getattr(config, "VOL_FCAST_SD_FLOOR_FRAC", 0.05)) * abs(mu),
+             1e-6)
 
     # --- driver 1: mean-reversion (learned coefficient, else fixed fallback) ---
     params = _load_model()

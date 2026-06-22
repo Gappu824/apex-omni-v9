@@ -476,12 +476,19 @@ def main():
             vfc = None
             try:
                 from core.vol_forecaster import forecast as _vol_fcast
-                T_y = float(ctx_m.get("T", 0.02))
-                vfc = _vol_fcast(idx,
-                                 builder.surface.atm_iv(idx, ctx_m.get("expiry", ""), T_y),
-                                 front_iv=(mac or {}).get("atm_iv"),
-                                 next_iv=(mac or {}).get("atm_iv_next"),
-                                 dte=(mac or {}).get("dte"))
+                # iv_now MUST be the SAME series the forecaster learned from — the
+                # macro Newton ATM IV that macro_gex feeds to append_intraday_sample
+                # AND republishes as mac["atm_iv"]. Passing the SVI SURFACE value
+                # here compared two different IV estimators inside the z-score; the
+                # surface reads persistently higher than the macro inversion, so z
+                # stayed pinned > CRUSH_Z and the regime jammed on VOL_CRUSH. Use
+                # the macro value so z measures a REAL intraday IV deviation.
+                _iv_now = (mac or {}).get("atm_iv")
+                if _iv_now is not None:
+                    vfc = _vol_fcast(idx, float(_iv_now),
+                                     front_iv=(mac or {}).get("atm_iv"),
+                                     next_iv=(mac or {}).get("atm_iv_next"),
+                                     dte=(mac or {}).get("dte"))
             except Exception:                              # noqa: BLE001
                 vfc = None
             rv = realized_vol_ann.get(idx)
@@ -492,7 +499,12 @@ def main():
                 put_wall=(mac or {}).get("put_wall"),
                 iv_rank=(mac or {}).get("iv_rank"), realized_vol=rv,
                 vol_regime=(vfc.regime if vfc else None),
-                vol_z=(vfc.z if vfc else None))
+                vol_z=(vfc.z if vfc else None),
+                # SIGNED net move over the window → TREND_UP/DOWN reflects actual
+                # price direction (not spot-vs-flip), so JUDGE's per-regime stats
+                # are trustworthy. `index` enables hysteresis when configured.
+                trend_sign=(1 if sh[-1] >= sh[0] else -1) if len(sh) >= 2 else 0,
+                index=idx)
             regime_now[idx] = regime
             conv = conv * regime.conv_mult                 # scale, never veto
             # signal-PERSISTENCE tracking: a "confident" trade is one where the
