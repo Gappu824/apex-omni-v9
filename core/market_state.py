@@ -32,12 +32,19 @@ assert len(FEATURE_NAMES) == config.FEATURES_PER_NODE
 
 LEG_ORDER = ["spot", "atm_ce", "atm_pe", "otm_ce", "otm_pe"]
 
+# dealer_inv integrates signed flow over wall-time; clamp the per-update dt so a
+# gap in the tape (a session boundary, or a second with no ticks during forge
+# replay) can't nuke or spike the accumulator. Deliberately NOT a config.py
+# constant: it is an integration guard, not a trained-artifact parameter, so
+# tuning it must not change CONFIG_HASH and invalidate every drift reference.
+_DEALER_INV_MAX_DT_S = 5.0
+
 
 class _Trackers:
     """Per-leg stateful physics. Same code path everywhere."""
     __slots__ = ("vol", "vpin", "hawkes", "last_ltp", "ew_voldelta",
                  "ofi_hist", "dealer_inv", "last_bid", "last_ask",
-                 "last_bq", "last_aq", "oi_hist")
+                 "last_bq", "last_aq", "oi_hist", "last_ts", "last_side")
 
     def __init__(self):
         self.vol = EWMAVol(config.EWMA_VOL_HALFLIFE_S)
@@ -47,6 +54,8 @@ class _Trackers:
         self.ew_voldelta = 1.0          # self-normalizing expected volume/s
         self.ofi_hist = deque(maxlen=config.OFI_WINDOW_TICKS)
         self.dealer_inv = 0.0           # decayed signed aggressive flow
+        self.last_ts = None             # wall-clock of last update (dt for decay)
+        self.last_side = 0.0            # tick-test: prevailing sign carried on flats
         self.last_bid = self.last_ask = 0.0
         self.last_bq = self.last_aq = 0.0
         self.oi_hist = deque(maxlen=config.OI_DELTA_WINDOW_S)  # (ts, oi) ΔOI window
@@ -104,10 +113,29 @@ class StateBuilder:
         ofi_z = float(np.clip((ofi - mu) / sd, -4, 4))
         t.last_bid, t.last_ask, t.last_bq, t.last_aq = bid, ask, bq, aq
 
-        # dealer inventory: decayed tick-rule signed flow, tanh-bounded
-        # (audit: v8's unbounded sum that the live brain never even set)
-        side = 1.0 if log_ret >= 0 else -1.0
-        t.dealer_inv = config.DEALER_INV_DECAY * t.dealer_inv + side * vol_d / max(t.ew_voldelta, 1.0)
+        # dealer inventory: wall-time-decayed signed flow, tanh-bounded.
+        #   • TICK TEST for direction. The old `>= 0 ⇒ +1` rule voted every
+        #     unchanged-price tick as a BUY, so the feature's mean scaled with the
+        #     RATE of flat ticks — and a fine feeder (the live brain, ~0.2 s loop)
+        #     sees far more flat ticks than a coarse one (the forge replay, 1 s).
+        #     A flat tick now carries the PREVAILING side (Lee–Ready tick test),
+        #     which has no directional bias yet keeps the flat-tick VOLUME — so the
+        #     net signed flow per second is the same however finely it's sampled.
+        #   • decay and the flow increment are integrated over wall-time dt: the
+        #     update is byte-identical at the forge's 1 s cadence (dt = 1 ⇒ decay
+        #     0.995, increment ×1) yet rate-invariant at any other cadence.
+        # Together these kill the train/serve skew that pinned dealer_inv adrift —
+        # a fixed +offset, live vs the 1 Hz-built reference, invariant to regime.
+        if log_ret > 0:
+            t.last_side = 1.0
+        elif log_ret < 0:
+            t.last_side = -1.0
+        side = t.last_side
+        dt = 1.0 if t.last_ts is None else \
+            min(max(ts - t.last_ts, 0.0), _DEALER_INV_MAX_DT_S)
+        t.last_ts = ts
+        t.dealer_inv = (config.DEALER_INV_DECAY ** dt) * t.dealer_inv \
+            + side * (vol_d / max(t.ew_voldelta, 1.0)) * dt
         dealer_inv = math.tanh(t.dealer_inv / config.DEALER_INV_SCALE)
 
         # 15-min ΔOI, normalized

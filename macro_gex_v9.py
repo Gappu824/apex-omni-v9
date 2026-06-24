@@ -15,6 +15,11 @@ APEX OMNI v9 — MACRO GEX RADAR (audit §7 leaps)
     dealers-long-calls / short-puts book with a clear log line saying so.
   * Atomic temp→rename JSON (kept from v8 — it was right).
 GPU optional: numpy is plenty for ~200 strikes; torch is used if present.
+
+v9.1: the per-snapshot surface/GEX math is factored into assemble_snapshot()
+so the historical backfill (tools/backfill_macro.py) reconstructs past days by
+calling the EXACT same function the live radar uses — one implementation, zero
+train/serve drift. The live path (compute_index) is unchanged in behaviour.
 """
 from __future__ import annotations
 import datetime as dt
@@ -168,49 +173,58 @@ def load_macro_archive(con: sqlite3.Connection, day: str, index: str) -> list[di
     return out
 
 
-def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
-    spot_sym = config.INDICES[index]["spot_symbol"]
-    spot = float(kite.ltp([spot_sym])[spot_sym]["last_price"])
-    rows = mapper.by_index.get(index, [])
-    if not rows or spot <= 0:
-        return
-    exps = sorted({r["expiry"] for r in rows if r["expiry"] >= dt.date.today()})
-    if not exps:
-        return
-    exp = exps[0]
-    band = [r for r in rows if r["expiry"] == exp
-            and abs(r["strike"] - spot) / spot <= config.MACRO_STRIKE_BAND]
-    if len(band) < 8:
-        return
-    lot = band[0]["lot"]
-    dte = max((exp - dt.date.today()).days, 0) + config.DTE_PART_DAY
-    T = dte / 365.0
+# IV-pin rejection. implied_vol_newton clamps sigma to [_IV_FLOOR, _IV_CEIL]; a
+# vol that comes back pinned at (or beside) a clamp means the input price was
+# outside the no-arbitrage range — a stale or one-sided quote, not a real vol.
+# Its gamma (∝ 1/sigma) would explode and poison net_gex and the wall picks, which
+# is exactly what the thin BSE chains (SENSEX/BANKEX) do when a missing book falls
+# back to a stale last price. assemble_snapshot drops any strike outside the
+# trusted band before any greek is taken. Tied to the solver clamp so they cannot
+# drift apart.
+_IV_FLOOR = 0.01
+_IV_CEIL = 4.0
+_IV_MIN_VALID = 0.02       # 2% — below this the solve has pinned to the floor
+_IV_MAX_VALID = 3.0        # 300% — above this it has pinned to the ceiling
+_MIN_VALID_CONTRACTS = 6   # too few real strikes survive ⇒ skip the snapshot
+
+
+def assemble_snapshot(*, ts, index, spot, exp, dte, K, mid, oi, is_call, lot,
+                      s_call, s_put):
+    """PURE surface/GEX math — no I/O, no module globals. Shared verbatim by the
+    live radar (compute_index) and the historical backfill so replayed snapshots
+    are numerically identical to what a live run would have published.
+
+    Inputs are per-contract arrays already collapsed to a single expiry:
+        K, mid, oi, is_call  — strike / option mid price / open interest / CE?
+        lot                  — contract lot size for that index
+        dte                  — calendar DTE (+ intraday remainder)
+        s_call, s_put        — dealer sign convention
+
+    Returns (payload, K_arr, iv_arr, gex_arr). `payload` carries every column the
+    vault archive stores; iv_rank is left None (the live path fills it from the
+    daily IV-history file; the forge does not read iv_rank from the vault). The
+    raw arrays are handed back so the live path can attach its JSON-only extras
+    (per-strike gex, ΔOI-15m)."""
+    K = np.asarray(K, float); prem = np.asarray(mid, float)
+    oi = np.asarray(oi, float); is_call = np.asarray(is_call, bool)
+    T = max(dte, 0.0) / 365.0
     F = spot * math.exp(config.RISK_FREE_RATE * T)
 
-    keys = [f'{r["exchange"]}:{r["symbol"]}' for r in band]
-    quotes = {}
-    for i in range(0, len(keys), config.MACRO_QUOTE_CHUNK):
-        quotes.update(kite.quote(keys[i:i + config.MACRO_QUOTE_CHUNK]))
-        time.sleep(1.05)                                # quote API: 1 req/s
-    K, prem, oi, is_call = [], [], [], []
-    for r, key in zip(band, keys):
-        q = quotes.get(key)
-        if not q:
-            continue
-        d = q.get("depth") or {}
-        b = (d.get("buy") or [{}])[0].get("price") or 0
-        a = (d.get("sell") or [{}])[0].get("price") or 0
-        mid = (b + a) / 2 if b and a else q.get("last_price") or 0
-        if mid <= 0:
-            continue
-        K.append(r["strike"]); prem.append(mid)
-        oi.append(float(q.get("oi") or 0)); is_call.append(r["itype"] == "CE")
-    if len(K) < 8:
-        return
-    K = np.array(K); prem = np.array(prem)
-    oi = np.array(oi); is_call = np.array(is_call)
+    iv = implied_vol_newton(prem, F, K, T, is_call, config.RISK_FREE_RATE,
+                            lo=_IV_FLOOR, hi=_IV_CEIL)
+    # Drop strikes whose vol pinned to the clamp (a stale/one-sided quote): their
+    # gamma blows up (∝ 1/sigma). A strike is only trustworthy when BOTH legs
+    # priced cleanly — drop the whole strike if either leg pins, else the surviving
+    # leg breaks the call/put gamma cancellation that net_gex and the flip rest on.
+    # If too few real strikes remain, skip the snapshot: the forge's
+    # right-continuous step holds the last good one, which beats a poisoned surface.
+    ok = (iv >= _IV_MIN_VALID) & (iv <= _IV_MAX_VALID) & np.isfinite(iv)
+    bad_strikes = set(K[~ok].tolist())
+    keep = np.array([k not in bad_strikes for k in K], bool)
+    if int(keep.sum()) < _MIN_VALID_CONTRACTS or len(np.unique(K[keep])) < 3:
+        return None
+    K, oi, is_call, iv = K[keep], oi[keep], is_call[keep], iv[keep]
 
-    iv = implied_vol_newton(prem, F, K, T, is_call, config.RISK_FREE_RATE)
     g = black76_greeks(F, K, T, iv, is_call, config.RISK_FREE_RATE)
     sign = np.where(is_call, s_call, s_put)
     gex = sign * g["gamma"] * oi * lot * spot * spot * 0.01
@@ -236,14 +250,7 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
     call_wall = float(K[np.argmax(cg)]) if cg.any() else None
     put_wall = float(K[np.argmax(pg)]) if pg.any() else None
 
-    h = _oi_hist.setdefault(index, deque(maxlen=12))
-    h.append((time.time(), {float(k): float(o) for k, o in zip(K, oi)}))
-    doi15 = []
-    if len(h) >= 2:
-        old = next((m for t, m in h if time.time() - t <= 930), h[0][1])
-        doi15 = [float(o - old.get(float(k), o)) for k, o in zip(K, oi)]
-
-    # ---- weapons: PCR, max pain, IV rank (all from the same real chain) ----
+    # ---- weapons: PCR, max pain, ATM IV (all from the same real chain) ----
     put_oi = float(oi[~is_call].sum()); call_oi = float(oi[is_call].sum())
     pcr = put_oi / call_oi if call_oi > 0 else None
     uK = np.unique(K)
@@ -252,6 +259,71 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
             for s in uK]
     max_pain = float(uK[int(np.argmin(pain))]) if len(uK) else None
     atm_iv = float(iv[np.argmin(np.abs(K - spot))])
+
+    payload = {"ts": ts, "index": index, "spot": spot,
+               "expiry": str(exp), "flip": flip, "flip_width": flip_w,
+               "call_wall": call_wall, "put_wall": put_wall,
+               "net_gex": float(gex.sum()), "net_dex": float(dex.sum()),
+               "pcr": pcr, "max_pain": max_pain, "atm_iv": atm_iv,
+               "iv_rank": None, "dte": dte,
+               "strikes": K.tolist(), "iv": iv.round(4).tolist()}
+    return payload, K, iv, gex
+
+
+def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
+    spot_sym = config.INDICES[index]["spot_symbol"]
+    spot = float(kite.ltp([spot_sym])[spot_sym]["last_price"])
+    rows = mapper.by_index.get(index, [])
+    if not rows or spot <= 0:
+        return
+    exps = sorted({r["expiry"] for r in rows if r["expiry"] >= dt.date.today()})
+    if not exps:
+        return
+    exp = exps[0]
+    band = [r for r in rows if r["expiry"] == exp
+            and abs(r["strike"] - spot) / spot <= config.MACRO_STRIKE_BAND]
+    if len(band) < 8:
+        return
+    lot = band[0]["lot"]
+    dte = max((exp - dt.date.today()).days, 0) + config.DTE_PART_DAY
+
+    keys = [f'{r["exchange"]}:{r["symbol"]}' for r in band]
+    quotes = {}
+    for i in range(0, len(keys), config.MACRO_QUOTE_CHUNK):
+        quotes.update(kite.quote(keys[i:i + config.MACRO_QUOTE_CHUNK]))
+        time.sleep(1.05)                                # quote API: 1 req/s
+    K, prem, oi, is_call = [], [], [], []
+    for r, key in zip(band, keys):
+        q = quotes.get(key)
+        if not q:
+            continue
+        d = q.get("depth") or {}
+        b = (d.get("buy") or [{}])[0].get("price") or 0
+        a = (d.get("sell") or [{}])[0].get("price") or 0
+        mid = (b + a) / 2 if (b and a) else 0            # require a real two-sided book
+        if mid <= 0:
+            continue
+        K.append(r["strike"]); prem.append(mid)
+        oi.append(float(q.get("oi") or 0)); is_call.append(r["itype"] == "CE")
+    if len(K) < 8:
+        return
+
+    res = assemble_snapshot(
+        ts=time.time(), index=index, spot=spot, exp=exp, dte=dte, K=K,
+        mid=prem, oi=oi, is_call=is_call, lot=lot, s_call=s_call, s_put=s_put)
+    if res is None:                                       # whole chain too thin/stale
+        return
+    payload, K, iv, gex = res
+
+    # ---- live-only enrichments (the forge reads NONE of these from the vault) ---
+    h = _oi_hist.setdefault(index, deque(maxlen=12))
+    h.append((time.time(), {float(k): float(o) for k, o in zip(K, oi)}))
+    doi15 = []
+    if len(h) >= 2:
+        old = next((m for t, m in h if time.time() - t <= 930), h[0][1])
+        doi15 = [float(o - old.get(float(k), o)) for k, o in zip(K, oi)]
+
+    atm_iv = payload["atm_iv"]
     hist_p = config.STATE_DIR / f"iv_history_{index}.json"
     today = str(dt.date.today())
     ivh = {}
@@ -267,6 +339,7 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
     past = [v for d_, v in ivh.items() if d_ != today]
     iv_rank = (float(np.mean([v <= atm_iv for v in past]))
                if len(past) >= config.IVRANK_MIN_DAYS else None)
+    payload["iv_rank"] = iv_rank
 
     # intraday ATM-IV sample for the vol-surface forecaster (daily history is
     # too coarse to forecast crush). Real recorded series, no fabrication.
@@ -276,23 +349,18 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
     except Exception:                                  # noqa: BLE001
         pass
 
-    payload = {"ts": time.time(), "index": index, "spot": spot,
-               "expiry": str(exp), "flip": flip, "flip_width": flip_w,
-               "call_wall": call_wall, "put_wall": put_wall,
-               "net_gex": float(gex.sum()), "net_dex": float(dex.sum()),
-               "pcr": pcr, "max_pain": max_pain, "atm_iv": atm_iv,
-               "iv_rank": iv_rank, "dte": dte,
-               "strikes": K.tolist(), "iv": iv.round(4).tolist(),
-               "gex": gex.round(2).tolist(), "doi15": doi15}
+    payload["gex"] = gex.round(2).tolist()
+    payload["doi15"] = doi15
     atomic_write(config.MACRO_STATE_TMPL.format(idx=index), payload)
     _ARCHIVE.write(payload)                               # vault: forge surface + walls
     log.info("%s spot %.1f flip %s±%s walls %s/%s PCR %s maxpain %s "
              "IVrank %s netGEX %.2e",
-             index, spot, f"{flip:.0f}" if flip else "—",
-             f"{flip_w:.0f}" if flip_w else "—", put_wall, call_wall,
-             f"{pcr:.2f}" if pcr else "—",
-             f"{max_pain:.0f}" if max_pain else "—",
-             f"{iv_rank:.2f}" if iv_rank is not None else "—", gex.sum())
+             index, spot, f'{payload["flip"]:.0f}' if payload["flip"] else "—",
+             f'{payload["flip_width"]:.0f}' if payload["flip_width"] else "—",
+             payload["put_wall"], payload["call_wall"],
+             f'{payload["pcr"]:.2f}' if payload["pcr"] else "—",
+             f'{payload["max_pain"]:.0f}' if payload["max_pain"] else "—",
+             f"{iv_rank:.2f}" if iv_rank is not None else "—", payload["net_gex"])
 
 
 def main():

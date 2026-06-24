@@ -54,6 +54,25 @@ log = logging.getLogger("drift")
 
 _FEAT_IDX = {name: i for i, name in enumerate(FEATURE_NAMES)}
 
+# --- assessability floors (module-level on purpose: these are properties of the
+# PSI/KS math, not trained-artifact parameters, so tuning them must NOT change
+# CONFIG_HASH and invalidate every drift reference). -------------------------
+# A feature is NOT assessable for distributional drift in two cases:
+#   • ref-DEGENERATE — the reference column is effectively a constant, so its
+#     quantile bin edges collapse and PSI/KS are numerically meaningless (a
+#     0.0005 jitter on a clamped feature like `skew` throws PSI past 10). These
+#     are dropped from the drift fraction entirely: they were FALSE positives,
+#     so removing them makes the fraction MORE accurate, not weaker.
+#   • live-STALE — the reference has real spread but the LIVE column is frozen
+#     flat (std≈0): the feed for that feature has stalled. A stalled feed is not
+#     "regime drift", so it must not inflate the drifted-feature count — but it
+#     MUST still de-arm live (you never arm on a dead feed). Handled by the
+#     stale-feed guard below, which forces DRIFTED with its own distinct reason.
+_DEGEN_REF_STD   = 2e-3     # ref std below this ⇒ reference constant ⇒ unbinnable
+_STALE_LIVE_STD  = 1e-6     # live std below this ⇒ that feature's feed is frozen
+_STALE_MIN_FEATS = 3        # this many frozen features ⇒ treat the FEED as stale
+_MIN_ASSESSABLE  = 6        # fewer assessable features than this ⇒ low confidence
+
 
 # ============================================================ reference
 def build_reference(feature_matrix: np.ndarray, *, model_version: str,
@@ -132,6 +151,7 @@ class DriftMonitor:
         self.buf: dict[str, deque] = {
             n: deque(maxlen=config.DRIFT_REF_MAX_SAMPLES)
             for n in config.DRIFT_KEY_FEATURES}
+        self._diag_set = None        # last drifted feature-set we dumped detail for
         self._reload()
 
     def _reload(self):
@@ -183,6 +203,7 @@ class DriftMonitor:
         feats = self.profile["features"]
         per = {}
         moderate = significant = considered = 0
+        degenerate = stale = 0
         for name, ref in feats.items():
             live = np.array(self.buf[name], float)
             if live.size < config.DRIFT_MIN_LIVE_SAMPLES:
@@ -193,36 +214,120 @@ class DriftMonitor:
             live_pct = hist / max(hist.sum(), 1)
             psi = _psi(ref_pct, live_pct)
             ks = _ks_from_hist(ref_pct, live_pct)
-            sig = psi >= config.DRIFT_PSI_SIGNIFICANT or \
-                ks >= config.DRIFT_KS_SIGNIFICANT
-            mod = (not sig) and psi >= config.DRIFT_PSI_MODERATE
-            considered += 1
-            significant += int(sig)
-            moderate += int(mod)
+            lm, ls = float(live.mean()), float(live.std())
+            rm = float(ref.get("mean", 0.0))
+            rs = float(ref.get("std", 0.0) or 0.0)
+            z = (lm - rm) / rs if rs > 1e-12 else 0.0
+
+            # --- assessability gate ------------------------------------------
+            # ref-degenerate: reference is effectively constant ⇒ its quantile
+            # edges collapse ⇒ PSI/KS are noise. live-frozen: reference has spread
+            # but the live feed for this feature has stalled flat. Both are pulled
+            # OUT of the drift fraction; a frozen feed is re-surfaced below as its
+            # own de-arm reason rather than masquerading as regime drift.
+            ref_degenerate = rs < _DEGEN_REF_STD or \
+                np.count_nonzero(np.isfinite(edges)) < 2
+            live_frozen = (not ref_degenerate) and ls < _STALE_LIVE_STD
+            if ref_degenerate:
+                level = "degenerate"; degenerate += 1
+            elif live_frozen:
+                level = "stale"; stale += 1
+            else:
+                sig = psi >= config.DRIFT_PSI_SIGNIFICANT or \
+                    ks >= config.DRIFT_KS_SIGNIFICANT
+                mod = (not sig) and psi >= config.DRIFT_PSI_MODERATE
+                considered += 1
+                significant += int(sig)
+                moderate += int(mod)
+                level = "significant" if sig else ("moderate" if mod else "stable")
             per[name] = {"psi": round(psi, 3), "ks": round(ks, 3),
-                         "level": "significant" if sig else
-                         ("moderate" if mod else "stable"),
-                         "live_mean": round(float(live.mean()), 4),
-                         "ref_mean": round(ref["mean"], 4)}
+                         "level": level,
+                         "live_mean": round(lm, 4), "ref_mean": round(rm, 4),
+                         "live_std": round(ls, 4), "ref_std": round(rs, 4),
+                         "z_off": round(z, 2)}
+        stale_feed = stale >= _STALE_MIN_FEATS
         if considered == 0:
+            # nothing assessable: a fully-frozen feed must still de-arm; otherwise
+            # we are simply still warming up.
+            if stale_feed:
+                res = {"ts": time.time(), "grade": "DRIFTED", "n_live": n,
+                       "reason": "stale_feed", "stale_feed": True,
+                       "features_considered": 0, "degenerate": degenerate,
+                       "stale": stale, "per_feature": per,
+                       "model_version": self.profile.get("model_version")}
+                self._maybe_log_detail("DRIFTED", per, n, "stale_feed")
+                self._persist(res)
+                return res
             return {"grade": "WARMUP", "n_live": n}
         sig_frac = significant / considered
         mod_frac = (moderate + significant) / considered
+        low_conf = considered < _MIN_ASSESSABLE
         if sig_frac >= config.DRIFT_DEARM_FRAC:
-            grade = "DRIFTED"
+            grade = "DRIFTED"; reason = "regime"
         elif mod_frac >= config.DRIFT_WATCH_FRAC:
-            grade = "WATCH"
+            grade = "WATCH"; reason = "watch"
         else:
-            grade = "GREEN"
+            grade = "GREEN"; reason = "clean"
+        # a stalled feed de-arms live regardless of the regime fraction, but is
+        # labelled distinctly so it is never read as "regime drift".
+        if stale_feed:
+            grade = "DRIFTED"; reason = "stale_feed"
+        # too few assessable features to certify clean ⇒ do not sit GREEN.
+        elif low_conf and grade == "GREEN":
+            grade = "WATCH"; reason = "low_assessable"
         worst = sorted(per.items(), key=lambda kv: -kv[1]["psi"])[:5]
-        res = {"ts": time.time(), "grade": grade, "n_live": n,
+        self._maybe_log_detail(grade, per, n, reason)
+        res = {"ts": time.time(), "grade": grade, "n_live": n, "reason": reason,
                "features_considered": considered,
+               "degenerate": degenerate, "stale": stale, "stale_feed": stale_feed,
                "significant": significant, "moderate": moderate,
                "sig_frac": round(sig_frac, 3), "mod_frac": round(mod_frac, 3),
                "model_version": self.profile.get("model_version"),
                "worst": {k: v for k, v in worst}, "per_feature": per}
         self._persist(res)
         return res
+
+    def _maybe_log_detail(self, grade: str, per: dict, n: int,
+                          reason: str = "regime"):
+        """Diagnostic — logging only, NO effect on grade or gating. The first
+        time the tape grades DRIFTED (and whenever the drifted/stale feature SET
+        changes), dump a per-feature ref-vs-live table. The decisive column is
+        z = (live_mean - ref_mean) / ref_std:
+          • |z| large on a feature  ⇒ its live values sit physically OFFSET from
+            the reference — a train/serve skew (the live featurizer/macro source
+            computes it differently) or a real regime move in that feature.
+          • psi/ks high but z ≈ 0   ⇒ the SHAPE moved, not the level: same centre,
+            different spread/tails (e.g. a glitching input throwing fat tails).
+        Rows flagged `deg` were dropped as ref-degenerate (constant reference,
+        unbinnable); `STALE` rows are a frozen live feed, not regime drift."""
+        sig = frozenset(k for k, v in per.items() if v["level"] == "significant")
+        stale = frozenset(k for k, v in per.items() if v["level"] == "stale")
+        degen = frozenset(k for k, v in per.items() if v["level"] == "degenerate")
+        if grade != "DRIFTED":
+            self._diag_set = None                 # reset so a re-entry re-logs
+            return
+        key = (sig, stale)                        # re-log when sig OR stale moves
+        if key == self._diag_set:
+            return
+        self._diag_set = key
+        rows = sorted(per.items(), key=lambda kv: -kv[1]["psi"])
+        assessable = len(per) - len(stale) - len(degen)
+        tail = ("  ⚠ FEED STALE (live features frozen) — de-armed, NOT regime drift"
+                if reason == "stale_feed" else "")
+        log.info("drift detail — model %s | n_live=%d | %d/%d sig (assessable) | "
+                 "%d degenerate | %d stale%s",
+                 self.profile.get("model_version"), n, len(sig), assessable,
+                 len(degen), len(stale), tail)
+        log.info("  %-14s %7s %6s %10s %9s %10s %9s %7s  %s",
+                 "feature", "psi", "ks", "ref_mean", "ref_std",
+                 "live_mean", "live_std", "z", "flag")
+        _FLAG = {"significant": "SIG", "moderate": "mod", "stable": "-",
+                 "degenerate": "deg", "stale": "STALE"}
+        for name, v in rows:
+            flag = _FLAG.get(v["level"], "-")
+            log.info("  %-14s %7.3f %6.3f %10.4f %9.4f %10.4f %9.4f %+7.2f  %s",
+                     name, v["psi"], v["ks"], v["ref_mean"], v["ref_std"],
+                     v["live_mean"], v["live_std"], v["z_off"], flag)
 
     def _persist(self, res: dict):
         try:

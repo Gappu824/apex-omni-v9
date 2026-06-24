@@ -308,7 +308,7 @@ def build_dataset(con, day: str):
             cw = snap.get("call_wall") if snap else None   # GEX walls cap the room
             pw = snap.get("put_wall") if snap else None     # (None ⇒ no cap, as before)
             row = {}
-            for leg in ("atm_ce", "atm_pe"):
+            for leg in ("atm_ce", "atm_pe", "otm_ce", "otm_pe"):
                 s = (legs.get(leg) or {}).get("snap")
                 if not (s and s["bid"] and s["ask"]):
                     continue
@@ -317,7 +317,7 @@ def build_dataset(con, day: str):
                 K = float((legs.get(leg) or {}).get("strike") or 0.0)
                 if spot > 0 and K > 0 and T > 0 and e > 0:
                     tp, sl = _shaped_barriers(e, spot, K, T, mins,
-                                              leg == "atm_ce", cw, pw)
+                                              leg.endswith("_ce"), cw, pw)
                     tp, sl = float(tp), float(sl)
                 else:                                     # missing context ⇒ base
                     tp = e * (1.0 + config.BASE_TP_PCT)
@@ -466,6 +466,17 @@ def _gen_meta_samples(con, day: str, index: str):
         if obs is None or chain is None:
             continue
         frame = builder.frames[-1]
+        # DRIFT REFERENCE POPULATION. The live monitor (DriftMonitor.observe)
+        # pools the spot + ATM CE/PE nodes of EVERY second; the reference must be
+        # that SAME all-tick population. Accumulating only signal moments (below
+        # the conviction gate) biases every marginal — signals fire precisely when
+        # iv / dealer_inv / oi_delta_norm are at extremes — so live PSI/KS would
+        # breach perpetually no matter how fresh the reference or how real the
+        # surface. Sample here, before the gate.
+        _b0 = iidx * config.NODES_PER_INDEX
+        for _nd in (frame[_b0], frame[_b0 + 1], frame[_b0 + 2]):
+            if _nd.any():
+                R.append(_nd.astype(np.float32))
         conv = float(pol.predict(frame)[2 * iidx])
         if abs(conv) < config.PAPER_ENTRY_CONVICTION or \
                 t - last_sig < config.ENTRY_ATTEMPT_THROTTLE_S:
@@ -516,10 +527,6 @@ def _gen_meta_samples(con, day: str, index: str):
         pnl = (exitp - e) * lot - round_trip_costs(e * lot, exitp * lot)
         # features: spot+atm_ce+atm_pe nodes (57) + tod, ER(30m), first30
         b0 = iidx * config.NODES_PER_INDEX
-        # raw 19-dim node rows → drift reference (the marginals the model saw)
-        for nd in (frame[b0], frame[b0 + 1], frame[b0 + 2]):
-            if nd.any():
-                R.append(nd.astype(np.float32))
         x = np.concatenate([frame[b0], frame[b0 + 1], frame[b0 + 2]])
         diffs = np.abs(np.diff(np.array(spot_hist, float)))
         er = (abs(spot_hist[-1] - spot_hist[0]) / diffs.sum()) \
@@ -617,41 +624,273 @@ if HAVE_RL:
             return self.obs[self.i], r / 100.0, True, False, {}
 
 
-def evaluate(model, vec, obs, ts, prem) -> float:
-    """After-cost ₹ a 1-lot trader following the policy would have made on a
-    held-out day (entry whenever |a|≥0.5, one decision/min)."""
-    total, step = 0.0, config.FORGE_EVAL_STEP_S
-    for i in range(0, len(obs) - step, step):
-        o = vec.normalize_obs(obs[i:i + 1]) if vec else obs[i:i + 1]
-        a, _ = model.predict(o, deterministic=True)
-        for k, idx in enumerate(config.INDEX_ORDER):
-            v = float(a[0][2 * k])
-            if abs(v) >= config.FORGE_ACT_GATE_EVAL:
-                total += reward_fn(prem[idx], float(ts[i]), 1 if v > 0 else -1)
+def _eval_meta():
+    """Load the freshly-trained meta-model exactly as apex_main.load_meta does
+    (same JSON the brain reads at runtime). None ⇒ no trained model yet, so the
+    sizer falls back to the uncalibrated paper win-prob, mirroring the brain's
+    bootstrap path."""
+    try:
+        p = config.META_MODEL_PATH
+        if p.exists():
+            return json.loads(p.read_text())
+    except Exception:                                     # noqa: BLE001
+        pass
+    return None
+
+
+def _eval_cal():
+    """The conviction→win-rate calibration table the brain blends in."""
+    try:
+        if config.CALIBRATION_TABLE.exists():
+            return json.loads(config.CALIBRATION_TABLE.read_text())
+    except Exception:                                     # noqa: BLE001
+        pass
+    return {}
+
+
+def _eval_winprob(meta, cal, frame, iidx, tod, er, f30, dirn, conv) -> float:
+    """P(win) computed EXACTLY as the live brain blends it (apex_main
+    meta_win_prob + win_prob_for, lines 141-170 / 524-533): the meta-model's
+    logistic on the same 19×3+4 feature vector, clamped to [META_P_FLOOR,
+    META_P_CAP], blended 50/50 with the conviction-bucket calibration when that
+    bucket has enough samples; the uncalibrated paper win-prob otherwise. This
+    is what feeds RiskGovernor's Kelly budget — so the forge sizes on the same
+    dynamic edge the brain does, not a static 0.60."""
+    import math
+    wp_meta = None
+    if meta is not None and int(meta.get("n", 0)) >= config.META_MIN_TRAIN:
+        b0 = iidx * config.NODES_PER_INDEX
+        x = np.concatenate([frame[b0], frame[b0 + 1], frame[b0 + 2],
+                            [tod, er,
+                             math.copysign(min(abs(f30) * 100, 3), f30)
+                             if f30 else 0.0,
+                             1.0 if dirn > 0 else -1.0]]).astype(np.float32)
+        mu = np.asarray(meta["mu"], np.float32)
+        sd = np.asarray(meta["sd"], np.float32)
+        w = np.asarray(meta["w"], np.float32)
+        z = (x - mu) / np.where(sd > 0.0, sd, 1.0)
+        pr = 1.0 / (1.0 + math.exp(-float(z @ w) - float(meta["b"])))
+        wp_meta = float(min(max(pr, config.META_P_FLOOR), config.META_P_CAP))
+    w_ = config.CAL_BUCKET_WIDTH
+    bkey = f"{min(abs(conv) // w_ * w_, 1 - w_):.2f}"
+    cal_hit = bkey in cal and cal[bkey][1] >= config.CAL_MIN_SAMPLES
+    if wp_meta is None:
+        return float(cal[bkey][0]) if cal_hit else config.uncalibrated_winprob()
+    if cal_hit:
+        return 0.5 * (wp_meta + float(cal[bkey][0]))      # blend both judges
+    return wp_meta
+
+
+def _eval_hm(t: int) -> str:
+    """Seconds-from-open → 'HH:MM', so RiskGovernor's entry curfew
+    (NO_ENTRY_AFTER) fires on the same wall-clock the brain sees."""
+    base = dt.datetime(2000, 1, 1,
+                       *(int(x) for x in config.SESSION_OPEN.split(":")))
+    return (base + dt.timedelta(seconds=int(t))).strftime("%H:%M")
+
+
+def _grade_like_live(con, day: str, index: str, decide) -> float:
+    """After-cost ₹ a policy would have ACTUALLY realized on `day` for `index`,
+    sized EXACTLY like live: every entry goes through the real
+    RiskGovernor.first_affordable (so the Kelly budget, the ATM→OTM→deeper
+    affordability walk, the worst-case disaster-floor check, the entry curfew,
+    cooldown, post-loss lockout and concurrency cap are the LIVE code, not a
+    forge re-implementation), with the dynamic per-signal win-prob the brain
+    computes, and the SAME shaped triple-barrier exit as the meta-labeler /
+    reward grid. `decide(obs, frame, iidx) -> conviction` plugs in either the SAC
+    model or the heuristic. The day is replayed tick-by-tick through the one
+    StateBuilder, identical to _gen_meta_samples — same surface fit, same walls,
+    same hierarchy. One divergence from live is documented: equity is per-index
+    here (a fresh RiskGovernor per index-day) rather than one shared pool across
+    indices — fine for a candidate-vs-incumbent ranking, both scored the same."""
+    from collections import deque
+    from simulation.replay_real_day import load_day
+    from simulation.scenario_engine import N
+    from core.risk_manager import RiskGovernor
+    loaded = load_day(con, day, index)
+    if not loaded:
+        return 0.0
+    spot_tok, by_sec, ti, bidA, askA = loaded
+    mapper = AsOfMapper(dt.date.fromisoformat(day))
+    builder = StateBuilder()
+    iidx = config.INDEX_ORDER.index(index)
+    risk = RiskGovernor()                                 # config.TRADING_CAPITAL
+    snaps, chain = {}, None
+    last_tick = {}
+    spot_hist: deque = deque(maxlen=1800)
+    open_p = p945 = None
+    last_try = -1e9
+    horizon = int(config.MAX_HOLD_MINUTES * 60)
+    meta, cal = _eval_meta(), _eval_cal()
+    total = 0.0
+    open_pos = None                                       # (exit_t, outlay, pnl, dir)
+    _oh, _om = (int(x) for x in config.SESSION_OPEN.split(":"))
+    _open_sod = _oh * 3600 + _om * 60
+    macro = load_macro_archive(con, day, index)
+    for _s in macro:
+        _s["_t"] = int((_s["ts"] + 19800) % 86400) - _open_sod
+    mptr = [0]
+    fit_surface = _make_surface_fitter()
+    for t in range(N):
+        for tok, sn in by_sec.get(t, {}).items():
+            snaps[tok] = sn
+            last_tick[tok] = t
+        sp = snaps.get(spot_tok)
+        if not sp or not sp.get("ltp"):
+            continue
+        spot = float(sp["ltp"])
+        spot_hist.append(spot)
+        if open_p is None:
+            open_p = spot
+        if p945 is None and t >= 1800:
+            p945 = spot
+        step = (chain or {}).get("step") or config.INDICES[index]["strike_step"]
+        atm = round(spot / step) * step
+        if chain is None or chain.get("atm") != atm:
+            chain = mapper.chain(index, spot) or chain
+        market = {index: {"spot": sp}}
+        if chain:
+            legs = {}
+            for leg, info in chain["legs"].items():
+                s = snaps.get(info["token"])
+                if s:
+                    legs[leg] = {"snap": s, "strike": info["strike"]}
+            market[index].update({"expiry": chain["expiry"],
+                                  "dte": chain["dte"], "T": chain["T"],
+                                  "is_weekly": chain["is_weekly"],
+                                  "legs": legs})
+        snap = _latest_at(macro, mptr, t, lambda s: s["_t"]) if macro else None
+        if chain and snap:                                # REAL surface before push
+            fit_surface(builder, index, chain["expiry"], chain["T"], snap)
+        obs = builder.push(market, float(t))
+        if obs is None or chain is None:
+            continue
+        frame = builder.frames[-1]
+        risk.on_tick()                                    # physics-settled counter
+
+        # ---- realize the held position when its barrier elapses (one/idx) ----
+        if open_pos is not None:
+            if t >= open_pos[0]:
+                _xt, _outlay, _pnl, _dir = open_pos
+                risk.register_exit(_outlay, _pnl, _dir, ts=float(_xt))
+                total += _pnl
+                open_pos = None
+            else:
+                continue                                  # still holding → no entry
+
+        # ---- flat: ask the policy ----
+        conv = float(decide(obs, frame, iidx))
+        if t - last_try < config.ENTRY_ATTEMPT_THROTTLE_S:
+            continue
+        d = "CE" if conv > 0 else "PE"
+        diffs = np.abs(np.diff(np.asarray(spot_hist, float)))
+        er = (abs(spot_hist[-1] - spot_hist[0]) / diffs.sum()) \
+            if len(spot_hist) > 120 and diffs.sum() > 0 else 0.5
+        f30 = ((p945 - open_p) / open_p) if (p945 and open_p) else 0.0
+        wp = _eval_winprob(meta, cal, frame, iidx, t / N, er, f30,
+                           1 if d == "CE" else -1, conv)
+        # SAME decision gate as the brain (apex_main 615-624): model-driven when
+        # a trained meta-model exists, else the fixed conviction bar.
+        if config.META_DECISION_ENABLED and meta is not None:
+            if abs(conv) < config.META_ENTRY_CONV_FLOOR or wp < config.META_ENTRY_P_BAR:
+                continue
+        elif abs(conv) < config.PAPER_ENTRY_CONVICTION:
+            continue
+        last_try = t
+
+        # ---- build the SAME preferred-first hierarchy the brain hands the
+        #      RiskGovernor (ATM→OTM→deeper, real two-sided quotes, spread gate) ----
+        T = float((chain or {}).get("T") or 0.01)
+        atm_iv = builder.surface.atm_iv(index, (chain or {}).get("expiry", ""), T)
+        hierarchy = []
+        for r in mapper.hierarchy(index, spot, d):
+            kk = ti.get(r["token"])
+            if kk is None or t - last_tick.get(r["token"], -99) > 5:
+                continue
+            b_, a_ = bidA[kk, t], askA[kk, t]
+            if np.isnan(b_) or np.isnan(a_) or b_ <= 0 or a_ <= 0:
+                continue
+            mid = (b_ + a_) / 2.0
+            if (a_ - b_) / max(mid, 0.05) > config.MAX_ENTRY_SPREAD_PCT:
+                continue                                  # live illiquidity gate
+            hierarchy.append({"premium": float(mid), "lot": int(r["lot"]),
+                              "symbol": r["symbol"], "exchange": r["exchange"],
+                              "price": float(a_), "_k": kk,
+                              "_strike": float(r["strike"])})
+        if not hierarchy:
+            continue
+
+        # ---- THE live sizer: same function, same config, zero drift ----
+        leg, permit = risk.first_affordable(
+            hierarchy, direction=d, win_prob=wp,
+            sl_pct=config.BASE_SL_PCT, tp_pct=config.BASE_TP_PCT,
+            data_age_s=0.0, now_hm=_eval_hm(t), ts=float(t),
+            ann_vol=atm_iv or None)
+        if leg is None:
+            continue                                      # blocked exactly as live
+        kk, e, lot, Kstrike = leg["_k"], leg["premium"], leg["lot"], leg["_strike"]
+
+        # ---- SHAPED triple-barrier exit on the CHOSEN leg (meta-labeler twin) ----
+        mins_left = max((N - t) / 60.0, 1.0)
+        cw = snap.get("call_wall") if snap else None
+        pw = snap.get("put_wall") if snap else None
+        if spot > 0 and Kstrike > 0 and T > 0 and e > 0:
+            tp, sl = _shaped_barriers(e, spot, Kstrike, T, mins_left,
+                                      d == "CE", cw, pw)
+            tp, sl = float(tp), float(sl)
+        else:
+            tp, sl = e * (1 + config.BASE_TP_PCT), e * (1 - config.BASE_SL_PCT)
+        seg = bidA[kk, t + 1:t + 1 + horizon]
+        if seg.size == 0 or np.all(np.isnan(seg)):
+            continue
+        itp = int(np.argmax(seg >= tp)) if np.any(seg >= tp) else None
+        isl = int(np.argmax(seg <= sl)) if np.any(seg <= sl) else None
+        if itp is not None and (isl is None or itp < isl):
+            exitp, off = float(tp), itp
+        elif isl is not None:
+            exitp, off = float(sl), isl
+        else:
+            valid = np.nonzero(~np.isnan(seg))[0]
+            exitp, off = float(seg[valid[-1]]), int(valid[-1])
+        outlay = e * lot
+        pnl = (exitp - e) * lot - round_trip_costs(outlay, exitp * lot)
+        risk.register_entry(outlay)
+        open_pos = (t + off + 1, outlay, float(pnl), d)   # realize at the barrier
+
+    if open_pos is not None:                              # EOD: realize the runner
+        risk.register_exit(open_pos[1], open_pos[2], open_pos[3],
+                           ts=float(open_pos[0]))
+        total += open_pos[2]
     return total
 
 
-def evaluate_heuristic(obs, ts, prem) -> float:
-    """Same held-out grading as evaluate(), but scoring the HEURISTIC — the
-    policy actually live in production — so the two numbers are directly
-    comparable. Identical step cadence, |a|≥gate, reward_fn and INDEX_ORDER;
-    the ONLY difference is the policy. The heuristic reads RAW flow features, so
-    it gets the current warm frame straight out of obs (no VecNormalize — that
-    is the SAC model's input transform, not the heuristic's). The current frame
-    is the last NUM_NODES×F slice, since push() stacks (SEQ_LENGTH,NUM_NODES,F)
-    in C-order before flattening to OBS_DIM."""
+def evaluate(model, vec, con, val_day) -> float:
+    """After-cost ₹ the SAC policy would have realized on the held-out day, sized
+    EXACTLY like live — every entry routed through the real RiskGovernor with the
+    dynamic per-signal win-prob, walking to an affordable leg. Summed over the
+    TRADABLE indices the brain actually trades. (Replays the day from the vault,
+    so it is heavier than the old precomputed-table sum, but it is the live
+    decision path — what the brain would have done, not a 1-lot-ATM fantasy.)"""
+    def decide(obs, frame, iidx):
+        o = vec.normalize_obs(obs[None]) if vec else obs[None]
+        a, _ = model.predict(o, deterministic=True)
+        return float(a[0][2 * iidx])
+    return float(sum(_grade_like_live(con, val_day, idx, decide)
+                     for idx in config.TRADABLE))
+
+
+def evaluate_heuristic(con, val_day) -> float:
+    """Same live-faithful grading as evaluate(), scoring the HEURISTIC, so the
+    baseline is apples-to-apples with the candidate. The ONLY difference is the
+    policy: the heuristic reads the raw warm frame straight from the builder (no
+    VecNormalize — that is the SAC model's input transform, not the heuristic's)."""
     from core.heuristic_policy import HeuristicPolicy
     pol = HeuristicPolicy()
-    F = config.FEATURES_PER_NODE
-    total, step = 0.0, config.FORGE_EVAL_STEP_S
-    for i in range(0, len(obs) - step, step):
-        frame = obs[i].reshape(config.SEQ_LENGTH, config.NUM_NODES, F)[-1]
-        a = pol.predict(frame)
-        for k, idx in enumerate(config.INDEX_ORDER):
-            v = float(a[2 * k])
-            if abs(v) >= config.FORGE_ACT_GATE_EVAL:
-                total += reward_fn(prem[idx], float(ts[i]), 1 if v > 0 else -1)
-    return total
+
+    def decide(obs, frame, iidx):
+        return float(pol.predict(frame)[2 * iidx])
+    return float(sum(_grade_like_live(con, val_day, idx, decide)
+                     for idx in config.TRADABLE))
 
 
 def train_trap_model(ledger_path=None):
@@ -824,17 +1063,38 @@ def _barrier_exit_grid(bid_g: np.ndarray, ask_g: np.ndarray,
 
 
 def _reward_table(prem: dict, ts) -> np.ndarray:
-    """(N, K, 2) realized after-cost ₹ for a 1-lot ATM trade at each second, per
-    index, both directions: [...,0] = long CE (dir>0), [...,1] = long PE (dir<0).
-    Uses the SAME triple-barrier realized exit as reward_fn / the meta-labeler
-    (mid entry, SHAPED tp / -BASE_SL_PCT stop, MAX_HOLD_MINUTES hold), built
-    vectorized so the whole table is one cheap precompute rather than N×K×2 forward
-    walks. Numerically identical to calling reward_fn per cell (asserted in tests)."""
+    """(N, K, 2) after-cost ₹ of the trade the LIVE brain would actually PLACE at
+    each second — the model's learning target, sized like live instead of a
+    1-lot-ATM fantasy. Three live constraints, so the policy learns the real
+    objective:
+      • TRADABLE indices only — the other four are 0. The brain never trades them,
+        so the policy must learn they are worthless, not farm ATM PnL on BANKNIFTY
+        etc. (the old grid graded all six, teaching trades that never happen).
+      • First-affordable leg — ATM if a 1-lot ATM entry (mid × lot) fits the Kelly
+        budget, else step out to OTM1, else 0 (no affordable leg ⇒ no trade ⇒ no
+        PnL). This is the brain's ATM→OTM affordability walk over the harvested
+        chain (ATM ± 1 step); at this capital an ATM index lot often exceeds the
+        per-trade budget, so the old "always ATM" reward was scoring trades the
+        account could never place.
+      • SAME shaped triple-barrier realized exit, evaluated on the CHOSEN leg.
+    Affordability here uses the STATIC Kelly budget (_kelly_budget at the paper
+    win-prob) so the target stays a cheap, policy-independent precompute. The
+    promotion GATE goes further — dynamic per-signal win-prob + a deeper hierarchy
+    + a stateful sequential sim (see evaluate / _grade_like_live); folding those
+    into the per-cell TRAINING grid would need the vault hierarchy and spot-history
+    bookkeeping threaded through build_dataset, a heavier follow-up. [...,0] = long
+    CE, [...,1] = long PE. Vectorized per leg; the affordable leg is picked
+    per-second."""
     K, N = len(config.INDEX_ORDER), len(ts)
     R = np.zeros((N, K, 2), np.float32)
     horizon = int(config.MAX_HOLD_MINUTES * 60)
+    budget = _kelly_budget(config.TRADING_CAPITAL)
     ts_i = np.rint(np.asarray(ts, dtype=np.float64)).astype(np.int64)
+    all_legs = ("atm_ce", "atm_pe", "otm_ce", "otm_pe")
+    legs_for = {0: ("atm_ce", "otm_ce"), 1: ("atm_pe", "otm_pe")}  # ATM preferred
     for k, idx in enumerate(config.INDEX_ORDER):
+        if idx not in config.TRADABLE:                    # brain never trades these
+            continue
         pidx = prem[idx]
         if not pidx:                                      # spot-only index ⇒ all 0
             continue
@@ -842,10 +1102,10 @@ def _reward_table(prem: dict, ts) -> np.ndarray:
         G = smax - smin + 1
         grids = {leg: [np.full(G, np.nan), np.full(G, np.nan), np.zeros(G),
                        np.full(G, np.nan), np.full(G, np.nan)]
-                 for leg in ("atm_ce", "atm_pe")}
+                 for leg in all_legs}
         for s, row in pidx.items():
             g = s - smin
-            for leg in ("atm_ce", "atm_pe"):
+            for leg in all_legs:
                 if leg in row:
                     b, a, lot, tp, sl = row[leg]
                     grids[leg][0][g] = b
@@ -856,13 +1116,26 @@ def _reward_table(prem: dict, ts) -> np.ndarray:
         gpos = ts_i - smin
         inside = np.nonzero((gpos >= 0) & (gpos < G))[0]
         gp = gpos[inside]
-        for d_idx, leg in ((0, "atm_ce"), (1, "atm_pe")):
-            bid_g, ask_g, lot_g, tp_g, sl_g = grids[leg]
-            ex = _barrier_exit_grid(bid_g, ask_g, tp_g, sl_g, horizon)  # (G,)
-            e = (bid_g + ask_g) / 2.0
-            pnl = (ex - e) * lot_g - _round_trip_costs_vec(e * lot_g, ex * lot_g)
-            good = ~np.isnan(pnl[gp])
-            R[inside[good], k, d_idx] = pnl[gp[good]].astype(np.float32)
+        for d_idx, (atm_leg, otm_leg) in legs_for.items():
+            pnl, mid, lot = {}, {}, {}
+            for leg in (atm_leg, otm_leg):
+                bid_g, ask_g, lot_g, tp_g, sl_g = grids[leg]
+                ex = _barrier_exit_grid(bid_g, ask_g, tp_g, sl_g, horizon)  # (G,)
+                e = (bid_g + ask_g) / 2.0
+                pnl[leg] = (ex - e) * lot_g - _round_trip_costs_vec(e * lot_g,
+                                                                    ex * lot_g)
+                mid[leg], lot[leg] = e, lot_g
+            # per-second affordability of a 1-lot entry (mid × lot ≤ budget)
+            atm_cost = mid[atm_leg] * lot[atm_leg]
+            otm_cost = mid[otm_leg] * lot[otm_leg]
+            atm_ok = (~np.isnan(pnl[atm_leg]) & ~np.isnan(atm_cost)
+                      & (lot[atm_leg] > 0) & (atm_cost <= budget))
+            otm_ok = (~np.isnan(pnl[otm_leg]) & ~np.isnan(otm_cost)
+                      & (lot[otm_leg] > 0) & (otm_cost <= budget))
+            # ATM if it fits the budget, else step out to OTM1, else 0 (no trade)
+            chosen = np.where(atm_ok, np.nan_to_num(pnl[atm_leg]),
+                              np.where(otm_ok, np.nan_to_num(pnl[otm_leg]), 0.0))
+            R[inside, k, d_idx] = chosen[gp].astype(np.float32)
     return R
 
 
@@ -1027,7 +1300,7 @@ def train_bandit(model, vec, obs, ts, prem, vobs, vts, vprem, log) -> None:
             "train_trade_rate": tr_rate, "holdout_trade_rate": hv_rate}
 
 
-def _score_incumbent_on(vo, vt, vp, log):
+def _score_incumbent_on(vo, vt, vp, con, val_day, log):
     """Re-score the currently-PROMOTED model on the SAME held-out day the
     candidate is graded on, so the two are compared apples-to-apples instead of
     against a score the incumbent earned on a different day (and possibly a
@@ -1046,7 +1319,7 @@ def _score_incumbent_on(vo, vt, vp, log):
         inc_vec = VecNormalize.load(str(npth), inc_env)
         inc_vec.training = False
         inc_model = SAC.load(str(mp), device="cpu")      # CPU: tiny eval, no GPU fight
-        return float(evaluate(inc_model, inc_vec, vo, vt, vp))
+        return float(evaluate(inc_model, inc_vec, con, val_day))
     except Exception as e:                                # noqa: BLE001
         log.warning("incumbent re-score failed (%s) — using its stored val_score "
                     "for the bar instead (share the brain's model-load snippet "
@@ -1161,8 +1434,8 @@ def main():
                 policy_kwargs={"features_extractor_class": Extractor,
                                "net_arch": [256, 256]}, verbose=0)
     diag = train_bandit(model, vec, obs, ts, prem, vo, vt, vp, log)
-    score = evaluate(model, vec, vo, vt, vp) if vo is not None else -1e9
-    heur = evaluate_heuristic(vo, vt, vp) if vo is not None else -1e9
+    score = evaluate(model, vec, con, val_day) if vo is not None else -1e9
+    heur = evaluate_heuristic(con, val_day) if vo is not None else -1e9
     log.info("held-out (%s) after-cost — model ₹%.2f | heuristic ₹%.2f | "
              "model trade-rate: train %.2f%% · held-out %.2f%% (per index-slot)",
              val_day, score, heur, diag["train_trade_rate"] * 100,
@@ -1173,7 +1446,7 @@ def main():
     # promoted on) so candidate-vs-incumbent is apples-to-apples. Fall back to the
     # stored score only if the incumbent can't be loaded, and to the heuristic when
     # there is no incumbent at all.
-    inc_today = _score_incumbent_on(vo, vt, vp, log)
+    inc_today = _score_incumbent_on(vo, vt, vp, con, val_day, log)
     inc_stored = -1e18
     if config.MODEL_MANIFEST.exists():
         inc_stored = float(json.loads(config.MODEL_MANIFEST.read_text()).get(
