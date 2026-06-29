@@ -32,19 +32,27 @@ assert len(FEATURE_NAMES) == config.FEATURES_PER_NODE
 
 LEG_ORDER = ["spot", "atm_ce", "atm_pe", "otm_ce", "otm_pe"]
 
-# dealer_inv integrates signed flow over wall-time; clamp the per-update dt so a
-# gap in the tape (a session boundary, or a second with no ticks during forge
-# replay) can't nuke or spike the accumulator. Deliberately NOT a config.py
-# constant: it is an integration guard, not a trained-artifact parameter, so
-# tuning it must not change CONFIG_HASH and invalidate every drift reference.
-_DEALER_INV_MAX_DT_S = 5.0
+# Wall-time guards / horizons for the cadence-invariant estimators below. These
+# are deliberately NOT config.py constants: they are integration/aggregation
+# guards, not trained-artifact parameters, so tuning them must not change
+# CONFIG_HASH and invalidate every drift reference.
+#   _MAX_UPDATE_DT_S clamps the per-update dt so a gap in the tape (a session
+#     boundary, or a second with no ticks during forge replay) can't nuke or
+#     spike a wall-time accumulator/EWMA.
+#   _RET_HORIZON_S is the return reference horizon — the forge's 1 Hz replay
+#     step. At dt == _RET_HORIZON_S every estimator here is byte-identical to its
+#     old per-tick form, so the live brain (~5 Hz) converges to the SAME value
+#     the 1 Hz-built reference encodes (no re-forge).
+_MAX_UPDATE_DT_S = 5.0
+_RET_HORIZON_S = 1.0
 
 
 class _Trackers:
     """Per-leg stateful physics. Same code path everywhere."""
     __slots__ = ("vol", "vpin", "hawkes", "last_ltp", "ew_voldelta",
                  "ofi_hist", "dealer_inv", "last_bid", "last_ask",
-                 "last_bq", "last_aq", "oi_hist", "last_ts", "last_side")
+                 "last_bq", "last_aq", "oi_hist", "last_ts", "last_side",
+                 "ltp_hist")
 
     def __init__(self):
         self.vol = EWMAVol(config.EWMA_VOL_HALFLIFE_S)
@@ -52,13 +60,16 @@ class _Trackers:
         self.hawkes = HawkesExcitation(config.HAWKES_DECAY_PER_S)
         self.last_ltp = None
         self.ew_voldelta = 1.0          # self-normalizing expected volume/s
-        self.ofi_hist = deque(maxlen=config.OFI_WINDOW_TICKS)
+        # buffers below are evicted by WALL-TIME in leg_features (not by element
+        # count) so their windows span the same seconds at any tick cadence.
+        self.ofi_hist = deque()         # (ts, ofi) — OFI z window (seconds)
         self.dealer_inv = 0.0           # decayed signed aggressive flow
         self.last_ts = None             # wall-clock of last update (dt for decay)
         self.last_side = 0.0            # tick-test: prevailing sign carried on flats
         self.last_bid = self.last_ask = 0.0
         self.last_bq = self.last_aq = 0.0
-        self.oi_hist = deque(maxlen=config.OI_DELTA_WINDOW_S)  # (ts, oi) ΔOI window
+        self.oi_hist = deque()          # (ts, oi) — ΔOI window (seconds)
+        self.ltp_hist = deque()         # (ts, ltp) — log-return horizon (seconds)
 
 
 class StateBuilder:
@@ -80,17 +91,46 @@ class StateBuilder:
         vol_d = max(float(snap.get("vol_delta") or 0.0), 0.0)
         oi = float(snap.get("oi") or 0.0)
 
-        # returns / vol / hawkes — one formula, period.
+        # ---- one wall-time dt for every cadence-anchored estimator below ----
+        # At the forge's 1 Hz dt == 1.0 and every line here reduces to its old
+        # per-tick form (byte-identical → no re-forge); at the brain's ~5 Hz the
+        # SAME wall-clock value is produced. dt is clamped so a tape gap can't
+        # nuke or spike an accumulator.
+        dt = 1.0 if t.last_ts is None else \
+            min(max(ts - t.last_ts, 0.0), _MAX_UPDATE_DT_S)
+        t.last_ts = ts
+
+        # log return over the ~1 s reference horizon. A per-tick return shrinks
+        # with the sampling interval (a 0.2 s return at 5 Hz vs a 1 s return in
+        # the 1 Hz reference); anchoring to _RET_HORIZON_S fixes that. At 1 Hz the
+        # oldest price in the horizon IS the previous tick → log(ltp/last_ltp);
+        # if a data gap collapses the window to this tick we fall back to the last
+        # good price, so the value is byte-identical at 1 Hz even across gaps.
         log_ret = 0.0
-        if t.last_ltp and t.last_ltp > 0 and ltp > 0:
-            log_ret = math.log(ltp / t.last_ltp)
+        if ltp > 0:
+            t.ltp_hist.append((ts, ltp))
+            while len(t.ltp_hist) > 1 and t.ltp_hist[0][0] < ts - _RET_HORIZON_S:
+                t.ltp_hist.popleft()
+            p_ref = t.ltp_hist[0][1] if len(t.ltp_hist) > 1 else (t.last_ltp or ltp)
+            if p_ref > 0:
+                log_ret = math.log(ltp / p_ref)
         t.last_ltp = ltp if ltp > 0 else t.last_ltp
-        regime_vol = t.vol.update(ltp if ltp > 0 else (t.last_ltp or 1.0))
+
+        # regime vol / hawkes — one formula, period. EWMAVol now sees the real dt
+        # (return ÷√dt, half-life anchored to seconds) so it no longer reads hot
+        # and fast at 5 Hz. hawkes reads the PRE-update ew_voldelta (kept).
+        regime_vol = t.vol.update(ltp if ltp > 0 else (t.last_ltp or 1.0), dt_s=dt)
         hawkes = t.hawkes.update(ts, min(vol_d / max(t.ew_voldelta, 1.0), 5.0))
 
-        # velocity: self-normalizing (audit: hardcoded 15M expected_vol retired)
-        t.ew_voldelta = 0.999 * t.ew_voldelta + 0.001 * max(vol_d, 0.0) \
-            if t.ew_voldelta else max(vol_d, 1.0)
+        # ew_voldelta: expected volume PER SECOND. The EWMA weight is anchored to a
+        # 1 s step (1 - 0.999**dt == 0.001 at dt == 1) so its time-constant is
+        # wall-clock, not tick-count — which also tightens velocity, dealer_inv and
+        # the hawkes magnitude that read it.
+        if t.ew_voldelta:
+            _a = 1.0 - 0.999 ** dt
+            t.ew_voldelta = (1.0 - _a) * t.ew_voldelta + _a * max(vol_d, 0.0)
+        else:
+            t.ew_voldelta = max(vol_d, 1.0)
         if vol_d <= 0 and t.ew_voldelta <= 1.0:
             velocity = 0.0          # volume-less feed (index spot): no signal,
         else:                       # not a constant −0.76 artifact
@@ -101,45 +141,53 @@ class StateBuilder:
         mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else ltp
         spread_pct = (ask - bid) / mid if mid > 0 and ask >= bid > 0 else 0.0
 
-        # OFI (Cont–Kukanov, top of book) → rolling z
+        # OFI (Cont–Kukanov, top of book) → z over a TIME window. Was a tick-count
+        # window (maxlen OFI_WINDOW_TICKS): 120 ticks is 120 s at the forge's 1 Hz
+        # but only ~24 s at 5 Hz, so the z-score normalized over a different span
+        # live vs in the reference. Now evicted by seconds; at 1 Hz it holds the
+        # same 120 ticks → identical mean/std.
         ofi = 0.0
         if t.last_bid:
             if bid >= t.last_bid: ofi += bq
             if bid <= t.last_bid: ofi -= t.last_bq
             if ask <= t.last_ask: ofi -= aq
             if ask >= t.last_ask: ofi += t.last_aq
-        t.ofi_hist.append(ofi)
-        mu = float(np.mean(t.ofi_hist)); sd = float(np.std(t.ofi_hist)) or 1.0
+        t.ofi_hist.append((ts, ofi))
+        _ofi_w = config.OFI_WINDOW_TICKS          # ticks → seconds at the 1 Hz ref
+        while len(t.ofi_hist) > 1 and t.ofi_hist[0][0] <= ts - _ofi_w:
+            t.ofi_hist.popleft()
+        _ofis = np.fromiter((o for _, o in t.ofi_hist), dtype=float,
+                            count=len(t.ofi_hist))
+        mu = float(_ofis.mean()); sd = float(_ofis.std()) or 1.0
         ofi_z = float(np.clip((ofi - mu) / sd, -4, 4))
         t.last_bid, t.last_ask, t.last_bq, t.last_aq = bid, ask, bq, aq
 
-        # dealer inventory: wall-time-decayed signed flow, tanh-bounded.
+        # dealer inventory: tick-test direction + wall-time-integrated signed flow.
         #   • TICK TEST for direction. The old `>= 0 ⇒ +1` rule voted every
         #     unchanged-price tick as a BUY, so the feature's mean scaled with the
         #     RATE of flat ticks — and a fine feeder (the live brain, ~0.2 s loop)
         #     sees far more flat ticks than a coarse one (the forge replay, 1 s).
         #     A flat tick now carries the PREVAILING side (Lee–Ready tick test),
-        #     which has no directional bias yet keeps the flat-tick VOLUME — so the
-        #     net signed flow per second is the same however finely it's sampled.
-        #   • decay and the flow increment are integrated over wall-time dt: the
-        #     update is byte-identical at the forge's 1 s cadence (dt = 1 ⇒ decay
-        #     0.995, increment ×1) yet rate-invariant at any other cadence.
-        # Together these kill the train/serve skew that pinned dealer_inv adrift —
-        # a fixed +offset, live vs the 1 Hz-built reference, invariant to regime.
+        #     which has no directional bias yet keeps the flat-tick VOLUME.
+        #   • decay and the flow increment are integrated over the shared wall-time
+        #     dt: byte-identical at the forge's 1 s cadence (dt = 1) yet
+        #     rate-invariant at any other cadence.
         if log_ret > 0:
             t.last_side = 1.0
         elif log_ret < 0:
             t.last_side = -1.0
         side = t.last_side
-        dt = 1.0 if t.last_ts is None else \
-            min(max(ts - t.last_ts, 0.0), _DEALER_INV_MAX_DT_S)
-        t.last_ts = ts
         t.dealer_inv = (config.DEALER_INV_DECAY ** dt) * t.dealer_inv \
             + side * (vol_d / max(t.ew_voldelta, 1.0)) * dt
         dealer_inv = math.tanh(t.dealer_inv / config.DEALER_INV_SCALE)
 
-        # 15-min ΔOI, normalized
+        # 15-min ΔOI, normalized. The lookup is unchanged; the buffer is now
+        # evicted by TIME (was maxlen = OI_DELTA_WINDOW_S ELEMENTS → only ~180 s of
+        # history at 5 Hz, truncating the intended 900 s window). At 1 Hz it holds
+        # the same elements the maxlen buffer did → identical reference price.
         t.oi_hist.append((ts, oi))
+        while len(t.oi_hist) > 1 and t.oi_hist[0][0] <= ts - config.OI_DELTA_WINDOW_S:
+            t.oi_hist.popleft()
         old = next((o for s, o in t.oi_hist if ts - s <= config.OI_DELTA_WINDOW_S), t.oi_hist[0][1])
         oi_delta_norm = (oi - old) / max(oi, 1.0)
 

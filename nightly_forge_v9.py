@@ -115,19 +115,32 @@ def _make_surface_fitter():
     from the macro radar's per-strike IVs (apex_main_v9.fit_surface). The forge
     replay otherwise NEVER fits it, so iv/delta/gamma/theta — four of the nineteen
     node features — train on the SVISurface DEFAULT (≈70-190% intraday IV vs the
-    real ~15%), a train/serve skew. Each NEW archived snapshot is fit once into the
-    shared StateBuilder, warm-started exactly as live converges over a 3-min macro
-    window: the first snapshot per (index,expiry) converges from DEFAULT over
-    PASSES_COLD passes, later ones refine the converged surface over PASSES_WARM.
-    No-op when `snap` is None (older days without an archive) ⇒ the forge keeps its
-    prior seed-surface behaviour, so this is purely additive. Validate the pass
-    counts on the box: a single fit does NOT converge on tiny intraday total
-    variance (the warm-start is why live's every-tick fit does)."""
+    real ~15%), a train/serve skew. Each NEW archived snapshot is fit into the
+    shared StateBuilder, warm-started exactly as live: the surface PERSISTS across
+    snapshots, so the first snapshot per (index,expiry) converges from DEFAULT and
+    every later one merely refines the already-converged surface.
+
+    FIT TO CONVERGENCE, not a fixed pass count. The live brain re-fits the surface
+    EVERY tick — hundreds-to-thousands of single-pass fits over a 3-min macro
+    window — so it reaches the SVI fixed point (the ATM total variance w(0) stops
+    moving). The previous fixed 150-cold / 12-warm passes stopped SHORT of that
+    fixed point on calm, low-IV days: the forge served iv ≈ 0.19 where the brain
+    converges to ≈ 0.13 — a ~+44% train/serve skew on the iv/delta/gamma/theta
+    features, worst exactly when IV is low. Here each snapshot is iterated until
+    w(0) settles (relative change ≤ FORGE_SURFACE_FIT_TOL) so the forge lands on
+    the SAME surface the brain serves. Warm-started: the first (cold) snapshot per
+    key converges from DEFAULT in a few hundred passes; each later snapshot in a
+    handful — it only needs to track the small intraday IV drift off the prior
+    fixed point. `min_passes` guards a one-pass fluke; `max_passes` caps a
+    non-converging fit. All three knobs are getattr-defaulted (deliberately
+    NOT in config.py) so CONFIG_HASH — and thus model/drift-reference compatibility
+    — is unchanged. No-op when `snap` is None (older days without an archive) ⇒ the
+    forge keeps its prior seed-surface behaviour, so this is purely additive."""
     fitted_ts: dict = {}
-    cold_done: set = set()
-    cold = int(getattr(config, "FORGE_SURFACE_FIT_PASSES_COLD", 150))
-    warm = int(getattr(config, "FORGE_SURFACE_FIT_PASSES_WARM", 12))
     enabled = bool(getattr(config, "FORGE_SURFACE_FIT", True))
+    tol = float(getattr(config, "FORGE_SURFACE_FIT_TOL", 1e-4))
+    max_passes = int(getattr(config, "FORGE_SURFACE_FIT_MAX_PASSES", 5000))
+    min_passes = max(int(getattr(config, "FORGE_SURFACE_FIT_MIN_PASSES", 2)), 1)
 
     def fit(builder, index, expiry, T, snap):
         if not (enabled and snap and snap.get("strikes")) or T <= 0:
@@ -141,10 +154,23 @@ def _make_surface_fitter():
             return
         K = np.asarray(snap["strikes"], float)
         iv = np.asarray(snap["iv"], float)
-        for _ in range(cold if key not in cold_done else warm):
+        # Iterate the SAME single-pass fit the live brain calls, until the ATM
+        # total variance w(0) = atm_iv²·T stops moving (rel-change ≤ tol). The
+        # surface is warm-started (it persists on `builder`), so a snapshot whose
+        # surface already sits near the fixed point exits in a couple of passes,
+        # while the first cold snapshot per key takes ~1k.
+        prev_w = None
+        for p in range(max_passes):
             builder.fit_surface(index, expiry, K, iv, F, T)
+            cur_iv = builder.surface.atm_iv(index, expiry, T)
+            if cur_iv is None or not np.isfinite(cur_iv) or cur_iv <= 0.0:
+                continue                                  # surface not usable yet
+            w = float(cur_iv) * float(cur_iv) * float(T)  # ATM total variance
+            if (prev_w is not None and p + 1 >= min_passes
+                    and abs(w - prev_w) <= tol * max(prev_w, 1e-12)):
+                break
+            prev_w = w
         fitted_ts[key] = snap["ts"]
-        cold_done.add(key)
 
     return fit
 

@@ -320,10 +320,12 @@ def main():
             if time.time() - last_hb >= config.HEARTBEAT_S:
                 last_hb = time.time()
                 log.info("♥ %s | feed age %.0fs STALE | PnL ₹%+.0f | "
-                         "pos %s | (waiting for ticks)", hm, age,
+                         "pos %s | conv %s | (waiting for ticks)", hm, age,
                          risk.realized_pnl,
                          {i: (pms[i].pos.symbol if pms[i].pos else "—")
-                          for i in config.TRADABLE})
+                          for i in config.TRADABLE},
+                         {i: (f"{conv_hist[i][-1]:+.2f}" if conv_hist.get(i)
+                              else "—") for i in config.TRADABLE})
             continue
         if stale_logged:
             log.info("✓ feed recovered (age %.1fs) — entries resumed", age)
@@ -352,11 +354,15 @@ def main():
             _run = sum(pms[i]._walkaway_tally["runaway"] for i in config.TRADABLE)
             _bord = sum(pms[i]._walkaway_tally["borderline"] for i in config.TRADABLE)
             _wa = f"{_run}R/{_bord}B" if (_run or _bord) else "0"
+            # latest signed conviction per tradable index (post-regime-mult —
+            # the exact value the entry gate sees). "—" until the first read.
+            convs = {i: (f"{conv_hist[i][-1]:+.2f}" if conv_hist.get(i) else "—")
+                     for i in config.TRADABLE}
             log.info("♥ %s | feed age %.1fs | PnL ₹%+.0f | deployed ₹%.0f | "
-                     "halted=%s | pos %s | policy %s | VIX %s | regime %s | "
-                     "walkaway %s | drift %s",
+                     "halted=%s | pos %s | conv %s | policy %s | VIX %s | "
+                     "regime %s | walkaway %s | drift %s",
                      hm, age, risk.realized_pnl, risk.deployed,
-                     risk.halted or risk.halt_reason or False, poss,
+                     risk.halted or risk.halt_reason or False, poss, convs,
                      policy.kind,
                      f"{vix_hist[-1][1]:.2f}" if vix_hist else "—",
                      _reg_s, _wa, drift_grade)

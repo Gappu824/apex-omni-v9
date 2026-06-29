@@ -490,7 +490,12 @@ MAX_HOLD_MINUTES_0DTE  = 25
 
 # Provenance: every run logs the exact config it traded on.
 import hashlib as _hl
-CONFIG_HASH = _hl.sha1(Path(__file__).read_bytes()).hexdigest()[:10]
+# CONFIG_HASH is computed at the END of this module — it must see every constant
+# defined below it (e.g. DRIFT_KEY_FEATURES, COSTS). See _compute_config_hash().
+# It is a FEATURE/MODEL fingerprint, not a whole-file hash: operational knobs
+# (capital, sizing, polling, paths, …) are excluded so editing them no longer
+# invalidates a trained reference. live_fire_armed() above reads it at runtime,
+# by which point the end-of-file assignment has run.
 
 # ----------------------------------------------------------------------------
 # FEATURE-DRIFT MONITOR (the live regime-shift guard — core/drift_monitor.py)
@@ -627,3 +632,113 @@ REWARD_HORIZON_S      = 60
 RISK_FREE_RATE        = 0.07
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+# ============================================================================
+# CONFIG_HASH — model/feature fingerprint (computed last, sees all constants)
+# ============================================================================
+# Stamped into every trained artifact (drift reference, meta-labeler) and the
+# Edge Certificate, then checked before any of them is trusted. It fingerprints
+# ONLY the constants that change those artifacts: how the 19 features are
+# computed, the feature-tensor shape, the surface/greeks math, the triple-
+# barrier labels (BASE_TP_PCT / BASE_SL_PCT / MAX_HOLD_MINUTES), broker COSTS
+# (labels are net-of-cost), and the regime / trap / vol-forecaster thresholds.
+#
+# Pure OPERATIONAL knobs are excluded so editing them does NOT invalidate a
+# reference the forge already trained: capital & sizing, risk budgets, order
+# routing / fills / polling, cooldowns & watchdogs, telemetry & logging cadence,
+# filesystem paths, credentials, drift ASSESSMENT thresholds (retune the de-arm
+# without a re-forge), edge-audit knobs, and forge training-infra hyper-params.
+#
+# FAIL-CLOSED: anything not explicitly excluded is fingerprinted, so a newly
+# added feature/label constant still invalidates correctly even if nobody
+# updates this list. Operational additions you don't want to force a re-forge
+# must be named with a path suffix or added to _HASH_EXCLUDE.
+#
+# NOTE: this changes the hash value itself. After deploying, the existing
+# reference reads NO_REF until the nightly forge runs once and restamps it. It
+# also means the Edge-Certificate config check no longer trips on these
+# operational knobs (including TRADING_CAPITAL) — acceptable while LIVE_FIRE is
+# permanently False and the certificate is re-audited from the ledger nightly.
+_HASH_EXCLUDE = frozenset({
+    # the hash must never fingerprint itself (else recompute is unstable)
+    "CONFIG_HASH",
+    # identity / run-mode (no effect on features or the trained model)
+    "VERSION", "LIVE_FIRE", "LIVE_CONFIRM_ENV", "LIVE_CONFIRM_PHRASE",
+    "PAPER_EXPLORE", "PAPER_FILL_REALISM", "PAPER_ENTRY_CONVICTION",
+    "PAPER_EXPLORE_WINPROB", "DEVICE",
+    # capital / sizing / risk budget (execution economics only)
+    "TRADING_CAPITAL", "KELLY_FRACTION", "MAX_KELLY_BUDGET_PCT",
+    "MAX_DAILY_DRAWDOWN_PCT", "MAX_LOSS_PER_TRADE_PCT",
+    "MAX_CONCURRENT_POSITIONS", "VOL_TARGET_ANN", "VOL_SCALE_MIN",
+    # credentials (env-derived, rotate daily)
+    "KITE_API_KEY", "KITE_API_SECRET", "KITE_ACCESS_TOKEN",
+    # cooldowns / lockouts / throttles / halts / data-watchdog (gate orders;
+    # identical paper↔live; do not change per-second feature/label generation)
+    "COOLDOWN_S", "DIRECTION_LOCKOUT_S", "ENTRY_ATTEMPT_THROTTLE_S",
+    "MAX_ORDER_REJECTS", "DATA_STALE_BLOCK_S", "DATA_STALE_FLATTEN_S",
+    "MACRO_STALE_S",
+    # order routing / fills / polling / entry-cross execution
+    "PAPER_SLIPPAGE_TICKS", "URGENT_CHASE_TICKS", "LIVE_POLL_INTERVAL_S",
+    "ORDER_POLL_BUDGET_S", "ORDER_REPOST_TICKS", "SELL_MARKET_PROTECTION",
+    "ENTRY_CROSS_CONVICTION", "ENTRY_SLIP_CAP_PCT", "SLIPCAP_BORDERLINE_FRAC",
+    "ENTRY_CROSS_SPREAD_PCT", "ENTRY_CROSS_CAP_TICKS", "LIVE_GTT_FLOOR",
+    "MAX_ENTRY_SPREAD_PCT",
+    # macro / scanner cadence & coverage  (MACRO_STRIKE_BAND stays IN — it
+    # shapes the GEX surface that iv/skew features and the shaped target read)
+    "MACRO_LOOP_S", "MACRO_QUOTE_CHUNK", "SCANNER_ALERT", "SCANNER_OFFSETS",
+    # telemetry / logging / IO cadence / inference-time calibration build
+    "HEARTBEAT_S", "TRADE_TRACK_S", "TELEMETRY_S", "QUEUE_WARN_DEPTH",
+    "RING_WRITE_S", "DB_BATCH_ROWS", "PRUNE_STEPS", "SNAPSHOT_PM_AT",
+    "LOG_FORMAT", "CAL_RELOAD_S", "QUOTE_CACHE_FRESH_S", "REGIME_LOG_EVERY_S",
+    "REGIME_FEATURE_LOG_MAX", "CAL_BUCKET_WIDTH", "CAL_MIN_SAMPLES",
+    # edge-certificate audit knobs (the cert is re-audited nightly from ledger)
+    "EDGE_MIN_TRADES", "EDGE_MIN_DAYS", "EDGE_BOOTSTRAP_N", "EDGE_CI",
+    "EDGE_CERT_VALID_DAYS",
+    # forge training-infra hyper-params (change HOW models train, not the
+    # data / labels / features / reference distribution)
+    "FORGE_BANDIT_BATCH", "FORGE_BANDIT_WARMUP_EPOCHS", "FORGE_BANDIT_EVAL_ROWS",
+    "FORGE_MIN_TRADE_RATE", "FORGE_BANDIT_MAX_EPOCHS", "FORGE_BANDIT_PATIENCE",
+    "FORGE_BANDIT_REWARD_SCALE", "SAC_BUFFER", "SAC_BATCH", "SAC_TRAIN_FREQ",
+    "SAC_GRAD_STEPS", "SAC_TIMESTEPS_CAP", "FORGE_EVAL_STEP_S",
+    "FORGE_ACT_GATE_TRAIN", "FORGE_ACT_GATE_EVAL", "FORGE_PROMOTE_MARGIN",
+    "FORGE_LOOKBACK_DAYS", "FORGE_RESERVOIR_DAYS", "FORGE_VAL_DAYS",
+    # drift ASSESSMENT thresholds (retune de-arm sensitivity with NO re-forge;
+    # the reference-CONSTRUCTION knobs DRIFT_BINS / DRIFT_REF_MAX_SAMPLES /
+    # DRIFT_KEY_FEATURES are deliberately NOT here — they stay in the hash)
+    "DRIFT_PSI_MODERATE", "DRIFT_PSI_SIGNIFICANT", "DRIFT_KS_SIGNIFICANT",
+    "DRIFT_WATCH_FRAC", "DRIFT_DEARM_FRAC", "DRIFT_MIN_LIVE_SAMPLES",
+    # misc data-source / backfill
+    "BACKFILL_DAYS", "VIX_SYMBOL",
+})
+
+# names ending in any of these are filesystem locations / log toggles → excluded
+_HASH_PATH_SUFFIXES = ("_PATH", "_DIR", "_TMPL", "_TABLE", "_MANIFEST", "_LOG")
+
+
+def _hash_canon(v):
+    """Deterministic, order-stable canonical form for the fingerprint payload."""
+    if isinstance(v, bool) or v is None or isinstance(v, (int, float, str)):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_hash_canon(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _hash_canon(v[k]) for k in sorted(v, key=str)}
+    return repr(v)                       # time/enum/etc. — stable repr
+
+
+def _compute_config_hash() -> str:
+    g = list(globals().items())          # snapshot: don't mutate during iterate
+    items = []
+    for k, v in g:
+        if not k.isupper() or k.startswith("_"):
+            continue                     # only public UPPERCASE constants
+        if k in _HASH_EXCLUDE or k.endswith(_HASH_PATH_SUFFIXES):
+            continue                     # operational knob — excluded
+        if isinstance(v, Path):
+            continue                     # any stray path constant
+        items.append((k, _hash_canon(v)))
+    payload = repr(sorted(items)).encode("utf-8")
+    return _hl.sha1(payload).hexdigest()[:10]
+
+
+CONFIG_HASH = _compute_config_hash()

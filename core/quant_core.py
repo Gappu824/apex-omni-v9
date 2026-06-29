@@ -196,22 +196,53 @@ class EWMAVol:
         self.alpha = 1 - math.exp(math.log(0.5) / half_life_s)
         self.ewma = 0.0; self.last = None
     def update(self, price, dt_s=1.0):
+        # dt_s-aware: the return is normalized by sqrt(dt) and the EWMA weight is
+        # anchored to a 1 s step (a == self.alpha at dt_s == 1.0), so the half-life
+        # is wall-clock seconds rather than a fixed tick count. Called with the
+        # real dt the value is cadence-invariant; called with the dt_s=1.0 default
+        # (e.g. the 1 Hz-gated rvol in the brain) it is byte-identical to before.
         if self.last and self.last > 0 and price > 0:
-            r = abs(math.log(price / self.last)) / max(math.sqrt(dt_s), 1e-3)
-            self.ewma = (1 - self.alpha) * self.ewma + self.alpha * r
+            dt = max(float(dt_s), 1e-6)
+            r = abs(math.log(price / self.last)) / max(math.sqrt(dt), 1e-3)
+            a = 1.0 - (1.0 - self.alpha) ** dt
+            self.ewma = (1 - a) * self.ewma + a * r
         self.last = price
         return self.annualized()
     def annualized(self):
         return self.ewma * math.sqrt(252.0 * 375.0 * 60.0)
 
 class HawkesExcitation:
+    """Self-exciting intensity with an exponential (time-based) kernel.
+
+    CADENCE-INVARIANT and reference-preserving. The old form added the
+    excitation once per call (``+= intensity``), so the steady-state value
+    scaled with the *update rate*: at the brain's ~5 Hz it sat ~2.6x above the
+    forge's 1 Hz reference — a train/serve skew identical in shape to the
+    dealer-inventory one. Here the per-step excitation is weighted by
+    ``(1-e^{-decay·dt}) / (1-e^{-decay·dt_ref})`` with ``dt_ref`` = the forge's
+    1 Hz replay step. Two properties fall out:
+      • at dt = dt_ref the weight is 1.0  → ``+= intensity`` exactly, so the
+        existing drift reference is unchanged (NO re-forge);
+      • the steady-state value is ``intensity / (1-e^{-decay·dt_ref})`` for ANY
+        dt, so the brain at 5 Hz converges to the SAME value the 1 Hz reference
+        encodes (a plain ``×dt`` does not — it overshoots to ~0.5x).
+    dt is clamped to guard feed gaps / out-of-order timestamps.
+    """
+    _MAX_DT_S = 5.0
+    _REF_DT_S = 1.0          # forge replays at 1 Hz; reference is built at this step
+
     def __init__(self, decay_per_s=2.0):
         self.decay = decay_per_s; self.val = 0.0; self.last_t = None
+        self._ref_w = 1.0 - math.exp(-decay_per_s * self._REF_DT_S)
     def update(self, t, intensity):
-        if self.last_t is not None:
-            self.val *= math.exp(-self.decay * max(t - self.last_t, 0.0))
+        if self.last_t is None:
+            dt = self._REF_DT_S                  # first tick: matches old (+= intensity)
+        else:
+            dt = min(max(t - self.last_t, 0.0), self._MAX_DT_S)
+            self.val *= math.exp(-self.decay * dt)
         self.last_t = t
-        self.val += float(intensity)
+        w = (1.0 - math.exp(-self.decay * dt)) / self._ref_w
+        self.val += float(intensity) * w
         return self.val
 
 def micro_price(bid, ask, bid_qty, ask_qty):
