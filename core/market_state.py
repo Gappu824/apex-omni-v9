@@ -52,7 +52,7 @@ class _Trackers:
     __slots__ = ("vol", "vpin", "hawkes", "last_ltp", "ew_voldelta",
                  "ofi_hist", "dealer_inv", "last_bid", "last_ask",
                  "last_bq", "last_aq", "oi_hist", "last_ts", "last_side",
-                 "ltp_hist")
+                 "ltp_hist", "vol_sec", "vol_cache")
 
     def __init__(self):
         self.vol = EWMAVol(config.EWMA_VOL_HALFLIFE_S)
@@ -70,6 +70,8 @@ class _Trackers:
         self.last_bq = self.last_aq = 0.0
         self.oi_hist = deque()          # (ts, oi) — ΔOI window (seconds)
         self.ltp_hist = deque()         # (ts, ltp) — log-return horizon (seconds)
+        self.vol_sec = None             # int(ts) of the last regime_vol update (1 Hz gate)
+        self.vol_cache = 0.0            # last 1 Hz regime_vol, held between updates
 
 
 class StateBuilder:
@@ -116,10 +118,22 @@ class StateBuilder:
                 log_ret = math.log(ltp / p_ref)
         t.last_ltp = ltp if ltp > 0 else t.last_ltp
 
-        # regime vol / hawkes — one formula, period. EWMAVol now sees the real dt
-        # (return ÷√dt, half-life anchored to seconds) so it no longer reads hot
-        # and fast at 5 Hz. hawkes reads the PRE-update ew_voldelta (kept).
-        regime_vol = t.vol.update(ltp if ltp > 0 else (t.last_ltp or 1.0), dt_s=dt)
+        # regime vol — gated to ONE update per wall-clock SECOND with dt_s=1.0, so
+        # the brain (~5 Hz) samples regime_vol at the SAME 1 Hz cadence the forge
+        # reference is built at. EWMAVol's return÷√dt is correct for diffusion but
+        # AMPLIFIES bid-ask-bounce noise by 1/√dt, so updating it every 5 Hz tick
+        # made regime_vol read multiples of the 1 Hz forge value (worst on calm
+        # days, where the estimate is mostly microstructure noise) — a pure
+        # train/serve skew, not real vol. This mirrors the brain's own 1 Hz-gated
+        # rvol. At the forge's 1 Hz int(ts) advances every call → it updates every
+        # call with dt_s=1.0 exactly as before, so the drift reference is unchanged
+        # (NO re-forge). hawkes reads the PRE-update ew_voldelta (kept).
+        _sec = int(ts)
+        if _sec != t.vol_sec:
+            t.vol_sec = _sec
+            t.vol_cache = t.vol.update(ltp if ltp > 0 else (t.last_ltp or 1.0),
+                                       dt_s=1.0)
+        regime_vol = t.vol_cache
         hawkes = t.hawkes.update(ts, min(vol_d / max(t.ew_voldelta, 1.0), 5.0))
 
         # ew_voldelta: expected volume PER SECOND. The EWMA weight is anchored to a

@@ -127,6 +127,8 @@ class PositionManager:
         self.risk = risk
         self.engine = engine
         self.pos: Position | None = None
+        self.last_block_reason = ""     # why the most recent try_enter didn't fill
+                                        # (read by the brain's heartbeat why-flat line)
         # walk-away diagnostics: classify chase-cap NOFILLs so the operator can
         # SEE whether the slip cap is refusing genuine chases (runaway) or might
         # be too tight on real fills (borderline). Evidence to tune the cap.
@@ -149,6 +151,7 @@ class PositionManager:
     def try_enter(self, ctx: TickContext, direction: str, conviction: float,
                   win_prob: float, hierarchy: list[LegQuote]) -> bool:
         if self.pos is not None:
+            self.last_block_reason = "already in position"
             return False
         cands = []
         for q in hierarchy:
@@ -166,6 +169,7 @@ class PositionManager:
                       conviction=f"{conviction:.3f}")
             log.info("SKIP %s %s (conv %+.2f): no leg passes spread gate",
                      self.index, direction, conviction)
+            self.last_block_reason = "no leg passes spread gate"
             return False
         leg, permit = self.risk.first_affordable(
             cands, direction=direction, win_prob=win_prob,
@@ -178,6 +182,7 @@ class PositionManager:
                       conviction=f"{conviction:.3f}")
             log.info("BLOCKED %s %s (conv %+.2f): %s", self.index,
                      direction, conviction, permit.reason)
+            self.last_block_reason = permit.reason
             return False
         q: LegQuote = leg["q"]
         tick = 0.05
@@ -221,6 +226,7 @@ class PositionManager:
                          "%.2f (spread %.1f%%), walked away",
                          self.index, q.symbol, kind, q.ask, overshoot * 100,
                          max_pay, spread_pct * 100)
+                self.last_block_reason = f"signal stale ({kind}) — ask past chase cap"
                 return False
             # cross: take the ask, hard-ceilinged a couple ticks beyond it
             limit = round(min(q.ask + config.ENTRY_CROSS_CAP_TICKS * tick,
@@ -239,6 +245,7 @@ class PositionManager:
             self._log(ts=ctx.ts, event="REJECT", index=self.index,
                       symbol=q.symbol, direction=direction,
                       reason=fill.reason, order_id=fill.order_id)
+            self.last_block_reason = f"rejected ({fill.reason})"
             return False
         if fill.status == "NOFILL" or fill.qty <= 0:
             self._log(ts=ctx.ts, event="NOFILL", index=self.index,
@@ -247,6 +254,7 @@ class PositionManager:
                       order_id=fill.order_id)
             log.info("NOFILL %s %s @ %.2f — walked away", self.index,
                      q.symbol, limit)
+            self.last_block_reason = "maker no-fill — walked away"
             return False
 
         outlay = fill.avg_price * fill.qty
@@ -295,6 +303,7 @@ class PositionManager:
                   regime=ctx.regime_label)
         log.info("ENTER %s %s ×%d @ %.2f | stop %.2f floor %.2f target %.2f",
                  self.index, p.symbol, p.qty, p.entry, p.stop, p.floor, p.target)
+        self.last_block_reason = ""
         return True
 
     # ------------------------------------------------------------ manage

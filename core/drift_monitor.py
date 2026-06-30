@@ -72,6 +72,15 @@ _DEGEN_REF_STD   = 2e-3     # ref std below this ⇒ reference constant ⇒ unbi
 _STALE_LIVE_STD  = 1e-6     # live std below this ⇒ that feature's feed is frozen
 _STALE_MIN_FEATS = 3        # this many frozen features ⇒ treat the FEED as stale
 _MIN_ASSESSABLE  = 6        # fewer assessable features than this ⇒ low confidence
+# A single live SESSION is a narrow slice of the multi-DAY reference, so its
+# marginal is always narrower than the 8-day pool — which trips raw PSI/KS even
+# when the LEVEL is dead-on (z≈0). The thresholds below qualify that shape move
+# with a real LEVEL shift or a real DISPERSION blow-up before it counts as drift
+# (see assess). getattr-defaults so they stay tunable without touching config /
+# the model fingerprint (no re-forge); promote to config + _HASH_EXCLUDE to pin.
+_Z_SIGNIFICANT = float(getattr(config, "DRIFT_Z_SIGNIFICANT", 1.0))  # |z| ⇒ level shifted
+_Z_MODERATE    = float(getattr(config, "DRIFT_Z_MODERATE",    0.5))  # |z| ⇒ WATCH-worthy
+_DISP_BLOWUP   = float(getattr(config, "DRIFT_DISP_BLOWUP",   2.0))  # live_std/ref_std ⇒ variance spike
 
 
 # ============================================================ reference
@@ -233,9 +242,22 @@ class DriftMonitor:
             elif live_frozen:
                 level = "stale"; stale += 1
             else:
-                sig = psi >= config.DRIFT_PSI_SIGNIFICANT or \
+                # SHAPE alone over-fires: a single live SESSION is a narrow slice
+                # of the multi-DAY reference, so live is systematically narrower
+                # than the 8-day marginal and PSI/KS clear their bars even when the
+                # level is dead-on (z≈0). That narrowing is a SAMPLING ARTIFACT, not
+                # regime drift. A feature is genuinely DRIFTED only when shape moved
+                # AND its LEVEL has shifted (|z| past a bar) OR its DISPERSION has
+                # BLOWN UP (live materially WIDER than the reference — the one shape
+                # change a narrow window cannot manufacture). Shape stays a necessary
+                # condition so level micro-noise alone can't trip it; PSI/KS remain
+                # in the per-feature log either way for diagnostics.
+                shape_moved = psi >= config.DRIFT_PSI_SIGNIFICANT or \
                     ks >= config.DRIFT_KS_SIGNIFICANT
-                mod = (not sig) and psi >= config.DRIFT_PSI_MODERATE
+                level_moved = abs(z) >= _Z_SIGNIFICANT
+                disp_blowup = rs > 1e-12 and (ls / rs) >= _DISP_BLOWUP
+                sig = shape_moved and (level_moved or disp_blowup)
+                mod = (not sig) and shape_moved and abs(z) >= _Z_MODERATE
                 considered += 1
                 significant += int(sig)
                 moderate += int(mod)

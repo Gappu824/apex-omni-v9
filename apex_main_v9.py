@@ -36,6 +36,7 @@ import numpy as np
 import config
 from apex_ipc_core import BinaryRingBuffer
 from core.market_state import StateBuilder
+from core.signal_persistence import assess_persistence
 from core.quant_core import bayesian_signal_fusion
 from core.risk_manager import RiskGovernor
 from core.execution_engine import ExecutionEngine
@@ -272,6 +273,12 @@ def main():
     log.info("entry conviction bar: %.2f | mode: %s", entry_bar, _mode)
     last_cal_load = time.time()
     last_hb = 0.0
+    # WHY-FLAT TRACKER: the last gate that stopped a fill, per index, refreshed
+    # each tick and surfaced on every heartbeat so the operator sees the CURRENT
+    # blocking reason instead of scrolling per-tick skip lines. NOTE: in PAPER,
+    # drift de-arm does NOT block (paper continues), so this is the real
+    # paper-blocking reason; the live-only drift de-arm stays in the `drift` field.
+    skip_reason: dict[str, str] = {i: "warming up" for i in config.TRADABLE}
     stale_logged = False
     ring_quotes: dict[int, dict] = {}
     engine.quote_fn = lambda tok: ring_quotes.get(tok, {})
@@ -358,14 +365,41 @@ def main():
             # the exact value the entry gate sees). "—" until the first read.
             convs = {i: (f"{conv_hist[i][-1]:+.2f}" if conv_hist.get(i) else "—")
                      for i in config.TRADABLE}
+            # WHY EACH INDEX IS FLAT right now — the last gate that stopped a fill
+            # this tick (a held position shows "in <symbol>"). This is the
+            # PAPER-blocking reason; drift de-arm is live-only and is the separate
+            # `drift` field, so the two are never conflated.
+            no_trade = " · ".join(f"{i}: {skip_reason.get(i, '—')}"
+                                  for i in config.TRADABLE)
             log.info("♥ %s | feed age %.1fs | PnL ₹%+.0f | deployed ₹%.0f | "
                      "halted=%s | pos %s | conv %s | policy %s | VIX %s | "
-                     "regime %s | walkaway %s | drift %s",
+                     "regime %s | walkaway %s | drift %s | no-trade: %s",
                      hm, age, risk.realized_pnl, risk.deployed,
                      risk.halted or risk.halt_reason or False, poss, convs,
                      policy.kind,
                      f"{vix_hist[-1][1]:.2f}" if vix_hist else "—",
-                     _reg_s, _wa, drift_grade)
+                     _reg_s, _wa, drift_grade, no_trade)
+            # KEY LEVELS per tradable index — spot vs prev-day candle (PDC/PDH/PDL)
+            # and the live GEX call/put walls + gamma flip from the macro radar
+            # (the walls are what the system caps targets at). One line per index;
+            # any piece that isn't available yet prints "—".
+            for i in config.TRADABLE:
+                sp = last_spot.get(i)
+                if not sp:
+                    log.info("  levels %-6s | spot — (waiting for ticks)", i)
+                    continue
+                lv = levels.get(i, {})
+                mc = read_macro(i) or {}
+                pdc = lv.get("pdc")
+                pdc_s = (f"PDC {pdc:.0f} ({sp/pdc - 1:+.1%})" if pdc else "PDC —")
+                pdh_s = f"PDH {lv['pdh']:.0f}" if lv.get("pdh") else "PDH —"
+                pdl_s = f"PDL {lv['pdl']:.0f}" if lv.get("pdl") else "PDL —"
+                cw, pw, fl = mc.get("call_wall"), mc.get("put_wall"), mc.get("flip")
+                wall_s = (f"Cwall {cw:.0f}" if cw else "Cwall —") + \
+                         (f"  Pwall {pw:.0f}" if pw else "  Pwall —") + \
+                         (f"  flip {fl:.0f}" if fl else "  flip —")
+                log.info("  levels %-6s | spot %.0f  %s  %s  %s | %s",
+                         i, sp, pdc_s, pdh_s, pdl_s, wall_s)
 
         # refresh ring-backed quotes for the paper engine + surfaces from macro
         ring_quotes.clear()
@@ -595,6 +629,7 @@ def main():
                     ring_quotes.get(pm.pos.token, {}) if pm.pos else {}):
                 log.info("resting order %s → %s", oid, fill.status)
             if pm.pos:
+                skip_reason[idx] = f"in {pm.pos.symbol}"
                 if risk.halted:
                     pm._exit(tctx, ring_quotes.get(pm.pos.token, {}),
                              "RISK_HALT", urgent=True)
@@ -615,6 +650,7 @@ def main():
             eff_bar = entry_bar + vix_bump +                 (config.IVRANK_BAR_BUMP
                  if ivr is not None and ivr >= config.IVRANK_HIGH else 0.0)
             if risk.halted:
+                skip_reason[idx] = f"risk halted ({risk.halt_reason or 'drawdown'})"
                 continue
             # DECISION GATE — model-driven when a trained meta-model exists,
             # else the fixed conviction bar (bootstrap). The risk envelope
@@ -623,38 +659,44 @@ def main():
                 # trained model live → the model's calibration-blended P(win)
                 # decides, above a minimal directional floor so it never acts on
                 # noise. Threshold-free in the meaningful range; no hand-set bar.
-                if abs(conv) < config.META_ENTRY_CONV_FLOOR \
-                        or wp < config.META_ENTRY_P_BAR:
+                if abs(conv) < config.META_ENTRY_CONV_FLOOR:
+                    skip_reason[idx] = (f"conv {abs(conv):.2f}<"
+                                        f"{config.META_ENTRY_CONV_FLOOR:.2f} floor")
+                    continue
+                if wp < config.META_ENTRY_P_BAR:
+                    skip_reason[idx] = (f"meta P(win) {wp:.2f}<"
+                                        f"{config.META_ENTRY_P_BAR:.2f}")
                     continue
                 _gate = f"meta P(win) {wp:.2f}≥{config.META_ENTRY_P_BAR:.2f}"
             else:
                 # bootstrap: no trained model yet → fixed conviction bar
                 if abs(conv) < eff_bar:
+                    skip_reason[idx] = f"conv {abs(conv):.2f}<{eff_bar:.2f} bar"
                     continue
                 _gate = f"conv {abs(conv):.2f}≥{eff_bar:.2f}"
             # SIGNAL-PERSISTENCE GATE — the instantaneous conviction cleared the
-            # bar, but is the read SUSTAINED or a one-tick spike? Require the
-            # recent window to (a) agree in sign and (b) average above the
-            # persistence floor. This is the difference between a confident trade
-            # and getting whipsawed in a choppy tape. Skipped until the window
-            # has filled (warm-up) so it doesn't block the first valid signals.
+            # bar, but is the read SUSTAINED or a one-tick spike? Net-displacement
+            # / signal-to-noise test (see core/signal_persistence.py): coherence of
+            # the signed conviction window (robust to an up-down tape that nets to a
+            # real move, unlike tick-by-tick sign agreement) + a Kaufman efficiency
+            # ratio on the tape, with an optional read-vs-tape agreement check.
+            # Skipped until the window has filled (warm-up).
             if config.SIGNAL_PERSIST_ENABLED:
                 ch = conv_hist.get(idx)
                 if ch is not None and len(ch) >= config.SIGNAL_PERSIST_N:
-                    same_dir = sum(1 for c in ch if (c > 0) == (conv > 0))
-                    avg_conv = sum(abs(c) for c in ch) / len(ch)
-                    frac_agree = same_dir / len(ch)
-                    if frac_agree < config.SIGNAL_PERSIST_FRAC:
-                        log.info("%s signal not persistent — direction agreed "
-                                 "%.0f%% of last %d ticks (need %.0f%%); skipping "
-                                 "whipsaw", idx, frac_agree * 100, len(ch),
-                                 config.SIGNAL_PERSIST_FRAC * 100)
-                        continue
-                    if avg_conv < eff_bar * config.SIGNAL_PERSIST_AVG_MULT:
-                        log.info("%s signal not persistent — avg |conv| %.2f over "
-                                 "last %d ticks below %.2f; skipping spike",
-                                 idx, avg_conv, len(ch),
-                                 eff_bar * config.SIGNAL_PERSIST_AVG_MULT)
+                    # actionable floor must match the LIVE decision path: the meta
+                    # conviction floor when the model decides, else the bootstrap
+                    # bar — not a separate, higher persistence-only threshold.
+                    _floor = (config.META_ENTRY_CONV_FLOOR
+                              if (config.META_DECISION_ENABLED
+                                  and wp_meta is not None)
+                              else eff_bar)
+                    _ok, _why, _ = assess_persistence(
+                        conv, list(ch), list(spot_secs.get(idx, ())),
+                        conv_floor=_floor)
+                    if not _ok:
+                        skip_reason[idx] = _why
+                        log.info("%s signal not persistent — %s", idx, _why)
                         continue
             if ts - last_try.get(idx, -1e9) < config.ENTRY_ATTEMPT_THROTTLE_S:
                 continue                       # one attempt per 5 s per index
@@ -664,6 +706,7 @@ def main():
                 continue
             hier_rows = mapper.hierarchy(idx, spot, direction)
             if not hier_rows:
+                skip_reason[idx] = "no option chain"
                 continue
             quotes = qc.get([(r["exchange"], r["symbol"]) for r in hier_rows])
             T = float(ctx_m.get("T", 0.01))
@@ -691,6 +734,8 @@ def main():
                     ask_qty=float(s0.get("quantity") or 0),
                     lot=r["lot"], delta=float(g["delta"]),
                     dte=float(ctx_m.get("dte", 1.0))))
+            if not hierarchy:
+                skip_reason[idx] = "no two-sided quotes"
             if hierarchy:
                 # The engine's paper quote_fn reads ring_quotes by token. The
                 # harvester only streams the ATM legs into the ring, so a chosen
@@ -711,6 +756,8 @@ def main():
                                             and wp_meta is not None)
                          else "bootstrap (fixed bar)")
                 pm.try_enter(tctx, direction, conv, wp, hierarchy)
+                skip_reason[idx] = (f"in {pm.pos.symbol}" if pm.pos
+                                    else pm.last_block_reason or "no fill")
 
 
 if __name__ == "__main__":
