@@ -19,6 +19,14 @@
    "date": "2026-06-25",
    "index": "NIFTY",
    "name": "mined_stop_run_2026-06-25_0931"
+  },
+  {
+   "kind": "stale",
+   "hm": "10:23",
+   "dur_s": 117,
+   "date": "2026-06-30",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-06-30_1023"
   }
  ]
 }
