@@ -1,6 +1,6 @@
 """
-APEX OMNI v9 — LIVE BRAIN (audit §8 rebuilt)
-============================================
+APEX OMNI v9.1 — LIVE BRAIN (audit §8 rebuilt; v9.1 shared decision path)
+=========================================================================
 Execution truth, one feature dialect, calibrated conviction, and a watchdog:
 
   * Startup reconciles against kite.positions() (live) — a restart can never
@@ -21,7 +21,34 @@ Execution truth, one feature dialect, calibrated conviction, and a watchdog:
     brain runs a transparent physics-only HeuristicPolicy so paper trading
     (and calibration-building) never blocks on the ML stack.
 
+v9.1 (audit fixes — see core/decision.py for the full rationale):
+  * EVERY decision stage — advisory shock, fusion, regime scaling, effective
+    bar, win-probability blend, persistence, the entry gate — now lives in
+    core/decision.py, imported here AND by the nightly forge. The brain no
+    longer has a private dialect the trainer can't hear.
+  * Regime multiplier applied in LOGIT space: CHOP/VOL_CRUSH dampen instead
+    of arithmetically vetoing (the old ×0.70 on a tanh could never clear 0.70).
+  * Persistence window is WALL-CLOCK (SIGNAL_PERSIST_WINDOW_S), not "last 4
+    loop iterations ≈ 0.8 s".
+  * GATE FUNNEL diagnostics: every tick, every tradable index, exactly one
+    outcome is counted (which gate blocked, or entered). Heartbeat shows the
+    running funnel; logs/brain_report_<date>.json carries the full table plus
+    conviction percentiles, regime time-share and P(win) stats — "why is it
+    flat" is now a file.
+
 Run:  python apex_main_v9.py
+
+v9.1.2 (2026-07-06 — the last parity gap): DECISIONS run once per RING SECOND.
+The harvester writes the ring at 1 Hz; the old ~5 Hz loop re-pushed the same
+snapshot ~5×/s, quintuple-counting vol_delta into OFI/VPIN/Hawkes/dealer-inv
+(live conv 0.86–0.95 vs the forge replay's ~0.5 ceiling on 2026-07-03) and
+inferring on a frame cadence the net never trained on. Now: push/policy/shock/
+regime/persistence/gates/entry at exactly the forge grader's cadence — while
+the 0.2 s loop keeps exits, fills, trap checks, the stale watchdog and trade
+tracking at full tempo (management reads the ≤1 s-old cached decision state).
+Bonus fixes for free: drift.observe samples at the reference population's
+cadence, and the VIX 5-minute spike window is finally 5 minutes (the 5 Hz
+deque had silently shrunk it to ~80 s).
 """
 from __future__ import annotations
 import datetime as dt
@@ -36,8 +63,6 @@ import numpy as np
 import config
 from apex_ipc_core import BinaryRingBuffer
 from core.market_state import StateBuilder
-from core.signal_persistence import assess_persistence
-from core.quant_core import bayesian_signal_fusion
 from core.risk_manager import RiskGovernor
 from core.execution_engine import ExecutionEngine
 from core.position_manager import PositionManager, LegQuote, TickContext
@@ -45,6 +70,8 @@ from core.instruments import LiveMapper
 from core.heuristic_policy import HeuristicPolicy
 from core.quant_core import black76_greeks
 from core import regime_classifier as regime_mod
+from core import decision as D
+from core.diagnostics import DailyReport, Reservoir
 
 log = logging.getLogger("brain")
 
@@ -139,22 +166,6 @@ def load_meta():
     return _meta_cache["m"]
 
 
-def meta_win_prob(frame, i, tod, er, f30, dirn) -> float | None:
-    m = load_meta()
-    if not m or int(m.get("n", 0)) < config.META_MIN_TRAIN:
-        return None
-    b0 = i * config.NODES_PER_INDEX
-    x = np.concatenate([frame[b0], frame[b0 + 1], frame[b0 + 2],
-                        [tod, er,
-                         math.copysign(min(abs(f30) * 100, 3), f30)
-                         if f30 else 0.0,
-                         1.0 if dirn > 0 else -1.0]]).astype(np.float32)
-    sd = np.asarray(m["sd"], np.float32)
-    z = (x - m["mu"]) / np.where(sd > 0.0, sd, 1.0)   # zero-variance dims contribute 0; no /0 → no NaN
-    pr = 1.0 / (1.0 + math.exp(-float(z @ m["w"]) - float(m["b"])))
-    return float(min(max(pr, config.META_P_FLOOR), config.META_P_CAP))
-
-
 def load_calibration() -> dict:
     if config.CALIBRATION_TABLE.exists():
         try:
@@ -162,13 +173,6 @@ def load_calibration() -> dict:
         except Exception:                                 # noqa: BLE001
             pass
     return {}
-
-def win_prob_for(conv: float, table: dict) -> float:
-    w = config.CAL_BUCKET_WIDTH
-    b = f"{min(abs(conv) // w * w, 1 - w):.2f}"
-    if b in table and table[b][1] >= config.CAL_MIN_SAMPLES:
-        return float(table[b][0])
-    return config.uncalibrated_winprob()
 
 def read_macro(idx: str) -> dict | None:
     p = Path(config.MACRO_STATE_TMPL.format(idx=idx))
@@ -243,13 +247,49 @@ def main():
     p945: dict[str, float] = {}
     regime_now: dict[str, object] = {}                 # last Regime per index
     last_track: dict[str, float] = {}                  # trade-tracking cadence
-    conv_hist: dict[str, deque] = {}                   # rolling conviction window
+    persist = {i: D.PersistenceTracker() for i in config.TRADABLE}
     from core.quant_core import EWMAVol
     rvol: dict[str, EWMAVol] = {i: EWMAVol() for i in config.INDICES}
     realized_vol_ann: dict[str, float] = {}
     spot_secs: dict[str, deque] = {i: deque(maxlen=1800)
                                    for i in config.TRADABLE}
-    last_sec_push: dict[str, int] = {}
+    # ---- v9.1.2 DECISION CADENCE state: the harvester writes the ring once
+    # per second, so decisions run once per RING SECOND (the forge's exact
+    # cadence); the ~5 Hz loop keeps exits/fills/trap/watchdog at full tempo.
+    # Cached 1 Hz products the management path reads between decisions:
+    last_decision_sec = -1
+    obs = None
+    frame = None
+    actions = np.zeros(config.ACTION_DIM, np.float32)
+    last_conv: dict[str, float] = {}       # post-regime conv, ≤1 s old
+    last_wp_hold: dict[str, float | None] = {}
+    last_mac: dict[str, dict | None] = {}
+    # ---- v9.1 diagnostics: gate funnel + daily report -----------------------
+    funnel = D.GateFunnel(config.TRADABLE)
+    report = DailyReport("brain")
+    conv_res = {i: Reservoir(20_000) for i in config.TRADABLE}   # |conv| stream
+    wp_res = {i: Reservoir(20_000) for i in config.TRADABLE}     # gated P(win)
+    regime_share: dict[str, dict] = {i: {} for i in config.TRADABLE}
+    last_report = time.time()
+
+    def _write_report(final: bool = False):
+        report.d["mode"] = ("LIVE" if config.live_fire_armed() else
+                            ("paper-explore" if config.PAPER_EXPLORE else "paper"))
+        report.d["policy"] = policy.kind
+        report.d["entry_bar"] = entry_bar
+        report.d["drift_grade"] = drift_grade
+        report.d["gate_funnel"] = funnel.as_dict()
+        report.d["conviction_abs"] = {i: conv_res[i].summary()
+                                      for i in config.TRADABLE}
+        report.d["winprob_at_gate"] = {i: wp_res[i].summary()
+                                       for i in config.TRADABLE}
+        report.d["regime_share_s"] = regime_share
+        report.d["pnl_realized"] = round(risk.realized_pnl, 2)
+        report.d["risk_halted"] = bool(risk.halted)
+        if final:
+            report.d["session_complete"] = True
+        report.write()
+
     if kite:
         try:                                  # prev-day levels (real candles)
             for idxn in config.TRADABLE:
@@ -309,6 +349,8 @@ def main():
                             "resume when ticks return (check connection/"
                             "harvester)", age)
                 stale_logged = True
+            for idx in config.TRADABLE:
+                funnel.record(idx, "stale_feed")
             if age > config.DATA_STALE_FLATTEN_S:
                 for idx in config.TRADABLE:
                     pm = pms[idx]
@@ -331,8 +373,9 @@ def main():
                          risk.realized_pnl,
                          {i: (pms[i].pos.symbol if pms[i].pos else "—")
                           for i in config.TRADABLE},
-                         {i: (f"{conv_hist[i][-1]:+.2f}" if conv_hist.get(i)
-                              else "—") for i in config.TRADABLE})
+                         {i: (f"{persist[i].latest:+.2f}"
+                              if persist[i].latest is not None else "—")
+                          for i in config.TRADABLE})
             continue
         if stale_logged:
             log.info("✓ feed recovered (age %.1fs) — entries resumed", age)
@@ -340,6 +383,9 @@ def main():
 
         if time.time() - last_cal_load > config.CAL_RELOAD_S:
             cal = load_calibration(); last_cal_load = time.time()
+        if time.time() - last_report >= config.DIAG_WRITE_EVERY_S:
+            last_report = time.time()
+            _write_report()
         if time.time() - last_hb >= config.HEARTBEAT_S:
             last_hb = time.time()
             d = drift.assess()
@@ -363,7 +409,8 @@ def main():
             _wa = f"{_run}R/{_bord}B" if (_run or _bord) else "0"
             # latest signed conviction per tradable index (post-regime-mult —
             # the exact value the entry gate sees). "—" until the first read.
-            convs = {i: (f"{conv_hist[i][-1]:+.2f}" if conv_hist.get(i) else "—")
+            convs = {i: (f"{persist[i].latest:+.2f}"
+                         if persist[i].latest is not None else "—")
                      for i in config.TRADABLE}
             # WHY EACH INDEX IS FLAT right now — the last gate that stopped a fill
             # this tick (a held position shows "in <symbol>"). This is the
@@ -379,6 +426,10 @@ def main():
                      policy.kind,
                      f"{vix_hist[-1][1]:.2f}" if vix_hist else "—",
                      _reg_s, _wa, drift_grade, no_trade)
+            # GATE FUNNEL — running per-index tally of what blocked entries so
+            # far today (top 5 gates each). The daily JSON has the full table.
+            log.info("  funnel %s", " | ".join(funnel.line(i)
+                                               for i in config.TRADABLE))
             # KEY LEVELS per tradable index — spot vs prev-day candle (PDC/PDH/PDL)
             # and the live GEX call/put walls + gamma flip from the macro radar
             # (the walls are what the system caps targets at). One line per index;
@@ -439,8 +490,24 @@ def main():
                     builder.fit_surface(idx, ctx_m.get("expiry", ""),
                                         mac["strikes"], mac["iv"], F, T)
 
+        # ---- v9.1.2 DECISION CADENCE GATE (the last parity gap) -----------
+        # The harvester writes the ring ONCE per second (RING_WRITE_S=1.0);
+        # this ~5 Hz loop was re-pushing the SAME snapshot ~5×/second, so
+        # per-push flow (vol_delta → OFI/VPIN/Hawkes/dealer-inv) was ingested
+        # ~5× vs the forge's 1 Hz replay — live conv peaked 0.86–0.95 on
+        # 2026-07-03 while the replay's ceiling sat ~0.5, AND the net infers
+        # on a frame cadence it never trained on. Decisions now run once per
+        # ring second: identical estimator windows, identical persistence
+        # sampling, identical funnel counting, live ↔ replay. The 0.2 s loop
+        # below keeps exits, fills, trap checks, the stale watchdog and trade
+        # tracking at full tempo. drift.observe moves to 1 Hz too, matching
+        # the reference population's sampling.
+        decide_now = int(ts) != last_decision_sec
         vix = (market.get("_VIX") or {}).get("ltp")
-        if vix:
+        if vix and decide_now:
+            # 1 Hz append: the (ts, vix) deque(400) now spans ~400 s, so the
+            # 295 s spike lookback is finally a real 5-minute test (at 5 Hz
+            # appends it silently degraded to an ~80 s window).
             vix_hist.append((ts, float(vix)))
         vix_bump = 0.0
         if len(vix_hist) > 5:
@@ -452,127 +519,133 @@ def main():
                 log.debug("VIX spike %.1f→%.1f — entry bar +%.2f",
                           base, now_v, vix_bump)
 
-        obs = builder.push(market, ts)
-        frame = builder.frames[-1]
-        drift.observe(frame)
-        actions = policy.conviction(obs, frame)
+        if decide_now:
+            last_decision_sec = int(ts)
+            obs = builder.push(market, ts)
+            frame = builder.frames[-1]
+            drift.observe(frame)
+            actions = policy.conviction(obs, frame)
+        if frame is None:
+            continue                       # no ring second pushed yet
 
         for idx in config.TRADABLE:
             ctx_m = market.get(idx)
             if not ctx_m or not ctx_m.get("spot"):
+                if decide_now:
+                    funnel.record(idx, "no_market")
                 continue
             spot = float(ctx_m["spot"].get("ltp") or 0)
             if spot <= 0:
+                if decide_now:
+                    funnel.record(idx, "no_market")
                 continue
             vel = spot - last_spot.get(idx, spot); last_spot[idx] = spot
-            if int(ts) != last_sec_push.get(idx):
-                last_sec_push[idx] = int(ts)
+            i = config.INDEX_ORDER.index(idx)
+            pm = pms[idx]
+
+            # ================= 1 Hz DECISION STACK (ring-second cadence —
+            # byte-identical to the forge grader's _Replayer) ================
+            if decide_now:
                 spot_secs[idx].append(spot)
                 if spot > 0 and idx in rvol:
                     rvol[idx].update(spot, dt_s=1.0)
                     realized_vol_ann[idx] = rvol[idx].annualized()
-            open_px.setdefault(idx, spot)
-            if idx not in p945 and hm >= "09:45":
-                p945[idx] = spot
-            i = config.INDEX_ORDER.index(idx)
-            ai = float(actions[2 * i])
-            # ADVISORY nudges only (audit: ±0.99 force-writes retired)
-            mac = read_macro(idx)
-            shock = 0.0
-            node = frame[i * config.NODES_PER_INDEX]
-            if node[4] > config.ADVISORY_VPIN_THRESHOLD:   # vpin
-                shock += config.ADVISORY_SHOCK * math.copysign(1.0, node[16] or ai)
-            if mac and mac.get("flip"):
-                shock += config.ADVISORY_SHOCK * (1.0 if spot > mac["flip"] else -1.0)
-            pcr = (mac or {}).get("pcr")
-            if pcr is not None:
-                if pcr >= config.PCR_HIGH:      # crowded puts → contrarian up
-                    shock += config.ADVISORY_SHOCK_PCR
-                elif pcr <= config.PCR_LOW:
-                    shock -= config.ADVISORY_SHOCK_PCR
-            mp = (mac or {}).get("max_pain")
-            if mp and float(ctx_m.get("dte", 9.0)) < 1.0:
-                shock += config.ADVISORY_SHOCK_MAXPAIN *                     (1.0 if mp > spot else -1.0)   # expiry-day pin gravity
-            lv = levels.get(idx)
-            if lv:
-                if spot > lv["pdh"]:
-                    shock += config.ADVISORY_SHOCK_LEVELS
-                elif spot < lv["pdl"]:
-                    shock -= config.ADVISORY_SHOCK_LEVELS
-            f30 = ((p945[idx] - open_px[idx]) / open_px[idx]
-                   if idx in p945 and open_px.get(idx) else 0.0)
-            if f30 and hm >= config.IMOM_AFTER:   # Gao–Han–Li–Zhou momentum
-                shock += config.ADVISORY_SHOCK_IMOM * (1.0 if f30 > 0 else -1.0)
-            conv = bayesian_signal_fusion(ai, shock, quant_weight=config.FUSION_QUANT_WEIGHT)
-            sh = spot_secs[idx]
-            dsum = sum(abs(b - a) for a, b in zip(sh, list(sh)[1:])) \
-                if len(sh) > 120 else 0.0
-            er = (abs(sh[-1] - sh[0]) / dsum) if dsum > 0 else 0.5
+                open_px.setdefault(idx, spot)
+                if idx not in p945 and hm >= "09:45":
+                    p945[idx] = spot
+                ai = float(actions[2 * i])
+                # ADVISORY nudges only (audit: ±0.99 force-writes retired).
+                # The whole stack lives in core/decision.compute_shock — one
+                # copy, shared with the forge's replay.
+                mac = read_macro(idx)
+                last_mac[idx] = mac
+                node = frame[i * config.NODES_PER_INDEX]
+                f30 = ((p945[idx] - open_px[idx]) / open_px[idx]
+                       if idx in p945 and open_px.get(idx) else 0.0)
+                shock = D.compute_shock(
+                    ai=ai, vpin=float(node[4]), dealer_inv=float(node[16]),
+                    mac=mac, spot=spot, dte=float(ctx_m.get("dte", 9.0)),
+                    levels=levels.get(idx), f30=f30, hm=hm)
+                conv = D.fuse(ai, shock)
+                sh = spot_secs[idx]
+                dsum = sum(abs(b - a) for a, b in zip(sh, list(sh)[1:])) \
+                    if len(sh) > 120 else 0.0
+                er = (abs(sh[-1] - sh[0]) / dsum) if dsum > 0 else 0.5
 
-            # ---- REGIME: label the tape from state already in hand and scale
-            # conviction by it (never a hard veto; risk floors untouched). This
-            # is what dampens momentum signals in a flat, long-gamma tape — the
-            # flat-market-bullish-signal problem the live logs showed.
-            vfc = None
-            try:
-                from core.vol_forecaster import forecast as _vol_fcast
-                # iv_now MUST be the SAME series the forecaster learned from — the
-                # macro Newton ATM IV that macro_gex feeds to append_intraday_sample
-                # AND republishes as mac["atm_iv"]. Passing the SVI SURFACE value
-                # here compared two different IV estimators inside the z-score; the
-                # surface reads persistently higher than the macro inversion, so z
-                # stayed pinned > CRUSH_Z and the regime jammed on VOL_CRUSH. Use
-                # the macro value so z measures a REAL intraday IV deviation.
-                _iv_now = (mac or {}).get("atm_iv")
-                if _iv_now is not None:
-                    vfc = _vol_fcast(idx, float(_iv_now),
-                                     front_iv=(mac or {}).get("atm_iv"),
-                                     next_iv=(mac or {}).get("atm_iv_next"),
-                                     dte=(mac or {}).get("dte"))
-            except Exception:                              # noqa: BLE001
+                # ---- REGIME: label the tape from state already in hand and
+                # scale conviction by it (never a hard veto; risk floors
+                # untouched).
                 vfc = None
-            rv = realized_vol_ann.get(idx)
-            regime = regime_mod.classify(
-                spot=spot, trend_efficiency=er,
-                net_gex=(mac or {}).get("net_gex"), flip=(mac or {}).get("flip"),
-                call_wall=(mac or {}).get("call_wall"),
-                put_wall=(mac or {}).get("put_wall"),
-                iv_rank=(mac or {}).get("iv_rank"), realized_vol=rv,
-                vol_regime=(vfc.regime if vfc else None),
-                vol_z=(vfc.z if vfc else None),
-                # SIGNED net move over the window → TREND_UP/DOWN reflects actual
-                # price direction (not spot-vs-flip), so JUDGE's per-regime stats
-                # are trustworthy. `index` enables hysteresis when configured.
-                trend_sign=(1 if sh[-1] >= sh[0] else -1) if len(sh) >= 2 else 0,
-                index=idx)
-            regime_now[idx] = regime
-            conv = conv * regime.conv_mult                 # scale, never veto
-            # signal-PERSISTENCE tracking: a "confident" trade is one where the
-            # directional read has HELD, not a single-tick spike. Record the
-            # signed conviction each tick; the gate below requires the recent
-            # window to agree in direction and average above the bar.
-            ch = conv_hist.setdefault(idx, deque(maxlen=config.SIGNAL_PERSIST_N))
-            ch.append(conv)
-            try:
-                regime_mod.log_features(idx, er, (mac or {}).get("net_gex"))
-            except Exception:                              # noqa: BLE001
-                pass
+                try:
+                    from core.vol_forecaster import forecast as _vol_fcast
+                    # iv_now MUST be the SAME series the forecaster learned
+                    # from — the macro Newton ATM IV (mac["atm_iv"]), not the
+                    # SVI surface value (two estimators inside one z-score
+                    # jammed the regime on VOL_CRUSH for three days).
+                    _iv_now = (mac or {}).get("atm_iv")
+                    if _iv_now is not None:
+                        vfc = _vol_fcast(idx, float(_iv_now),
+                                         front_iv=(mac or {}).get("atm_iv"),
+                                         next_iv=(mac or {}).get("atm_iv_next"),
+                                         dte=(mac or {}).get("dte"))
+                except Exception:                          # noqa: BLE001
+                    vfc = None
+                rv = realized_vol_ann.get(idx)
+                regime = regime_mod.classify(
+                    spot=spot, trend_efficiency=er,
+                    net_gex=(mac or {}).get("net_gex"),
+                    flip=(mac or {}).get("flip"),
+                    call_wall=(mac or {}).get("call_wall"),
+                    put_wall=(mac or {}).get("put_wall"),
+                    iv_rank=(mac or {}).get("iv_rank"), realized_vol=rv,
+                    vol_regime=(vfc.regime if vfc else None),
+                    vol_z=(vfc.z if vfc else None),
+                    trend_sign=(1 if sh[-1] >= sh[0] else -1)
+                    if len(sh) >= 2 else 0,
+                    index=idx)
+                regime_now[idx] = regime
+                # LOGIT-space scaling — dampened regimes demand a stronger raw
+                # signal instead of arithmetically vetoing (audit fix).
+                conv = D.apply_regime(conv, regime.conv_mult)
+                last_conv[idx] = conv
+                # wall-clock persistence sampling — 1/second, replay-identical
+                persist[idx].push(ts, conv)
+                conv_res[idx].add(abs(conv))
+                rs = regime_share[idx]
+                rs[regime.label] = rs.get(regime.label, 0) + 1
+                try:
+                    regime_mod.log_features(idx, er, (mac or {}).get("net_gex"))
+                except Exception:                          # noqa: BLE001
+                    pass
 
-            mins_open = (dt.datetime.strptime(hm, "%H:%M")
-                         - dt.datetime.strptime(config.SESSION_OPEN, "%H:%M")
-                         ).seconds / 60.0
-            wp_meta = meta_win_prob(frame, i, min(mins_open / 375.0, 1.0),
-                                    er, f30, 1 if conv > 0 else -1)
-            wp_tab = win_prob_for(conv, cal)
-            wp = wp_meta if wp_meta is not None else wp_tab
-            w_ = config.CAL_BUCKET_WIDTH
-            bkey = f"{min(abs(conv) // w_ * w_, 1 - w_):.2f}"
-            if wp_meta is not None and bkey in cal and \
-                    cal[bkey][1] >= config.CAL_MIN_SAMPLES:
-                wp = 0.5 * (wp_meta + float(cal[bkey][0]))   # blend both judges
-            log.debug("%s spot %.1f | ai %+.2f shock %+.2f → conv %+.2f "
-                      "(wp %.2f)", idx, spot, ai, shock, conv, wp)
+                mins_open = (dt.datetime.strptime(hm, "%H:%M")
+                             - dt.datetime.strptime(config.SESSION_OPEN,
+                                                    "%H:%M")).seconds / 60.0
+                # win-probability path is core/decision — meta logistic +
+                # calibration blend, one copy shared with the forge grader.
+                wp_meta = D.meta_win_prob(load_meta(), frame, i,
+                                          min(mins_open / 375.0, 1.0),
+                                          er, f30, 1 if conv > 0 else -1)
+                wp = D.blend_winprob(wp_meta, conv, cal)
+                log.debug("%s spot %.1f | ai %+.2f shock %+.2f → conv %+.2f "
+                          "(wp %.2f)", idx, spot, ai, shock, conv, wp)
+                # model's LIVE read of the HELD position (model-shaped exit):
+                # refreshed once per second; the ≤1 s-stale cached value feeds
+                # the 5 Hz management tctx. Uses the POSITION's direction so a
+                # flipping signal can't confuse it.
+                if config.META_DECISION_ENABLED and pm.pos is not None:
+                    last_wp_hold[idx] = D.meta_win_prob(
+                        load_meta(), frame, i, min(mins_open / 375.0, 1.0),
+                        er, f30, 1 if pm.pos.direction == "CE" else -1)
+                else:
+                    last_wp_hold[idx] = None
+            else:
+                mac = last_mac.get(idx)
+                conv = last_conv.get(idx, 0.0)
+                regime = regime_now.get(idx)
 
+            # ================= EVERY-TICK MANAGEMENT (~5 Hz: fills, stops,
+            # trail, trap shield, floors, tracking — full reaction tempo) ====
             legs_m = ctx_m.get("legs") or {}
             sp_now = 0.0
             atm = legs_m.get("atm_ce", {}).get("snap")
@@ -583,9 +656,9 @@ def main():
                 config.SPREAD_EW_ALPHA * (sp_now or spread_ew.get(idx, 0.01))
             absorb = any((v.get("snap") or {}).get("iceberg")
                          for v in legs_m.values())
-            # REAL option-flow shield inputs (audit follow-up): index spot has
-            # no volume, so sell-aggression comes from the ATM legs' signed
-            # tick-rule flow, and ΔOI from the position-side ATM leg.
+            # REAL option-flow shield inputs: index spot has no volume, so
+            # sell-aggression comes from the ATM legs' signed tick-rule flow,
+            # and ΔOI from the position-side ATM leg (frame ≤1 s old).
             t_ce = builder.trk.get(f"{idx}:atm_ce")
             t_pe = builder.trk.get(f"{idx}:atm_pe")
             opt_flow = ((t_ce.dealer_inv if t_ce else 0.0)
@@ -593,23 +666,13 @@ def main():
             sell_ratio = float(np.clip(
                 0.5 - 0.5 * math.tanh(opt_flow / config.DEALER_INV_SCALE),
                 0, 1))
-            pm = pms[idx]
-            oi_node = node
+            oi_node = frame[i * config.NODES_PER_INDEX]
             if pm.pos is not None:
                 oi_node = frame[i * config.NODES_PER_INDEX +
                                 (1 if pm.pos.direction == "CE" else 2)]
             mins_left = max((dt.datetime.strptime(config.SESSION_CLOSE, "%H:%M")
                              - dt.datetime.strptime(hm, "%H:%M")).seconds / 60,
                             1.0)
-            # model's LIVE read of the HELD position's direction (for the
-            # model-shaped exit). Re-evaluated each tick; None unless a trained
-            # model exists AND we hold a position. Uses the POSITION's direction,
-            # not the current signal's, so a flipping signal can't confuse it.
-            wp_hold = None
-            if config.META_DECISION_ENABLED and pm.pos is not None:
-                wp_hold = meta_win_prob(
-                    frame, i, min(mins_open / 375.0, 1.0), er, f30,
-                    1 if pm.pos.direction == "CE" else -1)
             tctx = TickContext(
                 ts=ts, hm=hm, spot=spot, spot_velocity_1s=vel,
                 data_age_s=age,
@@ -621,7 +684,7 @@ def main():
                 absorption=absorb, aggressive_sell_ratio=sell_ratio,
                 oi_delta_since=float(oi_node[2]),
                 avg_spread_pct=spread_ew[idx], conviction=conv,
-                live_win_prob=wp_hold,
+                live_win_prob=last_wp_hold.get(idx),
                 regime_label=(regime.label if regime else ""))
 
             for oid, fill in engine.on_quote(
@@ -630,14 +693,14 @@ def main():
                 log.info("resting order %s → %s", oid, fill.status)
             if pm.pos:
                 skip_reason[idx] = f"in {pm.pos.symbol}"
+                if decide_now:                 # funnel stays 1/sec ↔ replay
+                    funnel.record(idx, "in_position")
                 if risk.halted:
                     pm._exit(tctx, ring_quotes.get(pm.pos.token, {}),
                              "RISK_HALT", urgent=True)
                 else:
                     pm.manage(tctx, ring_quotes.get(pm.pos.token, {}))
-                # continuous trade tracking: stream the live position read
-                # (PnL, distance to stop/target, OI, trap, P(win)) on its own
-                # cadence while in a trade — so you can SEE the trade evolving.
+                # continuous trade tracking on its own cadence
                 if pm.pos is not None and \
                         time.time() - last_track.get(idx, 0.0) >= config.TRADE_TRACK_S:
                     last_track[idx] = time.time()
@@ -646,67 +709,47 @@ def main():
                     if snap:
                         log.info("%s", snap)
                 continue
+
+            # ================= 1 Hz ENTRY PATH (gates → attempt) =============
+            if not decide_now:
+                continue                       # decisions only on ring seconds
             ivr = (mac or {}).get("iv_rank")
-            eff_bar = entry_bar + vix_bump +                 (config.IVRANK_BAR_BUMP
-                 if ivr is not None and ivr >= config.IVRANK_HIGH else 0.0)
+            eff_bar = D.effective_bar(entry_bar, vix_bump, ivr)
             if risk.halted:
                 skip_reason[idx] = f"risk halted ({risk.halt_reason or 'drawdown'})"
+                funnel.record(idx, "risk_halted")
                 continue
             # DECISION GATE — model-driven when a trained meta-model exists,
-            # else the fixed conviction bar (bootstrap). The risk envelope
-            # (halt above; size/stop/floor downstream) bounds BOTH paths.
-            if config.META_DECISION_ENABLED and wp_meta is not None:
-                # trained model live → the model's calibration-blended P(win)
-                # decides, above a minimal directional floor so it never acts on
-                # noise. Threshold-free in the meaningful range; no hand-set bar.
-                if abs(conv) < config.META_ENTRY_CONV_FLOOR:
-                    skip_reason[idx] = (f"conv {abs(conv):.2f}<"
-                                        f"{config.META_ENTRY_CONV_FLOOR:.2f} floor")
-                    continue
-                if wp < config.META_ENTRY_P_BAR:
-                    skip_reason[idx] = (f"meta P(win) {wp:.2f}<"
-                                        f"{config.META_ENTRY_P_BAR:.2f}")
-                    continue
-                _gate = f"meta P(win) {wp:.2f}≥{config.META_ENTRY_P_BAR:.2f}"
-            else:
-                # bootstrap: no trained model yet → fixed conviction bar
-                if abs(conv) < eff_bar:
-                    skip_reason[idx] = f"conv {abs(conv):.2f}<{eff_bar:.2f} bar"
-                    continue
-                _gate = f"conv {abs(conv):.2f}≥{eff_bar:.2f}"
-            # SIGNAL-PERSISTENCE GATE — the instantaneous conviction cleared the
-            # bar, but is the read SUSTAINED or a one-tick spike? Net-displacement
-            # / signal-to-noise test (see core/signal_persistence.py): coherence of
-            # the signed conviction window (robust to an up-down tape that nets to a
-            # real move, unlike tick-by-tick sign agreement) + a Kaufman efficiency
-            # ratio on the tape, with an optional read-vs-tape agreement check.
-            # Skipped until the window has filled (warm-up).
-            if config.SIGNAL_PERSIST_ENABLED:
-                ch = conv_hist.get(idx)
-                if ch is not None and len(ch) >= config.SIGNAL_PERSIST_N:
-                    # actionable floor must match the LIVE decision path: the meta
-                    # conviction floor when the model decides, else the bootstrap
-                    # bar — not a separate, higher persistence-only threshold.
-                    _floor = (config.META_ENTRY_CONV_FLOOR
-                              if (config.META_DECISION_ENABLED
-                                  and wp_meta is not None)
-                              else eff_bar)
-                    _ok, _why, _ = assess_persistence(
-                        conv, list(ch), list(spot_secs.get(idx, ())),
-                        conv_floor=_floor)
-                    if not _ok:
-                        skip_reason[idx] = _why
-                        log.info("%s signal not persistent — %s", idx, _why)
-                        continue
+            # else the fixed conviction bar (bootstrap). One shared copy in
+            # core/decision.entry_gate — the forge grades with the same bytes.
+            gate = D.entry_gate(conv, wp, wp_meta, eff_bar)
+            if not gate.ok:
+                skip_reason[idx] = gate.reason
+                funnel.record(idx, "below_bar", gate.reason)
+                continue
+            _gate = gate.reason
+            wp_res[idx].add(wp)
+            # SIGNAL-PERSISTENCE GATE — sustained read, wall-clock window,
+            # sampled 1/second exactly like the forge grader.
+            _ok, _why, _ = persist[idx].check(conv, spot_secs.get(idx, ()),
+                                              gate.floor)
+            if not _ok:
+                skip_reason[idx] = _why
+                funnel.record(idx, "not_persistent", _why)
+                log.info("%s signal not persistent — %s", idx, _why)
+                continue
             if ts - last_try.get(idx, -1e9) < config.ENTRY_ATTEMPT_THROTTLE_S:
+                funnel.record(idx, "throttled")
                 continue                       # one attempt per 5 s per index
             last_try[idx] = ts
             direction = "CE" if conv > 0 else "PE"
             if not mapper:
+                funnel.record(idx, "no_chain", "no kite mapper")
                 continue
             hier_rows = mapper.hierarchy(idx, spot, direction)
             if not hier_rows:
                 skip_reason[idx] = "no option chain"
+                funnel.record(idx, "no_chain")
                 continue
             quotes = qc.get([(r["exchange"], r["symbol"]) for r in hier_rows])
             T = float(ctx_m.get("T", 0.01))
@@ -736,15 +779,11 @@ def main():
                     dte=float(ctx_m.get("dte", 1.0))))
             if not hierarchy:
                 skip_reason[idx] = "no two-sided quotes"
+                funnel.record(idx, "no_quotes")
             if hierarchy:
-                # The engine's paper quote_fn reads ring_quotes by token. The
-                # harvester only streams the ATM legs into the ring, so a chosen
-                # strike the ring doesn't track (common on SENSEX) would return an
-                # empty quote at fill time → the crossing order can't fill and
-                # walks away. Seed ring_quotes with the exact, freshly-fetched
-                # quotes the decision was priced from so the engine fills against
-                # the same book the brain saw. (Live mode fills via Kite, not
-                # this dict, so this only corrects the paper path.)
+                # Seed ring_quotes with the exact freshly-fetched book the
+                # decision was priced from, so the paper engine fills against
+                # what the brain saw (live fills via Kite, not this dict).
                 for _lq in hierarchy:
                     ring_quotes[_lq.token] = {
                         "bid": _lq.bid, "ask": _lq.ask,
@@ -752,12 +791,22 @@ def main():
                         "ltp": _lq.premium}
                 log.info("%s entry signal — gate: %s | P(win) %.2f | %s",
                          idx, _gate, wp,
-                         "MODEL-DRIVEN" if (config.META_DECISION_ENABLED
-                                            and wp_meta is not None)
+                         "MODEL-DRIVEN" if gate.model_driven
                          else "bootstrap (fixed bar)")
                 pm.try_enter(tctx, direction, conv, wp, hierarchy)
-                skip_reason[idx] = (f"in {pm.pos.symbol}" if pm.pos
-                                    else pm.last_block_reason or "no fill")
+                if pm.pos:
+                    skip_reason[idx] = f"in {pm.pos.symbol}"
+                    funnel.record(idx, "entered")
+                else:
+                    _blk = pm.last_block_reason or "no fill"
+                    skip_reason[idx] = _blk
+                    funnel.record(idx,
+                                  "risk_blocked" if pm.last_block_reason
+                                  else "no_fill", _blk)
+
+    # ---- session end: final diagnostics report ------------------------------
+    _write_report(final=True)
+    log.info("brain report → %s", report.path)
 
 
 if __name__ == "__main__":

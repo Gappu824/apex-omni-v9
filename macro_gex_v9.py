@@ -1,6 +1,6 @@
 """
-APEX OMNI v9 — MACRO GEX RADAR (audit §7 leaps)
-===============================================
+APEX OMNI v9.1 — MACRO GEX RADAR (audit §7 leaps + v9.1 diagnostics)
+====================================================================
   * REAL implied vols: vectorized Newton with analytic vega on the futures-
     style forward — the ATM-only Brenner shortcut across ±10% of strikes is
     gone, so the wings stop distorting gamma.
@@ -14,12 +14,19 @@ APEX OMNI v9 — MACRO GEX RADAR (audit §7 leaps)
     convention stops being imported US folklore. Defaults to the classic
     dealers-long-calls / short-puts book with a clear log line saying so.
   * Atomic temp→rename JSON (kept from v8 — it was right).
-GPU optional: numpy is plenty for ~200 strikes; torch is used if present.
 
-v9.1: the per-snapshot surface/GEX math is factored into assemble_snapshot()
-so the historical backfill (tools/backfill_macro.py) reconstructs past days by
-calling the EXACT same function the live radar uses — one implementation, zero
-train/serve drift. The live path (compute_index) is unchanged in behaviour.
+v9.1 changes (audit follow-ups):
+  * load_macro_archive now returns FLIP / FLIP_WIDTH / NET_DEX — they were
+    archived but never selected, so the forge's replay could not reproduce the
+    brain's gamma-flip advisory shock. With them, core/decision.compute_shock
+    runs on identical inputs live and in replay.
+  * Full radar diagnostics → logs/macro_report_<date>.json every loop: per-
+    index cycle counts, quote coverage, IV-pin drop counts, skip reasons,
+    archive write success/failure, last snapshot age, net-GEX / ATM-IV /
+    wall trails. "Is the radar healthy?" is now a file, not a scroll.
+
+GPU optional: numpy is plenty for ~200 strikes; torch is used if present.
+v9.1 keeps assemble_snapshot() pure and shared with tools/backfill_macro.py.
 """
 from __future__ import annotations
 import datetime as dt
@@ -38,6 +45,7 @@ import numpy as np
 import config
 from core.instruments import LiveMapper
 from core.quant_core import implied_vol_newton, black76_greeks
+from core.diagnostics import DailyReport
 
 log = logging.getLogger("macro")
 
@@ -114,6 +122,8 @@ class MacroArchive:
 
     def __init__(self):
         self.con: sqlite3.Connection | None = None
+        self.ok = 0
+        self.fail = 0
 
     def _ensure(self) -> sqlite3.Connection:
         if self.con is None:
@@ -139,7 +149,9 @@ class MacroArchive:
                 f"INSERT OR REPLACE INTO macro_snapshots_v9 VALUES "
                 f"({','.join('?' * len(_MACRO_COLS))})", row)
             con.commit()
+            self.ok += 1
         except Exception as e:                            # noqa: BLE001
+            self.fail += 1
             log.warning("macro vault archive skipped (live JSON unaffected): %s", e)
 
 
@@ -152,11 +164,16 @@ def load_macro_archive(con: sqlite3.Connection, day: str, index: str) -> list[di
     at-or-before each second — a right-continuous step, exactly how the brain
     reads the latest published JSON — to fit the surface and read the walls.
     Returns [] when nothing was archived (older days): the forge then keeps its
-    current seed-surface / no-wall behaviour, so this is purely additive."""
+    current seed-surface / no-wall behaviour, so this is purely additive.
+
+    v9.1: FLIP / FLIP_WIDTH / NET_DEX are now returned (they were archived but
+    never SELECTed), so the replayed advisory-shock stack — gamma-flip side,
+    PCR, max-pain, i-mom — matches the live brain's byte for byte."""
     try:
         rows = con.execute(
             "SELECT ts_ms, spot, expiry, dte, call_wall, put_wall, atm_iv, "
-            "iv_rank, pcr, max_pain, net_gex, strikes_json, iv_json "
+            "iv_rank, pcr, max_pain, net_gex, flip, flip_width, net_dex, "
+            "strikes_json, iv_json "
             "FROM macro_snapshots_v9 WHERE index_name=? AND "
             "date(ts_ms/1000,'unixepoch','localtime')=? ORDER BY ts_ms",
             (index, day)).fetchall()
@@ -164,10 +181,11 @@ def load_macro_archive(con: sqlite3.Connection, day: str, index: str) -> list[di
         return []
     out = []
     for (ts_ms, spot, expiry, dte, cw, pw, aiv, ivr, pcr, mp, ng,
-         sj, ij) in rows:
+         flip, flip_w, ndex, sj, ij) in rows:
         out.append({"ts": ts_ms / 1000.0, "spot": spot, "expiry": expiry,
                     "dte": dte, "call_wall": cw, "put_wall": pw, "atm_iv": aiv,
                     "iv_rank": ivr, "pcr": pcr, "max_pain": mp, "net_gex": ng,
+                    "flip": flip, "flip_width": flip_w, "net_dex": ndex,
                     "strikes": json.loads(sj or "[]"),
                     "iv": json.loads(ij or "[]")})
     return out
@@ -201,12 +219,14 @@ def assemble_snapshot(*, ts, index, spot, exp, dte, K, mid, oi, is_call, lot,
         s_call, s_put        — dealer sign convention
 
     Returns (payload, K_arr, iv_arr, gex_arr). `payload` carries every column the
-    vault archive stores; iv_rank is left None (the live path fills it from the
-    daily IV-history file; the forge does not read iv_rank from the vault). The
-    raw arrays are handed back so the live path can attach its JSON-only extras
-    (per-strike gex, ΔOI-15m)."""
+    vault archive stores plus n_raw/n_kept coverage counters (JSON/report only —
+    the archive writer ignores unknown keys); iv_rank is left None (the live
+    path fills it from the daily IV-history file; the forge does not read
+    iv_rank from the vault). The raw arrays are handed back so the live path
+    can attach its JSON-only extras (per-strike gex, ΔOI-15m)."""
     K = np.asarray(K, float); prem = np.asarray(mid, float)
     oi = np.asarray(oi, float); is_call = np.asarray(is_call, bool)
+    n_raw = int(len(K))
     T = max(dte, 0.0) / 365.0
     F = spot * math.exp(config.RISK_FREE_RATE * T)
 
@@ -266,23 +286,32 @@ def assemble_snapshot(*, ts, index, spot, exp, dte, K, mid, oi, is_call, lot,
                "net_gex": float(gex.sum()), "net_dex": float(dex.sum()),
                "pcr": pcr, "max_pain": max_pain, "atm_iv": atm_iv,
                "iv_rank": None, "dte": dte,
+               "n_raw": n_raw, "n_kept": int(len(K)),
                "strikes": K.tolist(), "iv": iv.round(4).tolist()}
     return payload, K, iv, gex
 
 
-def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
+def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put,
+                  diag: dict | None = None):
+    """One radar pass for one index. `diag` (per-index dict from main) collects
+    coverage/skip/quality counters for the daily report; None = silent."""
+    d = diag if diag is not None else {}
+    d["cycles"] = d.get("cycles", 0) + 1
     spot_sym = config.INDICES[index]["spot_symbol"]
     spot = float(kite.ltp([spot_sym])[spot_sym]["last_price"])
     rows = mapper.by_index.get(index, [])
     if not rows or spot <= 0:
+        d["skip_no_rows"] = d.get("skip_no_rows", 0) + 1
         return
     exps = sorted({r["expiry"] for r in rows if r["expiry"] >= dt.date.today()})
     if not exps:
+        d["skip_no_expiry"] = d.get("skip_no_expiry", 0) + 1
         return
     exp = exps[0]
     band = [r for r in rows if r["expiry"] == exp
             and abs(r["strike"] - spot) / spot <= config.MACRO_STRIKE_BAND]
     if len(band) < 8:
+        d["skip_thin_band"] = d.get("skip_thin_band", 0) + 1
         return
     lot = band[0]["lot"]
     dte = max((exp - dt.date.today()).days, 0) + config.DTE_PART_DAY
@@ -297,23 +326,29 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
         q = quotes.get(key)
         if not q:
             continue
-        d = q.get("depth") or {}
-        b = (d.get("buy") or [{}])[0].get("price") or 0
-        a = (d.get("sell") or [{}])[0].get("price") or 0
+        dep = q.get("depth") or {}
+        b = (dep.get("buy") or [{}])[0].get("price") or 0
+        a = (dep.get("sell") or [{}])[0].get("price") or 0
         mid = (b + a) / 2 if (b and a) else 0            # require a real two-sided book
         if mid <= 0:
             continue
         K.append(r["strike"]); prem.append(mid)
         oi.append(float(q.get("oi") or 0)); is_call.append(r["itype"] == "CE")
+    d["contracts_wanted"] = len(band)
+    d["contracts_quoted"] = len(K)
     if len(K) < 8:
+        d["skip_thin_quotes"] = d.get("skip_thin_quotes", 0) + 1
         return
 
     res = assemble_snapshot(
         ts=time.time(), index=index, spot=spot, exp=exp, dte=dte, K=K,
         mid=prem, oi=oi, is_call=is_call, lot=lot, s_call=s_call, s_put=s_put)
     if res is None:                                       # whole chain too thin/stale
+        d["skip_iv_pinned"] = d.get("skip_iv_pinned", 0) + 1
         return
     payload, K, iv, gex = res
+    d["iv_dropped_last"] = payload["n_raw"] - payload["n_kept"]
+    d["iv_dropped_total"] = d.get("iv_dropped_total", 0) + d["iv_dropped_last"]
 
     # ---- live-only enrichments (the forge reads NONE of these from the vault) ---
     h = _oi_hist.setdefault(index, deque(maxlen=12))
@@ -353,14 +388,26 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put):
     payload["doi15"] = doi15
     atomic_write(config.MACRO_STATE_TMPL.format(idx=index), payload)
     _ARCHIVE.write(payload)                               # vault: forge surface + walls
+    d["ok"] = d.get("ok", 0) + 1
+    d["last_ts"] = payload["ts"]
+    d["last"] = {"spot": spot, "atm_iv": round(atm_iv, 4),
+                 "iv_rank": iv_rank,
+                 "net_gex": payload["net_gex"],
+                 "flip": payload["flip"], "flip_width": payload["flip_width"],
+                 "call_wall": payload["call_wall"],
+                 "put_wall": payload["put_wall"],
+                 "pcr": payload["pcr"], "max_pain": payload["max_pain"],
+                 "strikes_kept": payload["n_kept"],
+                 "strikes_raw": payload["n_raw"], "dte": round(dte, 2)}
     log.info("%s spot %.1f flip %s±%s walls %s/%s PCR %s maxpain %s "
-             "IVrank %s netGEX %.2e",
+             "IVrank %s netGEX %.2e | strikes %d/%d",
              index, spot, f'{payload["flip"]:.0f}' if payload["flip"] else "—",
              f'{payload["flip_width"]:.0f}' if payload["flip_width"] else "—",
              payload["put_wall"], payload["call_wall"],
              f'{payload["pcr"]:.2f}' if payload["pcr"] else "—",
              f'{payload["max_pain"]:.0f}' if payload["max_pain"] else "—",
-             f"{iv_rank:.2f}" if iv_rank is not None else "—", payload["net_gex"])
+             f"{iv_rank:.2f}" if iv_rank is not None else "—",
+             payload["net_gex"], payload["n_kept"], payload["n_raw"])
 
 
 def main():
@@ -370,13 +417,24 @@ def main():
     kite.set_access_token(config.KITE_ACCESS_TOKEN)
     mapper = LiveMapper(kite)
     s_call, s_put = dealer_sign()
+    report = DailyReport("macro")
+    per_idx: dict[str, dict] = {i: {} for i in config.INDEX_ORDER}
+    report.d["per_index"] = per_idx
     while True:
         t0 = time.time()
         for idx in config.INDEX_ORDER:
             try:
-                compute_index(kite, mapper, idx, s_call, s_put)
+                compute_index(kite, mapper, idx, s_call, s_put,
+                              diag=per_idx[idx])
             except Exception as e:                     # noqa: BLE001
+                d = per_idx[idx]
+                d["errors"] = d.get("errors", 0) + 1
+                d["last_error"] = f"{type(e).__name__}: {e}"
                 log.error("%s: %s", idx, e)
+        report.d["archive"] = {"writes_ok": _ARCHIVE.ok,
+                               "writes_failed": _ARCHIVE.fail}
+        report.d["loop_seconds"] = round(time.time() - t0, 1)
+        report.write()                                 # every loop (~3 min)
         time.sleep(max(config.MACRO_LOOP_S - (time.time() - t0), 5))
 
 

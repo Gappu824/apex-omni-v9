@@ -1,10 +1,19 @@
 """
-APEX OMNI v9 — CONFIG / RISK CONSTITUTION
-=========================================
+APEX OMNI v9.1 — CONFIG / RISK CONSTITUTION
+===========================================
 Every constant the system reads lives HERE and only here. No getattr()
-fallbacks anywhere in v9: if it isn't defined in this file, the code refuses
-to start rather than inventing a default (audit finding: phantom ₹40,000
-capital fallback in v8).
+fallbacks anywhere in v9 for constitution values: if it isn't defined in this
+file, the code refuses to start rather than inventing a default (audit
+finding: phantom ₹40,000 capital fallback in v8).
+
+v9.1 (post-audit): dead constants purged so the file describes the running
+system again — MIN_CAL_WINPROB (defined, never enforced), the old
+multiplicative FORGE_PROMOTE_MARGIN (renamed in code, silently defaulting to
+₹0), SIGNAL_PERSIST_N/FRAC/AVG_MULT (replaced by a wall-clock window),
+REWARD_HORIZON_S and the four SAC rollout knobs the bandit trainer bypassed,
+FORGE_LOOKBACK/RESERVOIR/VAL_DAYS (superseded by FORGE_MAX_TRAIN_DAYS and the
+walk-forward harness). Anything deleted here had ZERO live references — the
+scan is in the audit report.
 
 ★ = the knobs you (the human) are expected to touch.
 """
@@ -69,7 +78,7 @@ def setup_logging(component: str, level=logging.INFO):
 # ----------------------------------------------------------------------------
 # IDENTITY / SAFETY
 # ----------------------------------------------------------------------------
-VERSION = "v9.0-audited"
+VERSION = "v9.1-audited"
 
 # ★ PAPER MODE. Stays False. To ever go live you must BOTH set this True AND
 #   export APEX_CONFIRM_LIVE="I-UNDERSTAND-REAL-MONEY". One switch is an
@@ -81,7 +90,7 @@ LIVE_CONFIRM_PHRASE = "I-UNDERSTAND-REAL-MONEY"
 def live_fire_armed() -> bool:
     """FOUR locks, all required: the LIVE_FIRE flag, the confirmation phrase,
     a FRESH Edge Certificate (statistical proof from the paper ledger that
-    this account clears the bar SEBI shows ~93% of individuals never clear),
+    this account clears the bar SEBI shows ~91% of individuals never clear),
     and NO active feature-drift — the live model may only bet real money on
     a market regime that resembles what it trained on. Fail any one → paper."""
     if not (bool(LIVE_FIRE) and
@@ -123,10 +132,15 @@ def live_fire_armed() -> bool:
 #   • Server-side GTT floor: placing a GTT *is* placing a real order, so in
 #     paper it is logged-not-placed; the in-process floor runs identically.
 #
-# PAPER_EXPLORE breaks parity ON PURPOSE if you want paper to trade more
-# aggressively (lower bar, exploratory win-prob) to build the calibration
-# table / Edge Certificate faster. Default False = paper mirrors live exactly.
-PAPER_EXPLORE = False
+# PAPER_EXPLORE breaks parity ON PURPOSE: paper trades on a lower bar with an
+# exploratory win-prob to build the calibration table / Edge Certificate
+# ledger. ★ v9.1 DEFAULT: True — the audit showed the mirror-live bootstrap
+# (0.70 bar, 0.52 Kelly prior) starves the ledger the certificate needs. The
+# EXPECTED scientific outcome of explore mode, given the closed directional
+# thesis, is a ledger that statistically CONFIRMS no edge and a certificate
+# that correctly refuses to arm — that is the machinery working, not failing.
+# Flip back to False the day you want paper to mirror live exactly.
+PAPER_EXPLORE = True
 
 # Paper fill realism. The one thing physically impossible to make identical to
 # live without submitting a real order. When True (default), a resting maker
@@ -155,14 +169,21 @@ def uncalibrated_winprob() -> float:
 # additionally syncs against kite.margins() and always uses the SMALLER of
 # (this number, broker available cash) — the bot may never believe it has
 # more money than the broker says.
-TRADING_CAPITAL = 60000.0          # ₹
+TRADING_CAPITAL = 60000.0           # ₹ — LIVE knob only (v9.1.1): the forge,
+#                                    meta, drift and every cache are sized off
+#                                    FORGE_EVAL_CAPITAL below; change this any
+#                                    time, nothing re-forges or invalidates.
+
+# Forge bandit-trainer knobs (training INFRA — hash-excluded below)
 FORGE_BANDIT_BATCH         = 2048
-FORGE_BANDIT_WARMUP_EPOCHS = 20     # NEW — no early-stop until the actor has had steps to learn to trade
-FORGE_BANDIT_EVAL_ROWS     = 4096   # NEW — rows sampled for the per-epoch proxy (keeps epochs fast)
-FORGE_MIN_TRADE_RATE       = 0.001  # NEW — below this TRAIN trade-rate, a model is a non-trader → never promoted
-FORGE_BANDIT_MAX_EPOCHS    = 150    # was 60 — give it room; early-stop ends it sooner when held-out plateaus
-FORGE_BANDIT_PATIENCE      = 15     # was 6   # stop after this many epochs of no held-out gain
-FORGE_BANDIT_REWARD_SCALE  = 100.0 # critic-target conditioning (matches the old /100)
+FORGE_BANDIT_WARMUP_EPOCHS = 20    # no early-stop until the actor has had steps to move off zero
+FORGE_BANDIT_EVAL_ROWS     = 4096  # rows sampled for the per-epoch proxy (keeps epochs fast)
+FORGE_MIN_TRADE_RATE       = 0.001 # below this TRAIN trade-rate a candidate is recorded as an
+#                                    ABSTAINER (a legitimate finding) and not deployed — deploying
+#                                    it would freeze the paper ledger the certificate audits.
+FORGE_BANDIT_MAX_EPOCHS    = 150
+FORGE_BANDIT_PATIENCE      = 15    # epochs of no INNER-day gain before early stop
+FORGE_BANDIT_REWARD_SCALE  = 100.0 # critic-target conditioning
 
 # ----------------------------------------------------------------------------
 # CREDENTIALS — environment only. Never a file named _env in the repo again.
@@ -191,23 +212,23 @@ MODEL_MANIFEST     = MODEL_DIR / "current_manifest.json"   # points at the promo
 # UNIVERSE (expiry style verified against the 2026 calendar: NIFTY weekly Tue,
 # SENSEX weekly Thu; BANKNIFTY/FINNIFTY/MIDCPNIFTY monthly last-Tue; BANKEX
 # monthly Thu. Lot sizes below are FALLBACKS ONLY — the mapper always trusts
-# the live instrument dump, which is how v8 absorbed the Jan-2026 lot change.)
+# the live instrument dump, which is how the Jan-2026 lot change (NIFTY 75→65,
+# BANKNIFTY 35→30, FINNIFTY 65→60, MIDCPNIFTY 140→120; NSE circ. FAOP70616)
+# cost this system nothing.)
 # ----------------------------------------------------------------------------
 INDICES = {
     "NIFTY":      {"exchange": "NFO", "spot_symbol": "NSE:NIFTY 50",        "weekly": True,  "lot_fallback": 65,  "strike_step": 50},
     "BANKNIFTY":  {"exchange": "NFO", "spot_symbol": "NSE:NIFTY BANK",      "weekly": False, "lot_fallback": 30,  "strike_step": 100},
     "FINNIFTY":   {"exchange": "NFO", "spot_symbol": "NSE:NIFTY FIN SERVICE","weekly": False, "lot_fallback": 60,  "strike_step": 50},
-    "MIDCPNIFTY": {"exchange": "NFO", "spot_symbol": "NSE:NIFTY MID SELECT", "weekly": False, "lot_fallback": 140, "strike_step": 25},
+    "MIDCPNIFTY": {"exchange": "NFO", "spot_symbol": "NSE:NIFTY MID SELECT", "weekly": False, "lot_fallback": 120, "strike_step": 25},
     "SENSEX":     {"exchange": "BFO", "spot_symbol": "BSE:SENSEX",          "weekly": True,  "lot_fallback": 20,  "strike_step": 100},
     "BANKEX":     {"exchange": "BFO", "spot_symbol": "BSE:BANKEX",          "weekly": False, "lot_fallback": 30,  "strike_step": 100},
 }
 INDEX_ORDER = list(INDICES.keys())
 # ★ Indices the brain may actually TRADE (others remain context nodes only).
-# With ₹5,000 only NIFTY/SENSEX cheap OTM is realistically affordable.
-# ★ Indices the brain may actually TRADE (others remain context nodes only).
-# NIFTY-only at ₹30k: SENSEX option lots run ~₹4,500+, which never fits the
-# Kelly budget at this capital — including it just spams BLOCKED lines. Add
-# "SENSEX" back once capital comfortably exceeds ~₹75k, or trade it standalone.
+# At ₹60k the Kelly walker fits NIFTY across most of the week and SENSEX
+# (lot 20) on cheaper strikes; both stay in. Trim to ["NIFTY"] if SENSEX
+# BLOCKED lines get noisy at lower capital.
 TRADABLE = ["NIFTY", "SENSEX"]
 
 # ----------------------------------------------------------------------------
@@ -279,9 +300,10 @@ MAX_ENTRY_SPREAD_PCT = 0.03   # refuse entries when (ask-bid)/mid above this
 
 # Conviction → probability. The calibration table (built nightly by the
 # analyzer from real/paper outcomes) is the truth; this floor is the fallback.
+# (v9.1: MIN_CAL_WINPROB deleted — it was defined and enforced NOWHERE; a
+# constant that reads like a safety gate but isn't is worse than none.)
 ENTRY_CONVICTION     = 0.70
-PAPER_ENTRY_CONVICTION = 0.55  # used ONLY if PAPER_EXPLORE=True (see below)
-MIN_CAL_WINPROB      = 0.55
+PAPER_ENTRY_CONVICTION = 0.55  # used ONLY if PAPER_EXPLORE=True (see above)
 UNCALIBRATED_WINPROB = 0.52   # what an unproven |conviction|≥0.70 is worth: barely a coin
 
 # ----------------------------------------------------------------------------
@@ -322,19 +344,19 @@ DTE_PART_DAY          = 0.3     # intraday remainder added to whole-day DTE
 # Strike ladder + entry tempo — SHARED by live brain and simulator (sim==live)
 HIERARCHY_DEPTH          = 8
 ENTRY_ATTEMPT_THROTTLE_S = 5.0
+
 # ---- SIGNAL PERSISTENCE (a confident trade needs a SUSTAINED read) ----------
-# Conviction is read each tick from live OI/flow/momentum. In a choppy tape it
-# can flip sign tick-to-tick (the whipsaw the logs showed) — high conviction in
-# the moment, but unstable. These require the directional read to have HELD
-# before entering: the recent window must agree in sign for ≥ SIGNAL_PERSIST_FRAC
-# of samples AND average above SIGNAL_PERSIST_AVG_MULT× the entry bar. This makes
-# the system wait for confident, SUSTAINED signals instead of entering on a
-# one-tick spike it exits minutes later. Same live Kite data — it just demands
-# the signal prove itself over time before committing capital.
-SIGNAL_PERSIST_ENABLED  = True
-SIGNAL_PERSIST_N        = 4      # ticks in the persistence window; read must hold
-SIGNAL_PERSIST_FRAC     = 0.75   # ≥ this fraction of the window must agree in sign
-SIGNAL_PERSIST_AVG_MULT = 0.95   # window-average |conv| must exceed this × the bar
+# v9.1: the window is WALL-CLOCK. The old deque of the last 4 brain-loop
+# iterations spanned ~0.8 s at the 5 Hz loop; SIGNAL_PERSIST_FRAC / AVG_MULT
+# were defined and read nowhere (audit). The tracker in core/decision.py keys
+# samples on timestamps and evicts by SIGNAL_PERSIST_WINDOW_S, so "held for N
+# seconds" means N seconds at any cadence — brain ~5 Hz, forge replay 1 Hz,
+# same window, same test (coherence + Kaufman-ER + tape agreement, unchanged
+# in core/signal_persistence.py).
+SIGNAL_PERSIST_ENABLED     = True
+SIGNAL_PERSIST_WINDOW_S    = 12.0   # the read must have held over this window
+SIGNAL_PERSIST_MIN_SAMPLES = 4      # gate is skipped until this many samples
+
 # Entry order pricing. A passive maker buy (posted at the bid-side micro-price)
 # cannot fill on an option that is RISING — which is exactly when a bullish
 # momentum signal fires — so a pure-maker entry starves on trending tape.
@@ -350,14 +372,10 @@ SIGNAL_PERSIST_AVG_MULT = 0.95   # window-average |conv| must exceed this × the
 #      micro-price. If the option has already run past that, the signal is
 #      stale and we WALK AWAY rather than buy exhaustion (critical at 0-2 DTE
 #      where chasing buys rich premium into accelerating decay).
-#   3. ENTRY_CROSS_SPREAD_PCT — crossing is only worth it when the spread is
-#      tight; if (ask-bid)/mid exceeds this (a band TIGHTER than the hard
-#      MAX_ENTRY_SPREAD_PCT reject), immediacy is too expensive — stay passive.
+#   3. Liquidity is gated by MAX_ENTRY_SPREAD_PCT (3%), chasing by
+#      ENTRY_SLIP_CAP_PCT.
 # Paper and live use the identical logic; crossing is what live would do.
-ENTRY_CROSS_CONVICTION = 0.70   # = ENTRY_CONVICTION: momentum entries
-# cross (the passive maker path below the entry bar only suits mean-reversion;
-# this is a momentum system). The slippage cap still walks away from runners
-# that ran past their chase cap, so crossing is filling — not blind chasing.
+ENTRY_CROSS_CONVICTION = 0.70   # = ENTRY_CONVICTION: momentum entries cross
 ENTRY_SLIP_CAP_PCT     = 0.60    # fraction of one strike-step premium move
 SLIPCAP_BORDERLINE_FRAC = 0.25   # diagnostics only (changes NO behavior): a
 # chase-cap walk-away within this fraction past the cap is "borderline" (the cap
@@ -365,8 +383,7 @@ SLIPCAP_BORDERLINE_FRAC = 0.25   # diagnostics only (changes NO behavior): a
 # correctly refused. Classifies walk-aways for the heartbeat tally / evidence.
 ENTRY_CROSS_SPREAD_PCT = 0.015   # DEPRECATED/unused: the separate cross-spread
 # band was removed — it starved fills by routing real (1.5–3% spread) NIFTY
-# option signals to the passive path. Liquidity is gated by MAX_ENTRY_SPREAD_PCT
-# (3%), chasing by ENTRY_SLIP_CAP_PCT. Kept only so external refs don't break.
+# option signals to the passive path. Kept only so external refs don't break.
 ENTRY_CROSS_CAP_TICKS  = 2       # hard ceiling: never pay >this many ticks past ask
 
 # Brain: advisory fusion, calibration, cadence
@@ -385,13 +402,23 @@ SPREAD_EW_ALPHA         = 0.02
 QUOTE_CACHE_FRESH_S     = 1.5
 HEURISTIC_W             = (0.45, 0.50, 0.35, 0.40)  # ofi, dealer, vel, momentum
 
+# Diagnostics (v9.1): every long-running component writes a machine-readable
+# daily report to logs/<component>_report_<date>.json — the gate funnel, tick
+# coverage, radar health, forge walk-forward table. Purely observational.
+DIAG_WRITE_EVERY_S      = 600.0   # brain/harvester/macro report cadence
+
 # Execution micro-knobs
 PAPER_SLIPPAGE_TICKS  = 1
 URGENT_CHASE_TICKS    = 2
 LIVE_POLL_INTERVAL_S  = 0.4
 
 # Harvester
-PRUNE_STEPS       = 3
+PRUNE_STEPS       = 6   # harvest ATM±6 strikes per side (was ±3). At low live
+#                         capital the first AFFORDABLE rung sits several
+#                         strikes OTM (₹5k ⇒ premium ≤ ₹14.3 on NIFTY); the
+#                         vault must carry what the account can actually buy,
+#                         or live AND replay both die at no_quotes. Hash-
+#                         excluded: retune freely, no re-forge.
 DB_BATCH_ROWS     = 1000
 RING_WRITE_S      = 1.0
 TELEMETRY_S       = 10.0
@@ -416,22 +443,19 @@ TRAP_OI_CONFIRM_SCALE = 10.0
 TRAP_DISLOCATION_FULL = 0.10
 TRAP_VEL_WINDOW_S     = 600
 
-# Forge training knobs
-SAC_BUFFER          = 50_000
+# Forge training knobs (v9.1: the SAC rollout knobs the bandit trainer never
+# read — SAC_BUFFER/TRAIN_FREQ/GRAD_STEPS/TIMESTEPS_CAP — are deleted; only
+# what the code reads remains)
 SAC_BATCH           = 256
-SAC_TRAIN_FREQ      = 64
-SAC_GRAD_STEPS      = 64
-SAC_TIMESTEPS_CAP   = 150_000
-FORGE_EVAL_STEP_S   = 60
 FORGE_ACT_GATE_TRAIN = 0.3
 FORGE_ACT_GATE_EVAL  = 0.5
 
 # ----------------------------------------------------------------------------
 # RESEARCH LAYER (each knob traces to published evidence — see README)
 # ----------------------------------------------------------------------------
-# Edge Certificate — the third lock. SEBI: ~93% of individual F&O traders
-# lose; profits accrue to algorithmic entities. This system therefore CANNOT
-# arm live until its own paper ledger clears statistical proof of edge.
+# Edge Certificate — the third lock. SEBI FY25: 91% of individual F&O traders
+# lose (net ₹1.06 lakh crore). This system therefore CANNOT arm live until its
+# own paper ledger clears statistical proof of edge.
 EDGE_MIN_TRADES      = 100
 EDGE_MIN_DAYS        = 20
 EDGE_BOOTSTRAP_N     = 10_000
@@ -439,9 +463,13 @@ EDGE_CI              = 0.95     # bootstrap CI lower bound of mean PnL must be >
 EDGE_CERT_PATH       = STATE_DIR / "edge_certificate.json"
 EDGE_CERT_VALID_DAYS = 7
 
-# Meta-labeling (López de Prado 2017/2018): primary model picks the SIDE,
-# a secondary model learns the SIZE — P(win | features) from triple-barrier
+# Meta-labeling (López de Prado 2018): primary model picks the SIDE, a
+# secondary model learns the SIZE — P(win | features) from triple-barrier
 # outcomes on REAL recorded prices, after real costs. Feeds Kelly directly.
+# v9.1: samples are UNIQUENESS-WEIGHTED (AFML ch.4 — overlapping 25–45-min
+# label windows at 1 Hz are ~99.9% redundant; weighting by 1/concurrency stops
+# the fit and its holdout accuracy from being dominated by duplicated paths),
+# and the holdout is BY DAY (the last training day), not a row split.
 META_MODEL_PATH = STATE_DIR / "meta_model.json"
 META_MIN_TRAIN  = 300          # labeled signals before the meta model is trusted
 META_LR         = 0.05
@@ -496,6 +524,10 @@ import hashlib as _hl
 # (capital, sizing, polling, paths, …) are excluded so editing them no longer
 # invalidates a trained reference. live_fire_armed() above reads it at runtime,
 # by which point the end-of-file assignment has run.
+# ★ v9.1 NOTE: this hash CHANGES vs v9.0 (label horizon is now 0-DTE-aware,
+# entry basis in labels is the ask, dead hashed constants were removed). The
+# existing drift reference and meta model read NO_REF / stale until the first
+# nightly forge run restamps them. Expected, one-time.
 
 # ----------------------------------------------------------------------------
 # FEATURE-DRIFT MONITOR (the live regime-shift guard — core/drift_monitor.py)
@@ -557,8 +589,13 @@ VOL_FCAST_MODEL_PATH  = str(STATE_DIR / "vol_forecast_model.json")  # learned
 
 # ---- REGIME CLASSIFIER (labels market state, scales conviction) ---------------
 # Names the regime from state the system already computes and returns a
-# conviction MULTIPLIER (never a hard veto, never moves a risk floor). Cut points
-# start fixed and are refit nightly to the empirical percentiles of THIS market.
+# conviction MULTIPLIER. ★ v9.1: the multiplier is applied in LOGIT space
+# (core/decision.py) — the audit proved the old linear `conv × mult` made CHOP
+# (×0.70) and VOL_CRUSH (×0.65) arithmetically un-enterable under the 0.70 bar
+# (tanh < 1), i.e. a hard veto the contract below forbids. Logit scaling keeps
+# every regime reachable while still demanding a stronger raw signal in
+# dampened tapes. Cut points start fixed and are refit nightly to the
+# empirical percentiles of THIS market.
 REGIME_TE_TREND     = 0.55    # |trend efficiency| ≥ this → trending (fallback)
 REGIME_TE_CHOP      = 0.30    # |trend efficiency| ≤ this → chop (fallback)
 REGIME_GEX_SQUEEZE  = -2.0e10 # net GEX ≤ this (deep negative) → squeeze-prone.
@@ -582,7 +619,8 @@ REGIME_HYSTERESIS_N = 1       # consecutive ticks on a NEW regime before switchi
 #                               1 = OFF (stateless, current behaviour). Raise to
 #                               2–3 to kill single-tick label/multiplier flicker
 #                               near a cut boundary.
-# conviction multipliers per regime (scale the brain's conviction; 1.0 = neutral)
+# conviction multipliers per regime (logit-space scale on the brain's
+# conviction; 1.0 = neutral)
 REGIME_MULT_TREND   = 1.15    # clean trend → momentum favored
 REGIME_MULT_CHOP    = 0.70    # chop → momentum bleeds, dampen
 REGIME_MULT_SQUEEZE = 1.20    # short-gamma at a wall → breakouts run, boost
@@ -622,13 +660,34 @@ ORDER_REPOST_TICKS    = 1      # one cancel/re-post a tick worse, then walk away
 SELL_MARKET_PROTECTION = 5     # % protection if a protected-market exit is ever used
 
 # ----------------------------------------------------------------------------
-# FORGE / TRAINING
+# FORGE / TRAINING  (v9.1 — the falsification harness)
 # ----------------------------------------------------------------------------
-FORGE_LOOKBACK_DAYS   = 10     # train on last K days + reservoir of older days
-FORGE_RESERVOIR_DAYS  = 5
-FORGE_VAL_DAYS        = 1      # walk-forward gate: newest day held out
-FORGE_PROMOTE_MARGIN  = 0.95   # promote only if val score ≥ incumbent × this
-REWARD_HORIZON_S      = 60
+FORGE_MAX_TRAIN_DAYS  = 0      # 0 = train on every harvested day except the
+#                                final (promotion) day. Set >0 to cap once the
+#                                per-day replay becomes the nightly bottleneck.
+FORGE_WF_FOLDS        = 5      # walk-forward out-of-sample folds: each of the
+#                                last K pool days is validated by a model
+#                                trained ONLY on the days strictly before it.
+#                                The promotion day is additionally NEVER seen
+#                                by any fold, any inner split, or any
+#                                checkpoint selection (audit: the old trainer
+#                                selected checkpoints ON the promotion day).
+FORGE_PROMOTE_MARGIN_RS = 500.0  # ★ additive ₹ a candidate must clear ABOVE
+#                                max(heuristic, incumbent) on the untouched
+#                                promotion day. v9.0 read a name that was never
+#                                defined and silently ran with ₹0.
+FORGE_PARALLEL_WORKERS = 0     # per-day dataset builds in parallel processes;
+#                                0 = auto (cpu_count//2, i7-13650HX ⇒ ~7),
+#                                1 = serial (debug).
+FORGE_EVAL_CAPITAL    = 100000.0  # ★ the REFERENCE account every forge label,
+#                                reward and grade is sized against (Kelly
+#                                budget ≈ ₹16,667 ⇒ ATM NIFTY/SENSEX always
+#                                affordable — the exam measures EDGE, never
+#                                account size). TRADING_CAPITAL above is the
+#                                LIVE knob: hash-EXCLUDED, change it any time
+#                                with zero ripple into forge/meta/drift/caches.
+#                                This constant IS hashed — editing it changes
+#                                labels, so a re-forge is correctly forced.
 RISK_FREE_RATE        = 0.07
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -640,25 +699,22 @@ LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 # Edge Certificate, then checked before any of them is trusted. It fingerprints
 # ONLY the constants that change those artifacts: how the 19 features are
 # computed, the feature-tensor shape, the surface/greeks math, the triple-
-# barrier labels (BASE_TP_PCT / BASE_SL_PCT / MAX_HOLD_MINUTES), broker COSTS
-# (labels are net-of-cost), and the regime / trap / vol-forecaster thresholds.
+# barrier labels (BASE_TP_PCT / BASE_SL_PCT / MAX_HOLD_MINUTES /
+# MAX_HOLD_MINUTES_0DTE / EXPIRY_DTE_LT), broker COSTS (labels are
+# net-of-cost), and the regime / trap / vol-forecaster thresholds.
 #
 # Pure OPERATIONAL knobs are excluded so editing them does NOT invalidate a
 # reference the forge already trained: capital & sizing, risk budgets, order
 # routing / fills / polling, cooldowns & watchdogs, telemetry & logging cadence,
 # filesystem paths, credentials, drift ASSESSMENT thresholds (retune the de-arm
-# without a re-forge), edge-audit knobs, and forge training-infra hyper-params.
+# without a re-forge), edge-audit knobs, forge training-infra hyper-params, and
+# the persistence-gate tempo knobs (they gate WHEN an entry fires, identically
+# in the brain and the forge grader, but change no feature or label).
 #
 # FAIL-CLOSED: anything not explicitly excluded is fingerprinted, so a newly
 # added feature/label constant still invalidates correctly even if nobody
 # updates this list. Operational additions you don't want to force a re-forge
 # must be named with a path suffix or added to _HASH_EXCLUDE.
-#
-# NOTE: this changes the hash value itself. After deploying, the existing
-# reference reads NO_REF until the nightly forge runs once and restamps it. It
-# also means the Edge-Certificate config check no longer trips on these
-# operational knobs (including TRADING_CAPITAL) — acceptable while LIVE_FIRE is
-# permanently False and the certificate is re-audited from the ledger nightly.
 _HASH_EXCLUDE = frozenset({
     # the hash must never fingerprint itself (else recompute is unstable)
     "CONFIG_HASH",
@@ -672,11 +728,13 @@ _HASH_EXCLUDE = frozenset({
     "MAX_CONCURRENT_POSITIONS", "VOL_TARGET_ANN", "VOL_SCALE_MIN",
     # credentials (env-derived, rotate daily)
     "KITE_API_KEY", "KITE_API_SECRET", "KITE_ACCESS_TOKEN",
-    # cooldowns / lockouts / throttles / halts / data-watchdog (gate orders;
-    # identical paper↔live; do not change per-second feature/label generation)
+    # cooldowns / lockouts / throttles / halts / data-watchdog / persistence
+    # tempo (gate orders; identical paper↔live↔forge-grader; do not change
+    # per-second feature/label generation)
     "COOLDOWN_S", "DIRECTION_LOCKOUT_S", "ENTRY_ATTEMPT_THROTTLE_S",
     "MAX_ORDER_REJECTS", "DATA_STALE_BLOCK_S", "DATA_STALE_FLATTEN_S",
-    "MACRO_STALE_S",
+    "MACRO_STALE_S", "SIGNAL_PERSIST_ENABLED", "SIGNAL_PERSIST_WINDOW_S",
+    "SIGNAL_PERSIST_MIN_SAMPLES",
     # order routing / fills / polling / entry-cross execution
     "PAPER_SLIPPAGE_TICKS", "URGENT_CHASE_TICKS", "LIVE_POLL_INTERVAL_S",
     "ORDER_POLL_BUDGET_S", "ORDER_REPOST_TICKS", "SELL_MARKET_PROTECTION",
@@ -691,17 +749,17 @@ _HASH_EXCLUDE = frozenset({
     "RING_WRITE_S", "DB_BATCH_ROWS", "PRUNE_STEPS", "SNAPSHOT_PM_AT",
     "LOG_FORMAT", "CAL_RELOAD_S", "QUOTE_CACHE_FRESH_S", "REGIME_LOG_EVERY_S",
     "REGIME_FEATURE_LOG_MAX", "CAL_BUCKET_WIDTH", "CAL_MIN_SAMPLES",
+    "DIAG_WRITE_EVERY_S",
     # edge-certificate audit knobs (the cert is re-audited nightly from ledger)
     "EDGE_MIN_TRADES", "EDGE_MIN_DAYS", "EDGE_BOOTSTRAP_N", "EDGE_CI",
     "EDGE_CERT_VALID_DAYS",
-    # forge training-infra hyper-params (change HOW models train, not the
-    # data / labels / features / reference distribution)
+    # forge training-infra hyper-params (change HOW models train and are
+    # examined, not the data / labels / features / reference distribution)
     "FORGE_BANDIT_BATCH", "FORGE_BANDIT_WARMUP_EPOCHS", "FORGE_BANDIT_EVAL_ROWS",
     "FORGE_MIN_TRADE_RATE", "FORGE_BANDIT_MAX_EPOCHS", "FORGE_BANDIT_PATIENCE",
-    "FORGE_BANDIT_REWARD_SCALE", "SAC_BUFFER", "SAC_BATCH", "SAC_TRAIN_FREQ",
-    "SAC_GRAD_STEPS", "SAC_TIMESTEPS_CAP", "FORGE_EVAL_STEP_S",
-    "FORGE_ACT_GATE_TRAIN", "FORGE_ACT_GATE_EVAL", "FORGE_PROMOTE_MARGIN",
-    "FORGE_LOOKBACK_DAYS", "FORGE_RESERVOIR_DAYS", "FORGE_VAL_DAYS",
+    "FORGE_BANDIT_REWARD_SCALE", "SAC_BATCH",
+    "FORGE_ACT_GATE_TRAIN", "FORGE_ACT_GATE_EVAL", "FORGE_PROMOTE_MARGIN_RS",
+    "FORGE_MAX_TRAIN_DAYS", "FORGE_WF_FOLDS", "FORGE_PARALLEL_WORKERS",
     # drift ASSESSMENT thresholds (retune de-arm sensitivity with NO re-forge;
     # the reference-CONSTRUCTION knobs DRIFT_BINS / DRIFT_REF_MAX_SAMPLES /
     # DRIFT_KEY_FEATURES are deliberately NOT here — they stay in the hash)

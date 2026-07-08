@@ -27,6 +27,30 @@
    "date": "2026-06-30",
    "index": "NIFTY",
    "name": "mined_stale_2026-06-30_1023"
+  },
+  {
+   "kind": "stale",
+   "hm": "10:58",
+   "dur_s": 40,
+   "date": "2026-07-06",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-07-06_1058"
+  },
+  {
+   "kind": "stale",
+   "hm": "12:05",
+   "dur_s": 6410,
+   "date": "2026-07-06",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-07-06_1205"
+  },
+  {
+   "kind": "stale",
+   "hm": "10:13",
+   "dur_s": 97,
+   "date": "2026-07-07",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-07-07_1013"
   }
  ]
 }
