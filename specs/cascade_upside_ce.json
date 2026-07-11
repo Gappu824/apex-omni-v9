@@ -1,0 +1,8 @@
+{
+ "id": "cascade_upside_ce",
+ "base": "cascade",
+ "detector": {
+  "zone_side": "above"
+ },
+ "note": "REGISTERED TRIAL: deep-negative total gamma with spot ABOVE the flip \u2014 admitted by the upside_zone_candidate_s diagnostic (36 candidate seconds on 2026-07-09). Direction still = impulse sign."
+}

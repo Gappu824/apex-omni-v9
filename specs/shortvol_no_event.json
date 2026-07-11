@@ -1,0 +1,8 @@
+{
+ "id": "shortvol_no_event",
+ "base": "shortvol",
+ "extra": {
+  "block_event_days": true
+ },
+ "note": "REGISTERED TRIAL: the measured event gate \u2014 no premium sold on curated event days (RBI/Fed/budget; Dubinsky-Johannes blowup literature). Calendar: state/event_calendar.json."
+}

@@ -1,0 +1,6 @@
+{
+ "id": "shortvol_base",
+ "base": "shortvol",
+ "knobs": {},
+ "note": "Reproduction self-check vs the standing shortvol certificate."
+}

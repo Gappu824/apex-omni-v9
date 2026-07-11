@@ -1,0 +1,8 @@
+{
+ "id": "cascade_vanna",
+ "base": "cascade",
+ "extra": {
+  "vanna_abs_min": 500000.0
+ },
+ "note": "REGISTERED TRIAL: require material vanna exposure at trigger (Barbon\u2013Buraschi squeeze channel) \u2014 dealer-flow recovered from the archive."
+}

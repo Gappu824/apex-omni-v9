@@ -1,0 +1,8 @@
+{
+ "id": "shortvol_pin",
+ "base": "shortvol",
+ "extra": {
+  "pin_min": 0.25
+ },
+ "note": "REGISTERED TRIAL: sell only when the tested wall holds \u226525% of book gamma (Avellaneda\u2013Lipkin pinning) \u2014 dealer-flow from the archive."
+}

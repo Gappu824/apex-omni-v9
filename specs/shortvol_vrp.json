@@ -1,0 +1,8 @@
+{
+ "id": "shortvol_vrp",
+ "base": "shortvol",
+ "extra": {
+  "vrp_min": 0.01
+ },
+ "note": "REGISTERED TRIAL: sell only when IV exceeds the HAR remaining-day forecast by \u22651 vol pt \u2014 the measured VRP (Carr\u2013Wu), requires a fitted rv model."
+}

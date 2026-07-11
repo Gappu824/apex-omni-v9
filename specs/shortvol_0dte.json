@@ -1,0 +1,12 @@
+{
+ "id": "shortvol_0dte",
+ "base": "shortvol",
+ "knobs": {
+  "SV_DTE_MIN": 0.02,
+  "SV_DTE_MAX": 0.8,
+  "SV_TP_FRAC": 0.4,
+  "SV_SL_CREDIT_MULT": 0.75,
+  "SV_CLOSE_HM": "14:45"
+ },
+ "note": "REGISTERED TRIAL: expiry-day premium harvest \u2014 tighter TP/SL, earlier hard-flat (0DTE literature: Beckmeyer et al. 2023). Excluded from the base spec by design; earns its own certificate or dies here."
+}

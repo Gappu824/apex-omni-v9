@@ -1,0 +1,6 @@
+{
+ "id": "cascade_base",
+ "base": "cascade",
+ "knobs": {},
+ "note": "Reproduction self-check: must match the standing cascade cert's backtest count."
+}
