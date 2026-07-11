@@ -283,6 +283,7 @@ class OpenSpread:
     open_long_ask: float
     pop: float
     mode: str
+    live: bool = False                        # v9.5: routed via spread_router
     max_loss: float = field(init=False)
 
     def __post_init__(self):
@@ -299,8 +300,9 @@ class SpreadBook:
     registers max-loss capital into the ONE RiskGovernor so a single
     drawdown constitution governs everything."""
 
-    def __init__(self, risk=None, ledger_path=None):
+    def __init__(self, risk=None, ledger_path=None, kite=None):
         self.risk = risk
+        self.kite = kite                      # live routing handle (v9.5)
         self.ledger = Path(ledger_path or config.LEDGER_PATH)
         self.pos: OpenSpread | None = None
         self.last_try: dict[str, float] = {}
@@ -357,12 +359,27 @@ class SpreadBook:
         if lots < 1:
             return {**base, "skip": f"unaffordable at {capital:.0f} "
                     f"(risk/lot {(spec.width-credit)*spec.lot:.0f})"}
+        # ---- v9.5 LIVE ROUTING (quintuple-locked; core/spread_router) --
+        _live = False
+        _sfill, _lfill = float(sq["bid"]), float(lq["ask"])
+        if mode == "certified" and self.kite is not None:
+            from core import spread_router as SR
+            _ok, _why = SR.live_spread_allowed(load_certificate())
+            if _ok:
+                _r = SR.route_open(self.kite, spec, lots, quotes)
+                if not _r.get("ok"):
+                    return {**base, "skip": f"live route: {_r.get('why')}"}
+                _live = True
+                _sfill = float(_r["short_fill"])
+                _lfill = float(_r["long_fill"])
+                credit = _sfill - _lfill      # realized, not quoted
         sp = OpenSpread(spec=spec,
                         spread_id=f"SV{int(ts)}{spec.index[:2]}",
                         credit=credit, lots=lots, open_ts=ts, open_hm=hm,
-                        open_short_bid=float(sq["bid"]),
-                        open_long_ask=float(lq["ask"]),
-                        pop=pop_prior(credit, spec.width), mode=mode)
+                        open_short_bid=_sfill,
+                        open_long_ask=_lfill,
+                        pop=pop_prior(credit, spec.width), mode=mode,
+                        live=_live)
         self.pos = sp
         if self.risk is not None:
             try:
@@ -412,6 +429,17 @@ class SpreadBook:
             # forced exit with a dead book: mark at intrinsic-worst (max loss)
             sa = sp.open_short_bid + sp.spec.width
             lb = max(sp.open_long_ask - sp.spec.width, 0.05)
+        if sp.live and self.kite is not None:
+            from core import spread_router as SR
+            _r = SR.route_close(self.kite, sp, quotes)
+            if not _r.get("ok"):
+                import logging
+                logging.getLogger("shortvol").critical(
+                    "LIVE spread close failed: %s - retrying next tick",
+                    _r.get("why"))
+                return None       # never fake-close a live book
+            sa = float(_r["short_fill"])
+            lb = float(_r["long_fill"])
         cc = close_cost(sa, lb)
         pnl = spread_pnl(sp.credit, cc, sp.spec.lot, sp.lots,
                          sp.open_short_bid, sp.open_long_ask, sa, lb)

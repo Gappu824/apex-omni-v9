@@ -65,8 +65,14 @@ class CascadeEvent:
 class CascadeDetector:
     """Per-index. Deterministic given the fed sequence — replay-identical."""
 
-    def __init__(self, index: str):
+    def __init__(self, index: str, zone_side: str = "below"):
+        # zone_side: "below" (the certified base — spot under the flip) or
+        # "above" (the registered upside-variant TRIAL: deep-negative total
+        # gamma with spot ABOVE the flip; admitted to the factory by the
+        # upside_zone_candidate_s diagnostic). Constructor argument, NOT a
+        # config knob — the base spec's knob-hash is untouched.
         self.index = index
+        self.zone_side = zone_side
         self.last_z: float | None = None      # v9.2.1: telemetry/diagnostics
         self._spots: deque = deque()          # (ts, spot) for the window return
         self._rets: deque = deque()           # (ts, r_window) history for σ
@@ -127,7 +133,12 @@ class CascadeDetector:
         self.last_z = float(z)
         hyst = max(config.CASCADE_HYST_MULT * float(flip_width or 0.0),
                    float(strike_step))
-        in_zone = (spot < flip - hyst) and (net_gex <= config.CASCADE_NET_GEX_MAX)
+        if self.zone_side == "above":
+            in_zone = (spot > flip + hyst) and \
+                (net_gex <= config.CASCADE_NET_GEX_MAX)
+        else:
+            in_zone = (spot < flip - hyst) and \
+                (net_gex <= config.CASCADE_NET_GEX_MAX)
         if in_zone and self._in_zone_since is None:
             self._in_zone_since = ts
         if not in_zone:
