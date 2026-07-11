@@ -169,7 +169,7 @@ def uncalibrated_winprob() -> float:
 # additionally syncs against kite.margins() and always uses the SMALLER of
 # (this number, broker available cash) — the bot may never believe it has
 # more money than the broker says.
-TRADING_CAPITAL = 60000.0           # ₹ — LIVE knob only (v9.1.1): the forge,
+TRADING_CAPITAL = 5000.0           # ₹ — LIVE knob only (v9.1.1): the forge,
 #                                    meta, drift and every cache are sized off
 #                                    FORGE_EVAL_CAPITAL below; change this any
 #                                    time, nothing re-forges or invalidates.
@@ -692,6 +692,141 @@ RISK_FREE_RATE        = 0.07
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
+# ----------------------------------------------------------------------------
+# GAMMA-CASCADE MODULE (v9.2 — the structural crash/squeeze engine)
+# ----------------------------------------------------------------------------
+# Mechanism (published, not invented): below the gamma flip with dealers net
+# short gamma, hedging flow trades WITH the move — intraday momentum
+# concentrates under negative gamma (Baltussen–Da–Lammers–Martens, JFE 2021),
+# option hedging pressure moves the underlying (Ni–Pearson–Poteshman 2005;
+# Barbon–Buraschi 2021). Direction comes from the STRUCTURE + impulse sign,
+# not from the momentum heuristic the meta-labeler has (correctly) buried.
+#
+# FALSIFICATION-FIRST, enforced in code: the live detector runs telemetry-only
+# until tools/cascade_harness.py has graded every historical trigger on YOUR
+# vault (ask entries, real costs, shaped barriers — the exact trade the brain
+# would place) and written CASCADE_CERT_PATH with ok=true. The certificate is
+# stamped with CONFIG_HASH + a fingerprint of every knob below; touch a knob
+# and the cert invalidates until the harness re-passes. Same lock philosophy
+# as LIVE_FIRE. All knobs hash-EXCLUDED (they change no feature/label of the
+# main system) — the cert fingerprint is their invalidation channel.
+CASCADE_LIVE_ENABLED   = True     # master switch; still inert without a cert
+CASCADE_PAPER_EXPLORE  = True     # ★ v9.2.1 staging tier: with NO certificate,
+#                                   cascade entries are allowed in PAPER ONLY
+#                                   (hard-blocked when live-armed) so every
+#                                   trigger accrues FORWARD out-of-sample
+#                                   evidence through the real execution path.
+#                                   The harness blends realized forward fills
+#                                   into the certificate; the 2026-07-09 run
+#                                   proved backtest-only certification is
+#                                   structurally impossible on pre-widening
+#                                   vault history (36 triggers, 35 unfillable:
+#                                   ATM±3 harvest vs an 8-rung ladder). LIVE
+#                                   cascade still requires the certificate
+#                                   AND all four live locks.
+CASCADE_VEL_WINDOW_S   = 60       # impulse = spot move over this window …
+CASCADE_VEL_Z          = 2.0      # … must be ≥ this many σ of its own history
+CASCADE_VOL_LOOKBACK_S = 1800     # σ estimated over this rolling window
+CASCADE_VOL_MIN_N      = 120      # impulse samples before z is trusted
+CASCADE_NET_GEX_MAX    = -1.0e10  # net GEX must be at least this negative
+#                                   (deep short-gamma; same e10 scale note as
+#                                   REGIME_GEX_SQUEEZE — sanity-check on your
+#                                   own net_gex distribution)
+CASCADE_HYST_MULT      = 1.0      # zone hysteresis = this × flip_width
+#                                   (floor: one strike step) — a full-bracket
+#                                   cross, not a tick-flicker
+CASCADE_COOLDOWN_S     = 600      # per-index re-arm delay after a fire
+CASCADE_MAX_EVENTS_DAY = 3        # per index; a cascade day is one regime,
+#                                   not thirty entries
+CASCADE_ENTRY_CONV     = 0.85     # signed conviction stamped on cascade
+#                                   entries (drives the reversal-exit
+#                                   semantics; sizing runs off the cert win
+#                                   rate through the normal Kelly governor)
+CASCADE_CERT_PATH      = STATE_DIR / "cascade_certificate.json"
+CASCADE_CERT_MIN_EVENTS = 20      # harness pass requires ≥ this many events…
+CASCADE_CERT_MIN_DAYS   = 5       # …across ≥ this many distinct event-days,
+CASCADE_CERT_CI         = 0.90    # …with bootstrap CI lower bound of mean
+#                                   after-cost ₹/event > 0 at this level.
+
+# ----------------------------------------------------------------------------
+# SHORT-VOL ENGINE (v9.3 — the other side of the trade the system PROVED)
+# ----------------------------------------------------------------------------
+# Every honest exam of this program produced the same number: long premium at
+# these horizons wins ~22% after costs (meta base_rate 0.2185 on 429 real
+# labels; 7/7 OOS losers). The counterparty of that condemned trade is the
+# variance-risk-premium harvest — the most robustly documented edge in options
+# (Carr–Wu RFS 2009; Bakshi–Kapadia 2003; Bollerslev–Tauchen–Zhou 2009;
+# Israelov–Nielsen on systematic short premium; Beckmeyer–Branger–Gayda 2023:
+# retail 0DTE BUYERS lose systematically). Regime side: premium is sold ONLY
+# under positive net gamma (dealers damp moves — Baltussen et al. JFE 2021),
+# inside the wall corridor, with rich IV rank — and NEVER while the cascade
+# detector's negative-gamma machinery is anywhere near active. Sell the calm,
+# own the storm; one book, two regimes, zero overlap by construction.
+#
+# INSTRUMENT: defined-risk vertical credit spreads (short the tested WALL
+# strike, long one step further out). Max loss = width − credit, known at
+# entry — the only shape retail capital can responsibly sell. Prespecified
+# single spec; no optimization. Staging identical to cascade: vault harness →
+# certificate (knob-hash-stamped, fail-closed) → PAPER-EXPLORE forward
+# evidence → live ONLY behind cert + the four locks. v9.3.0's ceiling is
+# PAPER by construction: live spread ROUTING (basket orders + real SPAN
+# margin via Kite's margin API) is deliberately unbuilt until a certificate
+# exists to justify it.
+SHORTVOL_ENABLED        = True    # master switch; inert without cert/explore
+SHORTVOL_PAPER_EXPLORE  = True    # paper-only entries pre-cert (never live)
+SV_IVRANK_MIN           = 0.60    # premium must be RICH vs its own 60-day range
+SV_NET_GEX_MIN          = 1.0e12  # dealers must be LONG gamma (damping regime)
+SV_WALL_BUFFER_STEPS    = 1.0     # spot must sit ≥ this many strike-steps
+#                                   inside BOTH walls (a real corridor)
+SV_CORRIDOR_MIN_STEPS   = 3.0     # and the corridor itself ≥ this wide
+SV_DTE_MIN              = 0.8     # v1 skips expiry day (short-gamma-at-pin
+#                                   blowup risk; a 0DTE variant needs its OWN
+#                                   prespecified harness pass)
+SV_DTE_MAX              = 9.0
+SV_AFTER_HM             = "10:00" # let the open's gamma flush settle
+SV_WIDTH_STEPS          = 1       # long leg = wall ± 1 step (tightest hedge)
+SV_MIN_CREDIT_FRAC      = 0.15    # reject if credit < this × width (junk premium)
+SV_TP_FRAC              = 0.50    # take profit at 50% of credit captured
+SV_SL_CREDIT_MULT       = 1.00    # stop when loss ≥ 1× credit (2× credit to close)
+SV_TOUCH_EXIT           = True    # urgent close if spot touches the short strike
+SV_CLOSE_HM             = "15:05" # hard flat before the closing auction chop
+SV_ATTEMPT_THROTTLE_S   = 300     # one build attempt per 5 min per index
+SV_POP_HAIRCUT          = 0.90    # sizing prior = (1 − credit/width) × haircut
+SV_RISK_PCT             = 5.0     # % of capital at risk per spread (max loss ×
+#                                   lots ≤ this). Fixed-fractional, NOT Kelly:
+#                                   Kelly fed the risk-neutral pop is ≈0 by
+#                                   construction (the VRP edge IS true-p >
+#                                   risk-neutral-p), so fractional risk is the
+#                                   literature-standard prespecification.
+SHORTVOL_CERT_PATH      = STATE_DIR / "shortvol_certificate.json"
+SV_CERT_MIN_EVENTS      = 25      # cert bar: ≥ events …
+SV_CERT_MIN_DAYS        = 6       # … across ≥ event-days …
+SV_CERT_CI              = 0.90    # … bootstrap CI lower bound of ₹/event > 0
+
+# ----------------------------------------------------------------------------
+# COUNTERFACTUAL LEDGER (v9.4, Pillar 4) — the constitution audits itself.
+# The nightly forge shadow-grades blocked signals on the promotion day through
+# the SAME ask-entry barrier grader and attributes would-be ₹ to the gate that
+# killed each one. Off-policy evaluation of the rulebook; report-only.
+CF_NEAR_MISS    = 0.05    # bootstrap-bar near-miss band: shadow |conv| ≥ bar−this
+CF_MAX_PER_GATE = 400     # per-gate/day shadow cap (sampling noted in report)
+
+# ----------------------------------------------------------------------------
+# v9.5 - TRANCHES 2-4, delivered whole (PROGRAM.md is the binding scope)
+LC_WINDOW           = 15      # living-cert rolling window (fills)
+LC_MIN_EVENTS       = 10      # ...minimum before a de-arm can trigger
+MACRO_TERM_STRUCTURE = True   # tenor-2 ATM probe -> macro_term_v9 (D-J feed)
+TERM_BAND_STEPS     = 2       # probe band: ATM +/- this many steps
+STRESS_SPLIT_HM     = "11:30" # regime-stitch splice time
+RCT_LIMIT_TIMEOUT_S = 2.0     # LIMIT_FIRST arm: secs before market fallback
+RCT_MIN_FIT         = 200     # fill-model refuses below this many labels
+GRAD_MICRO_CAPITAL  = 25000.0 # micro-live stage capital (one-lot)
+GRAD_KELLY_FRAC     = 0.25    # fractional Kelly at scaling stage
+GRAD_DD_MAX_PCT     = 10.0    # Grossman-Zhou drawdown throttle ceiling
+SPREAD_LIVE_TOKEN   = STATE_DIR / "ARM_LIVE_SPREADS"  # operator lock #4
+FORGE_TRAIN_SAC     = True    # False = freeze the directional SAC (gravestone);
+                              # meta/heur exam/counterfactual/drift still run
+
 # ============================================================================
 # CONFIG_HASH — model/feature fingerprint (computed last, sees all constants)
 # ============================================================================
@@ -767,6 +902,29 @@ _HASH_EXCLUDE = frozenset({
     "DRIFT_WATCH_FRAC", "DRIFT_DEARM_FRAC", "DRIFT_MIN_LIVE_SAMPLES",
     # misc data-source / backfill
     "BACKFILL_DAYS", "VIX_SYMBOL",
+    # gamma-cascade module (trigger/tempo knobs change no feature or label of
+    # the main system; the cascade CERTIFICATE fingerprints them instead, so
+    # tuning invalidates the cert — never forces a re-forge)
+    "CASCADE_LIVE_ENABLED", "CASCADE_PAPER_EXPLORE", "CASCADE_VEL_WINDOW_S",
+    "CASCADE_VEL_Z",
+    "CASCADE_VOL_LOOKBACK_S", "CASCADE_VOL_MIN_N", "CASCADE_NET_GEX_MAX",
+    "CASCADE_HYST_MULT", "CASCADE_COOLDOWN_S", "CASCADE_MAX_EVENTS_DAY",
+    "CASCADE_ENTRY_CONV", "CASCADE_CERT_MIN_EVENTS", "CASCADE_CERT_MIN_DAYS",
+    "CASCADE_CERT_CI",
+    # short-vol engine (v9.3): trigger/exit knobs change no feature or label
+    # of the main system; the shortvol CERTIFICATE fingerprints them all —
+    # tuning invalidates the cert, never forces a re-forge
+    "SHORTVOL_ENABLED", "SHORTVOL_PAPER_EXPLORE", "SV_IVRANK_MIN",
+    "SV_NET_GEX_MIN", "SV_WALL_BUFFER_STEPS", "SV_CORRIDOR_MIN_STEPS",
+    "SV_DTE_MIN", "SV_DTE_MAX", "SV_AFTER_HM", "SV_WIDTH_STEPS",
+    "SV_MIN_CREDIT_FRAC", "SV_TP_FRAC", "SV_SL_CREDIT_MULT", "SV_TOUCH_EXIT",
+    "SV_CLOSE_HM", "SV_ATTEMPT_THROTTLE_S", "SV_POP_HAIRCUT", "SV_RISK_PCT",
+    "CF_NEAR_MISS", "CF_MAX_PER_GATE",
+    "LC_WINDOW", "LC_MIN_EVENTS", "MACRO_TERM_STRUCTURE", "TERM_BAND_STEPS",
+    "STRESS_SPLIT_HM", "RCT_LIMIT_TIMEOUT_S", "RCT_MIN_FIT",
+    "GRAD_MICRO_CAPITAL", "GRAD_KELLY_FRAC", "GRAD_DD_MAX_PCT",
+    "FORGE_TRAIN_SAC",
+    "SV_CERT_MIN_EVENTS", "SV_CERT_MIN_DAYS", "SV_CERT_CI",
 })
 
 # names ending in any of these are filesystem locations / log toggles → excluded

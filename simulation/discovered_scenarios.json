@@ -51,6 +51,18 @@
    "date": "2026-07-07",
    "index": "NIFTY",
    "name": "mined_stale_2026-07-07_1013"
+  },
+  {
+   "kind": "stop_run",
+   "hm": "09:36",
+   "depth_pts": 44.2,
+   "down_s": 58,
+   "recover_pts": 27.4,
+   "recover_s": 149,
+   "open": 24026.9,
+   "date": "2026-07-09",
+   "index": "NIFTY",
+   "name": "mined_stop_run_2026-07-09_0936"
   }
  ]
 }

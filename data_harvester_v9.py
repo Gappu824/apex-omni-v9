@@ -188,7 +188,7 @@ class Harvester:
         self.mapper = LiveMapper(self.kite)
         self.mapper.write_snapshot()                      # time-machine entry ★
         self.diag = HarvestDiag()
-        self.report = DailyReport("harvester")
+        self.report = DailyReport("harvester", resume=True)   # v9.6.1: restart-safe forensics (parity with brain)
         self.vault = VaultKeeper(self.diag)
         self.ring = BinaryRingBuffer(writer=True)
         self.q: queue.Queue = queue.Queue()

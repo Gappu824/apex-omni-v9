@@ -69,17 +69,34 @@ class Reservoir:
 class DailyReport:
     """A dict with a date-stamped path and an atomic writer. Components mutate
     `self.d` freely and call write() on their own cadence; write() also stamps
-    freshness so a stalled process is visible from the file alone."""
+    freshness so a stalled process is visible from the file alone.
 
-    def __init__(self, component: str):
+    v9.2 resume: with resume=True, an existing same-day file is LOADED as the
+    base instead of overwritten — a mid-session restart no longer wipes the
+    morning's forensics (2026-07-08: an 11:01 IST brain restart destroyed the
+    funnel evidence of the very move under investigation). The ORIGINAL
+    started_utc is preserved and each restart is appended to `restarts`; the
+    caller is responsible for re-seeding its own live counters from the loaded
+    dict (see apex_main's funnel/regime seed block)."""
+
+    def __init__(self, component: str, resume: bool = False):
         self.component = component
         self.date = str(dt.date.today())
         self.path = config.LOG_DIR / f"{component}_report_{self.date}.json"
-        self.d: dict = {"component": component, "date": self.date,
-                        "version": config.VERSION,
-                        "config_hash": config.CONFIG_HASH,
-                        "started_utc": dt.datetime.utcnow().isoformat(
-                            timespec="seconds") + "Z"}
+        now_iso = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        self.d: dict = {}
+        if resume and self.path.exists():
+            try:
+                prev = json.loads(self.path.read_text(encoding="utf-8"))
+                if prev.get("date") == self.date:
+                    self.d = prev
+                    self.d.setdefault("restarts", []).append(now_iso)
+            except Exception:                             # noqa: BLE001
+                self.d = {}                               # torn file ⇒ fresh
+        self.d.update({"component": component, "date": self.date,
+                       "version": config.VERSION,
+                       "config_hash": config.CONFIG_HASH})
+        self.d.setdefault("started_utc", now_iso)
         self._last_write = 0.0
 
     def write(self, min_interval_s: float = 0.0) -> None:

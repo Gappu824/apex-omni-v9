@@ -85,6 +85,7 @@ from pathlib import Path
 import numpy as np
 
 import config
+from core import trial_registry as TR
 from core.instruments import AsOfMapper
 from core.market_state import StateBuilder
 from core.execution_engine import round_trip_costs
@@ -485,8 +486,11 @@ class _Replayer:
         # (its intraday state files are live-only) ⇒ no VOL_CRUSH label;
         # ann_vol for the governor's vol-target scaling = archive ATM IV.
 
-    def run(self, decide):
-        """decide(obs, frame, iidx) -> raw policy conviction (pre-shock)."""
+    def run(self, decide, on_block=None):
+        """decide(obs, frame, iidx) -> raw policy conviction (pre-shock).
+        v9.4: on_block(idx, gate, detail, ctx) — the counterfactual hook —
+        fires where the replayer itself kills a signal (meta-veto near-miss,
+        persistence, throttle); the grader wires it on the promotion day."""
         from simulation.scenario_engine import N
         _oh, _om = (int(x) for x in config.SESSION_OPEN.split(":"))
         open_sod = _oh * 3600 + _om * 60
@@ -557,15 +561,38 @@ class _Replayer:
                 if not gate.ok:
                     if self.funnel:
                         self.funnel.record(idx, "below_bar", gate.reason)
+                    if on_block is not None and abs(conv) >= (
+                            getattr(gate, "floor", self.entry_bar)
+                            - config.CF_NEAR_MISS):
+                        on_block(idx, "below_bar", gate.reason,
+                                 {"t": t, "ts": ts, "conv": conv, "wp": wp,
+                                  "direction": "CE" if conv > 0 else "PE",
+                                  "spot": spot, "mac": mac, "hm": hm,
+                                  "dte": (ctx or {}).get("dte", 9.0),
+                                  "T": (ctx or {}).get("T") or 0.01})
                     continue
                 pok, pwhy, _ = self.persist[idx].check(conv, sh, gate.floor)
                 if not pok:
                     if self.funnel:
                         self.funnel.record(idx, "not_persistent", pwhy)
+                    if on_block is not None:
+                        on_block(idx, "not_persistent", pwhy,
+                                 {"t": t, "ts": ts, "conv": conv, "wp": wp,
+                                  "direction": "CE" if conv > 0 else "PE",
+                                  "spot": spot, "mac": mac, "hm": hm,
+                                  "dte": (ctx or {}).get("dte", 9.0),
+                                  "T": (ctx or {}).get("T") or 0.01})
                     continue
                 if t - self.last_try[idx] < config.ENTRY_ATTEMPT_THROTTLE_S:
                     if self.funnel:
                         self.funnel.record(idx, "throttled")
+                    if on_block is not None:
+                        on_block(idx, "throttled", "",
+                                 {"t": t, "ts": ts, "conv": conv, "wp": wp,
+                                  "direction": "CE" if conv > 0 else "PE",
+                                  "spot": spot, "mac": mac, "hm": hm,
+                                  "dte": (ctx or {}).get("dte", 9.0),
+                                  "T": (ctx or {}).get("T") or 0.01})
                     continue
                 self.last_try[idx] = t
                 yield ("signal", {
@@ -881,7 +908,64 @@ def _eval_hm(t: int) -> str:
     return (base + dt.timedelta(seconds=int(t))).strftime("%H:%M")
 
 
-def _grade_day(con, day: str, decide, meta, cal, funnel=None):
+def _shadow_trade(rep, s, t):
+    """v9.4 counterfactual grade of a BLOCKED signal: the trade the gate
+    refused, priced and exited exactly as the grader would — first fresh
+    two-sided rung within the spread cap (NO governor, NO affordability: the
+    question is the signal's worth, not the account's size), ASK entry,
+    shaped barriers on the snapshot walls, 0-DTE-aware hold, real costs.
+    Returns after-cost ₹, or None when history cannot fill it."""
+    from simulation.scenario_engine import N
+    d = s["direction"]
+    try:
+        rows = rep.mapper.hierarchy(s["idx"], s["spot"], d)
+    except Exception:                                     # noqa: BLE001
+        return None
+    pick = None
+    for r in rows:
+        kk = rep.ti.get(r["token"])
+        if kk is None or t - rep.last_tick.get(r["token"], -99) > 5:
+            continue
+        b_, a_ = rep.bidA[kk, t], rep.askA[kk, t]
+        if np.isnan(b_) or np.isnan(a_) or b_ <= 0 or a_ <= 0:
+            continue
+        mid = (b_ + a_) / 2.0
+        if (a_ - b_) / max(mid, 0.05) > config.MAX_ENTRY_SPREAD_PCT:
+            continue
+        pick = (kk, float(a_), int(r["lot"]), float(r["strike"]))
+        break
+    if pick is None:
+        return None
+    kk, e, lot, K = pick
+    horizon = _hold_seconds(float(s.get("dte") or 9.0))
+    mins_left = max((N - t) / 60.0, 1.0)
+    T_ = float(s.get("T") or 0.01)
+    cw = (s.get("mac") or {}).get("call_wall")
+    pw = (s.get("mac") or {}).get("put_wall")
+    if s["spot"] > 0 and K > 0 and T_ > 0 and e > 0:
+        tp, sl = _shaped_barriers(e, s["spot"], K, T_, mins_left,
+                                  d == "CE", cw, pw)
+        tp, sl = float(tp), float(sl)
+    else:
+        tp, sl = e * (1 + config.BASE_TP_PCT), e * (1 - config.BASE_SL_PCT)
+    seg = rep.bidA[kk, t + 1:t + 1 + horizon]
+    if seg.size == 0 or np.all(np.isnan(seg)):
+        return None
+    itp = int(np.argmax(seg >= tp)) if np.any(seg >= tp) else None
+    isl = int(np.argmax(seg <= sl)) if np.any(seg <= sl) else None
+    if itp is not None and (isl is None or itp < isl):
+        exitp = float(tp)
+    elif isl is not None:
+        exitp = float(sl)
+    else:
+        v = np.nonzero(~np.isnan(seg))[0]
+        exitp = float(seg[v[-1]])
+    return float((exitp - e) * lot
+                 - round_trip_costs(e * lot, exitp * lot))
+
+
+def _grade_day(con, day: str, decide, meta, cal, funnel=None,
+               attribution=None):
     """After-cost ₹ a policy would have ACTUALLY realized on `day`, sized
     EXACTLY like live: ONE RiskGovernor across ALL tradable indices (the live
     MAX_CONCURRENT_POSITIONS=1 world — v9.0's per-index governors let phantom
@@ -903,7 +987,29 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None):
     total = 0.0
     trades = wins = 0
     open_pos = None                    # (exit_t, outlay, pnl, dir, idx)
-    for ev in rep.run(decide):
+    def _cf(gate_, s_=None, t_=None, count_only=False):
+        """Counterfactual accumulator: n counts every block; graded ₹ only
+        up to CF_MAX_PER_GATE per gate (sampling honesty in the report)."""
+        if attribution is None:
+            return
+        a_ = attribution.setdefault(gate_, {"n": 0, "graded": 0, "sum": 0.0,
+                                            "wins": 0, "capped": 0})
+        a_["n"] += 1
+        if count_only or s_ is None:
+            return
+        if a_["graded"] >= config.CF_MAX_PER_GATE:
+            a_["capped"] += 1
+            return
+        pnl_ = _shadow_trade(rep, s_, t_)
+        if pnl_ is None:
+            return
+        a_["graded"] += 1
+        a_["sum"] += pnl_
+        a_["wins"] += int(pnl_ > 0)
+
+    _hook = (lambda i_, g_, d_, c_: _cf(g_, {"idx": i_, **c_}, c_["t"])) \
+        if attribution is not None else None
+    for ev in rep.run(decide, on_block=_hook):
         if ev[0] == "sec":
             t = ev[1]
             if open_pos is not None and t >= open_pos[0]:
@@ -952,6 +1058,7 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None):
             if funnel:                       # WHY the whole ladder died (v9.1.1)
                 why = " ".join(f"{k}:{n}" for k, n in skip.items() if n)
                 funnel.record(idx, "no_quotes", f"ladder dead — {why}")
+            _cf("no_quotes", count_only=True)
             continue
         leg, permit = risk.first_affordable(
             hierarchy, direction=d, win_prob=s["wp"],
@@ -962,6 +1069,7 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None):
             if funnel:                       # the permit's own words (v9.1.1)
                 funnel.record(idx, "risk_blocked",
                               str(permit.reason)[:80] if permit else "blocked")
+            _cf("risk_blocked", {"idx": idx, **{k: s[k] for k in ("t", "ts", "conv", "wp", "direction", "spot", "mac", "hm")}, "dte": s["ctx"].get("dte", 9.0), "T": s["ctx"].get("T") or 0.01}, t)
             continue
         kk, lot, Kstrike = leg["_k"], leg["lot"], leg["_strike"]
         e = float(leg["price"])                           # ASK — live crosses ★
@@ -980,6 +1088,7 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None):
         if seg.size == 0 or np.all(np.isnan(seg)):
             if funnel:
                 funnel.record(idx, "no_fill", "no forward bids")
+            _cf("no_fill", count_only=True)
             continue
         itp = int(np.argmax(seg >= tp)) if np.any(seg >= tp) else None
         isl = int(np.argmax(seg <= sl)) if np.any(seg <= sl) else None
@@ -1011,17 +1120,20 @@ def evaluate(model, vec, con, day, meta, cal, funnel=None):
         o = vec.normalize_obs(obs[None]) if vec else obs[None]
         a, _ = model.predict(o, deterministic=True)
         return float(a[0][2 * iidx])
-    return _grade_day(con, day, decide, meta, cal, funnel)
+    return _grade_day(con, day, decide, meta, cal, funnel,
+                      attribution=attribution)
 
 
-def evaluate_heuristic(con, day, meta, cal, funnel=None):
+def evaluate_heuristic(con, day, meta, cal, funnel=None,
+                       attribution=None):
     """Heuristic on `day`, identical grading (raw warm frame, no VecNormalize —
     that is the SAC model's input transform, not the heuristic's)."""
     pol = HeuristicPolicy()
 
     def decide(obs, frame, iidx):
         return float(pol.predict(frame)[2 * iidx])
-    return _grade_day(con, day, decide, meta, cal, funnel)
+    return _grade_day(con, day, decide, meta, cal, funnel,
+                      attribution=attribution)
 
 
 def train_trap_model(ledger_path=None):
@@ -1741,8 +1853,16 @@ def main():
         fit_days, inner_day = pool, pool[-1]
         log.warning("only one pool day — inner selection runs ON the train "
                     "day (unavoidable until a 3rd day is harvested)")
-    model, vec, diag = make_and_train(fit_days, inner_day, "candidate")
-    if model is None:
+    if config.FORGE_TRAIN_SAC:
+        model, vec, diag = make_and_train(fit_days, inner_day, "candidate")
+    else:
+        model = vec = None
+        diag = {"frozen": True}
+        log.info("SAC FROZEN (FORGE_TRAIN_SAC=False) — the directional "
+                 "gravestone stands: no candidate tonight; meta retrain, "
+                 "heuristic+meta exam, counterfactual, drift, regime and "
+                 "caches all run in full.")
+    if config.FORGE_TRAIN_SAC and model is None:
         raise SystemExit("No replayable seconds — check harvester output.")
     report.d["bandit"] = {k: (round(v, 4) if isinstance(v, float) else v)
                           for k, v in diag.items()}
@@ -1753,8 +1873,28 @@ def main():
     meta, cal = _eval_meta(), _eval_cal()
     fun_sac = D.GateFunnel(config.TRADABLE)
     fun_heur = D.GateFunnel(config.TRADABLE)
-    score, st_s = evaluate(model, vec, con, final_day, meta, cal, fun_sac)
-    heur, st_h = evaluate_heuristic(con, final_day, meta, cal, fun_heur)
+    score, st_s = (
+        evaluate(model, vec, con, final_day, meta, cal, fun_sac)
+        if model is not None else (0.0, {"trades": 0}))
+    gate_attr: dict = {}
+    heur, st_h = evaluate_heuristic(con, final_day, meta, cal, fun_heur,
+                                    attribution=gate_attr)
+    if gate_attr:
+        log.info("counterfactual gate attribution (promotion day — the ₹ each"
+                 " rule refused; graded ≤%d/gate):", config.CF_MAX_PER_GATE)
+        for g_, a_ in sorted(gate_attr.items()):
+            log.info("  %-14s n=%-6d graded=%-4d Σ₹%+11.2f mean ₹%+9.2f "
+                     "wins %d%s", g_, a_["n"], a_["graded"], a_["sum"],
+                     a_["sum"] / a_["graded"] if a_["graded"] else 0.0,
+                     a_["wins"],
+                     f" (capped +{a_['capped']})" if a_["capped"] else "")
+        try:
+            with (config.STATE_DIR / "gate_attribution.jsonl").open(
+                    "a", encoding="utf-8") as f_:
+                f_.write(json.dumps({"date": final_day,
+                                     "attribution": gate_attr}) + "\n")
+        except Exception:                                 # noqa: BLE001
+            pass
     heur_boot, st_b = evaluate_heuristic(con, final_day, None, {}, None)
     log.info("promotion day (%s) after-cost — SAC ₹%.2f (%d trades) | "
              "heuristic+meta ₹%.2f (%d) | heuristic-bootstrap ₹%.2f (%d)",
@@ -1806,60 +1946,66 @@ def main():
         return (f"{_meta_samples_stamp()}:"
                 f"{_h.sha1(repr(train_days).encode()).hexdigest()[:8]}")
 
-    wf_rows = []
-    wf_funnel = D.GateFunnel(config.TRADABLE)
-    wf_hits = wf_new = 0
-    K = min(int(config.FORGE_WF_FOLDS), max(len(pool) - 2, 0))
-    for fd in pool[len(pool) - K:] if K > 0 else []:
-        j = pool.index(fd)
-        tr = pool[:j]
-        cpath = _wf_cache_path(fd)
-        if cpath.exists():
+    if model is not None:
+        wf_rows = []
+        wf_funnel = D.GateFunnel(config.TRADABLE)
+        wf_hits = wf_new = 0
+        K = min(int(config.FORGE_WF_FOLDS), max(len(pool) - 2, 0))
+        for fd in pool[len(pool) - K:] if K > 0 else []:
+            j = pool.index(fd)
+            tr = pool[:j]
+            cpath = _wf_cache_path(fd)
+            if cpath.exists():
+                try:
+                    row = json.loads(cpath.read_text())
+                    if row.get("stamp") == _wf_stamp(tr):
+                        row["cached"] = True
+                        wf_rows.append(row)
+                        wf_hits += 1
+                        log.info("  WF %s | cached | SAC ₹%+.2f (%d tr) | heur "
+                                 "₹%+.2f (%d tr)", fd, row["sac"],
+                                 row["sac_trades"], row["heuristic"],
+                                 row["heur_trades"])
+                        continue
+                except Exception:                             # noqa: BLE001
+                    pass                                      # torn/old ⇒ recompute
+            wf_model, wf_vec, _wd = make_and_train(tr[:-1], tr[-1], f"wf:{fd}")
+            if wf_model is None:
+                continue
+            s_rs, s_st = evaluate(wf_model, wf_vec, con, fd, None, {}, wf_funnel)
+            h_rs, h_st = evaluate_heuristic(con, fd, None, {})
+            row = {"day": fd, "train_days": len(tr), "stamp": _wf_stamp(tr),
+                   "sac": round(s_rs, 2), "heuristic": round(h_rs, 2),
+                   "sac_trades": s_st["trades"], "heur_trades": h_st["trades"],
+                   "eval_capital": config.FORGE_EVAL_CAPITAL,
+                   "ts": time.time()}
             try:
-                row = json.loads(cpath.read_text())
-                if row.get("stamp") == _wf_stamp(tr):
-                    row["cached"] = True
-                    wf_rows.append(row)
-                    wf_hits += 1
-                    log.info("  WF %s | cached | SAC ₹%+.2f (%d tr) | heur "
-                             "₹%+.2f (%d tr)", fd, row["sac"],
-                             row["sac_trades"], row["heuristic"],
-                             row["heur_trades"])
-                    continue
-            except Exception:                             # noqa: BLE001
-                pass                                      # torn/old ⇒ recompute
-        wf_model, wf_vec, _wd = make_and_train(tr[:-1], tr[-1], f"wf:{fd}")
-        if wf_model is None:
-            continue
-        s_rs, s_st = evaluate(wf_model, wf_vec, con, fd, None, {}, wf_funnel)
-        h_rs, h_st = evaluate_heuristic(con, fd, None, {})
-        row = {"day": fd, "train_days": len(tr), "stamp": _wf_stamp(tr),
-               "sac": round(s_rs, 2), "heuristic": round(h_rs, 2),
-               "sac_trades": s_st["trades"], "heur_trades": h_st["trades"],
-               "eval_capital": config.FORGE_EVAL_CAPITAL,
-               "ts": time.time()}
-        try:
-            cpath.write_text(json.dumps(row))
-        except Exception as e:                            # noqa: BLE001
-            log.warning("WF fold cache write failed for %s: %s", fd, e)
-        wf_rows.append(row)
-        wf_new += 1
-        log.info("  WF %s | %d train d | SAC ₹%+.2f (%d tr) | heur ₹%+.2f "
-                 "(%d tr)", fd, len(tr), s_rs, s_st["trades"], h_rs,
-                 h_st["trades"])
-        del wf_model, wf_vec
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    if K == 0:
-        log.info("walk-forward skipped: needs ≥4 harvested days "
-                 "(have %d) — grows automatically", len(days))
+                cpath.write_text(json.dumps(row))
+            except Exception as e:                            # noqa: BLE001
+                log.warning("WF fold cache write failed for %s: %s", fd, e)
+            wf_rows.append(row)
+            wf_new += 1
+            log.info("  WF %s | %d train d | SAC ₹%+.2f (%d tr) | heur ₹%+.2f "
+                     "(%d tr)", fd, len(tr), s_rs, s_st["trades"], h_rs,
+                     h_st["trades"])
+            del wf_model, wf_vec
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        if K == 0:
+            log.info("walk-forward skipped: needs ≥4 harvested days "
+                     "(have %d) — grows automatically", len(days))
 
-    sac_wf = [r["sac"] for r in wf_rows]
-    heur_wf = [r["heuristic"] for r in wf_rows]
-    hist_path = config.MODEL_DIR / "forge_history.jsonl"
-    trials = 1
-    if hist_path.exists():
-        trials += sum(1 for _ in hist_path.open(encoding="utf-8"))
+        sac_wf = [r["sac"] for r in wf_rows]
+        heur_wf = [r["heuristic"] for r in wf_rows]
+        # v9.4: deflation charges the GLOBAL trial registry (Pillar 1) — the
+        # pre-registry forge_history era is back-filled once, idempotently.
+        TR.ensure_forge_backfill()
+    else:
+        wf_rows, sac_wf = [], []
+    if model is not None:
+        TR.register("forge", ver, "candidate", day=final_day)
+
+    trials = TR.trials_for_deflation("forge")
     dsr, psr = _deflated_psr(sac_wf, trials) if len(sac_wf) >= 3 else (None, None)
     if psr:
         log.info("walk-forward SAC: sum ₹%.2f over %d folds | PSR(SR>0)=%.2f "
@@ -1921,7 +2067,9 @@ def main():
         "heuristic_bootstrap": round(heur_boot, 2),
         "incumbent": round(incumbent, 2) if has_champ else None,
         "incumbent_src": inc_src,
-        "funnel_sac": fun_sac.as_dict(), "funnel_heuristic": fun_heur.as_dict()}
+        "funnel_sac": fun_sac.as_dict(),
+        "funnel_heuristic": fun_heur.as_dict(),
+        "gate_attribution": gate_attr}
     report.d["walk_forward"] = {
         "folds": wf_rows, "sac_sum": round(sum(sac_wf), 2) if sac_wf else None,
         "heur_sum": round(sum(heur_wf), 2) if heur_wf else None,

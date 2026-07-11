@@ -106,13 +106,19 @@ CREATE TABLE IF NOT EXISTS macro_snapshots_v9 (
     flip        REAL, flip_width REAL, call_wall REAL, put_wall REAL,
     net_gex     REAL, net_dex REAL, pcr REAL, max_pain REAL,
     atm_iv      REAL, iv_rank REAL, strikes_json TEXT, iv_json TEXT,
+    gex_json    TEXT,
     PRIMARY KEY (ts_ms, index_name));
 CREATE INDEX IF NOT EXISTS idx_macro_idx_ts
     ON macro_snapshots_v9 (index_name, ts_ms);
+CREATE TABLE IF NOT EXISTS macro_term_v9 (
+    ts_ms INTEGER, index_name TEXT, expiry TEXT, dte REAL, atm_iv REAL,
+    strikes_json TEXT, iv_json TEXT,
+    PRIMARY KEY (ts_ms, index_name, expiry));
 """
 _MACRO_COLS = ("ts_ms", "index_name", "spot", "expiry", "dte", "flip",
                "flip_width", "call_wall", "put_wall", "net_gex", "net_dex",
-               "pcr", "max_pain", "atm_iv", "iv_rank", "strikes_json", "iv_json")
+               "pcr", "max_pain", "atm_iv", "iv_rank", "strikes_json",
+               "iv_json", "gex_json")
 
 
 class MacroArchive:
@@ -132,6 +138,14 @@ class MacroArchive:
             con.execute("PRAGMA journal_mode=WAL;")
             con.execute("PRAGMA busy_timeout=5000;")     # wait, don't error, on lock
             con.executescript(MACRO_ARCHIVE_SCHEMA)
+            try:                     # v9.2 live migration for pre-existing vaults
+                con.execute("ALTER TABLE macro_snapshots_v9 "
+                            "ADD COLUMN gex_json TEXT")
+                con.commit()
+                log.info("macro archive migrated: gex_json column added "
+                         "(per-contract GEX now persisted for the nowcast)")
+            except sqlite3.OperationalError:
+                pass                                     # already present
             self.con = con
         return self.con
 
@@ -144,7 +158,8 @@ class MacroArchive:
                    p.get("net_gex"), p.get("net_dex"), p.get("pcr"),
                    p.get("max_pain"), p.get("atm_iv"), p.get("iv_rank"),
                    json.dumps(p.get("strikes") or []),
-                   json.dumps(p.get("iv") or []))
+                   json.dumps(p.get("iv") or []),
+                   json.dumps(p.get("gex") or []))
             con.execute(
                 f"INSERT OR REPLACE INTO macro_snapshots_v9 VALUES "
                 f"({','.join('?' * len(_MACRO_COLS))})", row)
@@ -173,21 +188,31 @@ def load_macro_archive(con: sqlite3.Connection, day: str, index: str) -> list[di
         rows = con.execute(
             "SELECT ts_ms, spot, expiry, dte, call_wall, put_wall, atm_iv, "
             "iv_rank, pcr, max_pain, net_gex, flip, flip_width, net_dex, "
-            "strikes_json, iv_json "
+            "strikes_json, iv_json, gex_json "
             "FROM macro_snapshots_v9 WHERE index_name=? AND "
             "date(ts_ms/1000,'unixepoch','localtime')=? ORDER BY ts_ms",
             (index, day)).fetchall()
-    except sqlite3.OperationalError:                      # table absent ⇒ no archive
-        return []
+    except sqlite3.OperationalError:
+        try:                          # pre-v9.2 vault: no gex_json column yet
+            rows = [r + (None,) for r in con.execute(
+                "SELECT ts_ms, spot, expiry, dte, call_wall, put_wall, "
+                "atm_iv, iv_rank, pcr, max_pain, net_gex, flip, flip_width, "
+                "net_dex, strikes_json, iv_json "
+                "FROM macro_snapshots_v9 WHERE index_name=? AND "
+                "date(ts_ms/1000,'unixepoch','localtime')=? ORDER BY ts_ms",
+                (index, day)).fetchall()]
+        except sqlite3.OperationalError:              # table absent ⇒ no archive
+            return []
     out = []
     for (ts_ms, spot, expiry, dte, cw, pw, aiv, ivr, pcr, mp, ng,
-         flip, flip_w, ndex, sj, ij) in rows:
+         flip, flip_w, ndex, sj, ij, gj) in rows:
         out.append({"ts": ts_ms / 1000.0, "spot": spot, "expiry": expiry,
                     "dte": dte, "call_wall": cw, "put_wall": pw, "atm_iv": aiv,
                     "iv_rank": ivr, "pcr": pcr, "max_pain": mp, "net_gex": ng,
                     "flip": flip, "flip_width": flip_w, "net_dex": ndex,
                     "strikes": json.loads(sj or "[]"),
-                    "iv": json.loads(ij or "[]")})
+                    "iv": json.loads(ij or "[]"),
+                    "gex": json.loads(gj) if gj else []})
     return out
 
 
@@ -291,6 +316,82 @@ def assemble_snapshot(*, ts, index, spot, exp, dte, K, mid, oi, is_call, lot,
     return payload, K, iv, gex
 
 
+def write_term_row(con, ts: float, index: str, expiry: str, dte: float,
+                   atm_iv: float, K: list, iv: list) -> None:
+    """Pure, testable writer for the tenor-2 probe (macro_term_v9)."""
+    con.execute("INSERT OR REPLACE INTO macro_term_v9 VALUES (?,?,?,?,?,?,?)",
+                (int(ts * 1000), index, expiry, dte, atm_iv,
+                 json.dumps(list(K)), json.dumps(list(iv))))
+    con.commit()
+
+
+def load_term(con, day: str, index: str) -> list[dict]:
+    try:
+        rows = con.execute(
+            "SELECT ts_ms, expiry, dte, atm_iv, strikes_json, iv_json FROM "
+            "macro_term_v9 WHERE index_name=? AND "
+            "date(ts_ms/1000,'unixepoch','localtime')=? ORDER BY ts_ms",
+            (index, day)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{"ts": r[0] / 1000.0, "expiry": r[1], "dte": r[2],
+             "atm_iv": r[3], "strikes": json.loads(r[4] or "[]"),
+             "iv": json.loads(r[5] or "[]")} for r in rows]
+
+
+def _term_probe(kite, index: str, spot: float, rows, exps, d):
+    """v9.5 Pillar-3 data feed: a MINIMAL sweep of the SECOND expiry —
+    ATM ± TERM_BAND_STEPS strikes only (≈8–12 quotes/index/cycle, one API
+    chunk + the standard 1.05 s budget sleep) — Newton IVs → ATM tenor-2 vol
+    into macro_term_v9. This is the tenor pair Dubinsky–Johannes event-
+    variance extraction needs; the front tenor's full smile already lives in
+    the main archive. Additive table: NO migration of existing vaults."""
+    if not getattr(config, "MACRO_TERM_STRUCTURE", False) or len(exps) < 2:
+        return
+    exp2 = exps[1]
+    step = float(config.INDICES[index]["strike_step"])
+    bandw = config.TERM_BAND_STEPS * step
+    band = [r for r in rows if r["expiry"] == exp2
+            and abs(r["strike"] - spot) <= bandw + 1e-6]
+    if len(band) < 4:
+        return
+    keys = [f'{r["exchange"]}:{r["symbol"]}' for r in band]
+    try:
+        quotes = kite.quote(keys[:config.MACRO_QUOTE_CHUNK])
+    except Exception:                                 # noqa: BLE001
+        d["term_err"] = d.get("term_err", 0) + 1
+        return
+    time.sleep(1.05)
+    dte2 = max((exp2 - dt.date.today()).days, 0) + config.DTE_PART_DAY
+    T2 = dte2 / 365.0
+    F2 = spot * math.exp(config.RISK_FREE_RATE * T2)
+    Ks, ivs = [], []
+    for r in band:
+        q = quotes.get(f'{r["exchange"]}:{r["symbol"]}') or {}
+        dq = q.get("depth") or {}
+        b0 = (dq.get("buy") or [{}])[0].get("price") or 0
+        s0 = (dq.get("sell") or [{}])[0].get("price") or 0
+        mid = (float(b0) + float(s0)) / 2.0 if b0 and s0 \
+            else float(q.get("last_price") or 0)
+        if mid <= 0:
+            continue
+        is_call = r["symbol"].endswith("CE")
+        if (is_call and r["strike"] < spot) or \
+           (not is_call and r["strike"] > spot):
+            continue                                  # OTM side only
+        iv = implied_vol_newton(mid, F2, r["strike"], T2, is_call,
+                                config.RISK_FREE_RATE)
+        if iv and 0.03 < iv < 2.0:
+            Ks.append(float(r["strike"]))
+            ivs.append(float(iv))
+    if len(ivs) < 2:
+        return
+    atm2 = float(ivs[int(np.argmin(np.abs(np.asarray(Ks) - spot)))])
+    write_term_row(_ARCHIVE._ensure(), time.time(), index, str(exp2), dte2,
+                   atm2, Ks, ivs)
+    d["term_ok"] = d.get("term_ok", 0) + 1
+
+
 def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put,
                   diag: dict | None = None):
     """One radar pass for one index. `diag` (per-index dict from main) collects
@@ -388,6 +489,7 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put,
     payload["doi15"] = doi15
     atomic_write(config.MACRO_STATE_TMPL.format(idx=index), payload)
     _ARCHIVE.write(payload)                               # vault: forge surface + walls
+    _term_probe(kite, index, spot, rows, exps, d)
     d["ok"] = d.get("ok", 0) + 1
     d["last_ts"] = payload["ts"]
     d["last"] = {"spot": spot, "atm_iv": round(atm_iv, 4),
@@ -417,7 +519,7 @@ def main():
     kite.set_access_token(config.KITE_ACCESS_TOKEN)
     mapper = LiveMapper(kite)
     s_call, s_put = dealer_sign()
-    report = DailyReport("macro")
+    report = DailyReport("macro", resume=True)   # v9.6.1: restart-safe forensics (parity with brain)
     per_idx: dict[str, dict] = {i: {} for i in config.INDEX_ORDER}
     report.d["per_index"] = per_idx
     while True:

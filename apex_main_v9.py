@@ -72,6 +72,12 @@ from core.quant_core import black76_greeks
 from core import regime_classifier as regime_mod
 from core import decision as D
 from core.diagnostics import DailyReport, Reservoir
+from core.gamma_nowcast import GammaNowcast
+from core import cascade as CS
+from core import shortvol as SVOL
+from core.dealer_flow import DealerFlow
+from core import rv_forecaster as RVF
+from core import book as BOOK
 
 log = logging.getLogger("brain")
 
@@ -265,12 +271,124 @@ def main():
     last_wp_hold: dict[str, float | None] = {}
     last_mac: dict[str, dict | None] = {}
     # ---- v9.1 diagnostics: gate funnel + daily report -----------------------
+    # v9.2: resume=True — a mid-session restart merges into the day's report;
+    # live counters are RE-SEEDED from it below (reservoir percentiles are
+    # restart-local by nature; everything countable survives the bounce).
     funnel = D.GateFunnel(config.TRADABLE)
-    report = DailyReport("brain")
+    report = DailyReport("brain", resume=True)
     conv_res = {i: Reservoir(20_000) for i in config.TRADABLE}   # |conv| stream
     wp_res = {i: Reservoir(20_000) for i in config.TRADABLE}     # gated P(win)
     regime_share: dict[str, dict] = {i: {} for i in config.TRADABLE}
+    _prev = report.d
+    if _prev.get("gate_funnel"):
+        for _i, _sec in _prev["gate_funnel"].items():
+            if _i in funnel.counts:
+                for _g, _n in (_sec.get("gates") or {}).items():
+                    funnel.counts[_i][_g] = int(_n)
+                funnel.block_detail[_i] = {
+                    k: int(v) for k, v in
+                    (_sec.get("top_block_reasons") or {}).items()}
+        for _i, _rs in (_prev.get("regime_share_s") or {}).items():
+            if _i in regime_share:
+                regime_share[_i].update({k: int(v) for k, v in _rs.items()})
+        report.d["resume_note"] = ("counters resumed from prior same-day "
+                                   "report; conviction/winprob reservoirs are "
+                                   "restart-local; block-reason detail resumes "
+                                   "top-8 only")
+        log.info("brain report RESUMED — funnel/regime counters carried "
+                 "across restart (%d restart(s) today)",
+                 len(_prev.get("restarts") or []))
     last_report = time.time()
+
+    # ---- v9.2 GAMMA-CASCADE: 1 Hz flip nowcast + structural detector --------
+    # Telemetry always; ENTRIES only under a valid harness certificate
+    # (core/cascade.load_certificate — fail-closed, knob-hash-stamped). The
+    # detector is the SAME bytes tools/cascade_harness.py graded.
+    nowcasts = {i: GammaNowcast(i) for i in config.TRADABLE}
+    detectors = {i: CS.CascadeDetector(i) for i in config.TRADABLE}
+    flip_now: dict[str, object] = {}
+    cascade_cert = CS.load_certificate()
+    casc_mode = CS.cascade_mode(cascade_cert)      # certified|paper-explore|telemetry
+    cascade_fired = {i: 0 for i in config.TRADABLE}
+    cascade_entered = {i: 0 for i in config.TRADABLE}
+    report.d.setdefault("cascade", {}).setdefault("events", [])
+    report.d["cascade"]["mode"] = casc_mode
+    if casc_mode == "certified":
+        log.info("CASCADE ARMED (CERTIFIED) — cert ok (n=%s events, mean ₹%s, "
+                 "CI lo ₹%s, win_lo %.0f%%) knob %s",
+                 cascade_cert.get("n_events"), cascade_cert.get("mean_pnl"),
+                 cascade_cert.get("ci_lo"),
+                 100 * float(cascade_cert.get("win_rate_lo", 0)),
+                 cascade_cert.get("knob_hash"))
+    elif casc_mode == "paper-explore":
+        log.info("CASCADE ARMED (PAPER-EXPLORE) — no certificate yet; entries "
+                 "run in PAPER ONLY to accrue forward out-of-sample evidence "
+                 "(the harness blends realized paper fills into the cert; "
+                 "live cascade stays locked behind cert + the four locks)")
+    else:
+        log.info("cascade detector: TELEMETRY-ONLY (CASCADE_LIVE_ENABLED "
+                 "and/or paper-explore off)")
+
+    # ---- v9.3 SHORT-VOL ENGINE: VRP credit spreads, cascade-vetoed ----------
+    # Sells defined-risk verticals at the tested wall ONLY under +gamma
+    # pinning with rich IV rank; the cascade machinery is the structural
+    # crash-veto (sell the calm, own the storm — zero overlap by
+    # construction). Staged like cascade: telemetry → paper-explore forward
+    # evidence → certificate. v9.3.0 execution ceiling is PAPER by design:
+    # live spread ROUTING stays unbuilt until a certificate justifies it.
+    sv_cert = SVOL.load_certificate()
+    sv_mode = SVOL.shortvol_mode(sv_cert)
+    svbook = SVOL.SpreadBook(risk=risk, kite=kite)
+    sv_gate_block: dict[str, dict] = {i: {} for i in config.TRADABLE}
+    sv_blocked_now: dict[str, bool] = {i: False for i in config.TRADABLE}
+    report.d.setdefault("shortvol", {}).setdefault("events", [])
+    report.d["shortvol"]["mode"] = sv_mode
+    if sv_mode == "paper-explore":
+        log.info("SHORTVOL ARMED (PAPER-EXPLORE) — VRP credit spreads: short "
+                 "the tested wall, long one step out; +gamma corridor + rich "
+                 "IV only; cascade-vetoed; paper fills feed the certificate "
+                 "via the forward log")
+    elif sv_mode == "certified":
+        log.info("SHORTVOL certified (n=%s, mean ₹%s) — NOTE: v9.3.0 live "
+                 "ROUTING is unbuilt by design; execution remains paper",
+                 sv_cert.get("n_events"), sv_cert.get("mean_pnl"))
+    else:
+        log.info("shortvol: TELEMETRY-ONLY (gate stats recorded; set "
+                 "SHORTVOL_PAPER_EXPLORE=True to accrue forward evidence)")
+    _svtok = f"0c {sv_mode}"
+
+    # ---- v9.4 TELEMETRY ORGANS (Pillars 2+3): dealer-flow vector + rv̂ -----
+    # Charm/vanna/pin from the radar's own profile; HAR remaining-day vol and
+    # the measured VRP spread when a fitted model exists. Telemetry + report
+    # ONLY — no certified gate consumes these until their own trials pass
+    # (PROGRAM.md; the rv skill certificate is the forecaster's lock).
+    dflows = {i: DealerFlow(i) for i in config.TRADABLE}
+    last_dflow: dict[str, object] = {}
+    rv_models = {i: RVF.load_model(i) for i in config.TRADABLE}
+    _rv_acc = {i: {"m": -1, "px": None, "rv": 0.0} for i in config.TRADABLE}
+    last_rv: dict[str, dict] = {}
+    last_mac_lite: dict[str, dict] = {}
+    last_book: dict = {}
+    _OPEN_SOD_B = (int(config.SESSION_OPEN.split(":")[0]) * 3600
+                   + int(config.SESSION_OPEN.split(":")[1]) * 60)
+    _rvm = [i for i, m in rv_models.items() if m]
+    if _rvm:
+        log.info("rv forecaster loaded for %s — telemetry only until the "
+                 "skill certificate passes (tools/rv_skill_report.py)", _rvm)
+
+    def _sv_quotes(spec):
+        """Fresh two-leg book via the throttled QuoteCache (≈1 Hz)."""
+        qq = qc.get([(spec.exchange, spec.short_symbol),
+                     (spec.exchange, spec.long_symbol)])
+        out = {}
+        for tokn, sym in ((spec.short_token, spec.short_symbol),
+                          (spec.long_token, spec.long_symbol)):
+            d = (qq.get(sym) or {}).get("depth") or {}
+            b0 = (d.get("buy") or [{}])[0]
+            s0 = (d.get("sell") or [{}])[0]
+            out[tokn] = {"bid": float(b0.get("price") or 0),
+                         "ask": float(s0.get("price") or 0)}
+        return out
 
     def _write_report(final: bool = False):
         report.d["mode"] = ("LIVE" if config.live_fire_armed() else
@@ -284,6 +402,79 @@ def main():
         report.d["winprob_at_gate"] = {i: wp_res[i].summary()
                                        for i in config.TRADABLE}
         report.d["regime_share_s"] = regime_share
+        report.d["cascade"]["mode"] = casc_mode
+        # ---- v9.6 portfolio book: both engines as ONE set of greeks ----
+        try:
+            _legs, _lm = [], []
+            for _i, _p in pms.items():
+                if _p.pos is not None:
+                    _legs.append({"index": _i, "strike": _p.pos.strike,
+                                  "is_call": _p.pos.direction == "CE",
+                                  "qty": _p.pos.qty, "mid": None})
+                    _lm.append((f"{_p.pos.exchange}:{_p.pos.symbol}",
+                                len(_legs) - 1))
+            if svbook.pos is not None:
+                _sp, _sc = svbook.pos, svbook.pos.spec
+                for _sym, _K, _q in (
+                        (_sc.short_symbol, _sc.short_strike,
+                         -_sp.lots * _sc.lot),
+                        (_sc.long_symbol, _sc.long_strike,
+                         _sp.lots * _sc.lot)):
+                    _legs.append({"index": _sc.index, "strike": _K,
+                                  "is_call": _sc.direction == "CE",
+                                  "qty": _q, "mid": None})
+                    _lm.append((f"{_sc.exchange}:{_sym}", len(_legs) - 1))
+            if _lm:
+                try:
+                    _qs = kite.quote([k for k, _ in _lm])
+                    for _k, _ix in _lm:
+                        _q = _qs.get(_k) or {}
+                        _d = _q.get("depth") or {}
+                        _b = (_d.get("buy") or [{}])[0].get("price") or 0
+                        _a = (_d.get("sell") or [{}])[0].get("price") or 0
+                        _legs[_ix]["mid"] = ((float(_b) + float(_a)) / 2
+                                             if _b and _a else
+                                             float(_q.get("last_price") or 0)
+                                             or None)
+                except Exception:                         # noqa: BLE001
+                    pass                       # est_iv fallback carries it
+            last_book = (BOOK.compute_book(_legs, last_mac_lite)
+                         if _legs else {})
+        except Exception as _be:                          # noqa: BLE001
+            log.warning("book telemetry: %s", _be)
+            last_book = {}
+        report.d["book"] = last_book
+        report.d["dealer_flow"] = {
+            i: ({"net_gex": _v.net_gex,
+                 "charm_rs_min": round(_v.charm_flow_rs_min, 1),
+                 "vanna_units_volpt": round(_v.vanna_units_volpt, 1),
+                 "pin": {str(k): round(pv, 3)
+                         for k, pv in _v.pin.items()},
+                 "signs_inferred": _v.signs_inferred,
+                 "age_s": round(_v.snapshot_age_s, 1)}
+                if (_v := last_dflow.get(i)) is not None else None)
+            for i in config.TRADABLE}
+        report.d["rv"] = dict(last_rv)
+        report.d["shortvol"]["mode"] = sv_mode
+        report.d["shortvol"]["gate_blockers"] = {
+            i: dict(sorted(b.items(), key=lambda kv: -kv[1])[:6])
+            for i, b in sv_gate_block.items()}
+        report.d["shortvol"]["closed_today"] = svbook.closed_today
+        report.d["shortvol"]["open"] = (None if svbook.pos is None else {
+            "id": svbook.pos.spread_id, "index": svbook.pos.spec.index,
+            "side": svbook.pos.spec.side,
+            "credit": round(svbook.pos.credit, 2), "lots": svbook.pos.lots,
+            "max_loss": round(svbook.pos.max_loss, 2),
+            "opened": svbook.pos.open_hm})
+        report.d["cascade"]["fired"] = dict(cascade_fired)
+        report.d["cascade"]["entered"] = dict(cascade_entered)
+        report.d["cascade"]["flip_now"] = {
+            i: ({"flip": (round(_n.flip, 1) if _n.flip else None),
+                 "net_gex": _n.net_gex,
+                 "snapshot_age_s": round(_n.snapshot_age_s, 1),
+                 "in_band": _n.in_band}
+                if (_n := flip_now.get(i)) is not None else None)
+            for i in config.TRADABLE}
         report.d["pnl_realized"] = round(risk.realized_pnl, 2)
         report.d["risk_halted"] = bool(risk.halted)
         if final:
@@ -333,6 +524,16 @@ def main():
         risk.on_tick()
         hm = dt.datetime.now().strftime("%H:%M")
         if hm >= config.SESSION_CLOSE:
+            if svbook.pos is not None:
+                _cr = svbook.manage(ts=ts, hm=hm,
+                                    spot=last_spot.get(
+                                        svbook.pos.spec.index, 0.0),
+                                    quotes=_sv_quotes(svbook.pos.spec),
+                                    cascade_event=True)
+                if _cr is not None:
+                    log.warning("Ⓥ SHORTVOL session-close flat → ₹%+.2f",
+                                _cr["pnl"])
+                    report.d["shortvol"]["events"].append(_cr)
             log.info("session over — done. PnL ₹%.2f", risk.realized_pnl)
             break
 
@@ -352,6 +553,15 @@ def main():
             for idx in config.TRADABLE:
                 funnel.record(idx, "stale_feed")
             if age > config.DATA_STALE_FLATTEN_S:
+                if svbook.pos is not None:
+                    _cr = svbook.manage(
+                        ts=ts, hm=hm,
+                        spot=last_spot.get(svbook.pos.spec.index, 0.0),
+                        quotes={}, cascade_event=True)
+                    if _cr is not None:
+                        log.warning("Ⓥ SHORTVOL stale-feed flat → ₹%+.2f "
+                                    "(worst-mark, dead book)", _cr["pnl"])
+                        report.d["shortvol"]["events"].append(_cr)
                 for idx in config.TRADABLE:
                     pm = pms[idx]
                     if pm.pos is not None:
@@ -418,14 +628,27 @@ def main():
             # `drift` field, so the two are never conflated.
             no_trade = " · ".join(f"{i}: {skip_reason.get(i, '—')}"
                                   for i in config.TRADABLE)
+            _cf_n = sum(cascade_fired.values())
+            _ce_n = sum(cascade_entered.values())
+            _casc = f"{_cf_n}F/{_ce_n}E {casc_mode}"
+            # certificate can appear/refresh mid-session (harness run after a
+            # morning close, cron, etc.) — re-resolve the staging mode each
+            # heartbeat so arming never needs a brain restart.
+            cascade_cert = CS.load_certificate()
+            casc_mode = CS.cascade_mode(cascade_cert)
+            sv_cert = SVOL.load_certificate()
+            sv_mode = SVOL.shortvol_mode(sv_cert)
+            _svtok = ((f"{svbook.pos.spec.index}·open" if svbook.pos
+                       else f"{svbook.closed_today}c") + f" {sv_mode}")
             log.info("♥ %s | feed age %.1fs | PnL ₹%+.0f | deployed ₹%.0f | "
                      "halted=%s | pos %s | conv %s | policy %s | VIX %s | "
-                     "regime %s | walkaway %s | drift %s | no-trade: %s",
+                     "regime %s | walkaway %s | cascade %s | sv %s | drift %s | "
+                     "no-trade: %s",
                      hm, age, risk.realized_pnl, risk.deployed,
                      risk.halted or risk.halt_reason or False, poss, convs,
                      policy.kind,
                      f"{vix_hist[-1][1]:.2f}" if vix_hist else "—",
-                     _reg_s, _wa, drift_grade, no_trade)
+                     _reg_s, _wa, _casc, _svtok, drift_grade, no_trade)
             # GATE FUNNEL — running per-index tally of what blocked entries so
             # far today (top 5 gates each). The daily JSON has the full table.
             log.info("  funnel %s", " | ".join(funnel.line(i)
@@ -446,9 +669,28 @@ def main():
                 pdh_s = f"PDH {lv['pdh']:.0f}" if lv.get("pdh") else "PDH —"
                 pdl_s = f"PDL {lv['pdl']:.0f}" if lv.get("pdl") else "PDL —"
                 cw, pw, fl = mc.get("call_wall"), mc.get("put_wall"), mc.get("flip")
+                _ncv = flip_now.get(i)
+                nc_s = (f"  nflip {_ncv.flip:.0f}({_ncv.snapshot_age_s:.0f}s)"
+                        if _ncv is not None and _ncv.flip else "  nflip —")
+                _dfv = last_dflow.get(i)
+                df_s = ((f"  charm ₹{_dfv.charm_flow_rs_min:+,.0f}/m"
+                         f"  vanna {_dfv.vanna_units_volpt:+,.0f}u"
+                         + (f"  pin {max(_dfv.pin.values()):.2f}"
+                            if _dfv.pin else ""))
+                        if _dfv is not None else "")
+                _bk = last_book.get(i)
+                bk_s = ((f"  Δ₹{_bk['delta_rs']:+,.0f}"
+                         f" θ₹{_bk['theta_rs_day']:+,.0f}/d")
+                        if _bk else "")
+                _rvv = last_rv.get(i)
+                rv_s = ((f"  rv̂ {100 * _rvv['rv_hat']:.1f}%"
+                         + (f" vrp {100 * _rvv['vrp']:+.1f}%"
+                            if _rvv.get("vrp") is not None else ""))
+                        if _rvv else "")
                 wall_s = (f"Cwall {cw:.0f}" if cw else "Cwall —") + \
                          (f"  Pwall {pw:.0f}" if pw else "  Pwall —") + \
-                         (f"  flip {fl:.0f}" if fl else "  flip —")
+                         (f"  flip {fl:.0f}" if fl else "  flip —") + nc_s \
+                         + df_s + rv_s + bk_s
                 log.info("  levels %-6s | spot %.0f  %s  %s  %s | %s",
                          i, sp, pdc_s, pdh_s, pdl_s, wall_s)
 
@@ -542,6 +784,7 @@ def main():
             vel = spot - last_spot.get(idx, spot); last_spot[idx] = spot
             i = config.INDEX_ORDER.index(idx)
             pm = pms[idx]
+            cascade_ev = None                    # set only on decision seconds
 
             # ================= 1 Hz DECISION STACK (ring-second cadence —
             # byte-identical to the forge grader's _Replayer) ================
@@ -559,6 +802,132 @@ def main():
                 # copy, shared with the forge's replay.
                 mac = read_macro(idx)
                 last_mac[idx] = mac
+                # ---- CASCADE: 1 Hz analytic flip nowcast + detector --------
+                # Flip-source hierarchy identical to the harness: fresh
+                # analytic nowcast off the radar's per-contract profile, else
+                # the radar's own numbers (≤MACRO_STALE_S), else the detector
+                # idles. Zero extra API calls.
+                nowcasts[idx].update_snapshot(mac)
+                _nc = nowcasts[idx].nowcast(spot, ts)
+                flip_now[idx] = _nc
+                if _nc is not None:
+                    _cf, _cw, _cg = _nc.flip, _nc.flip_width, _nc.net_gex
+                    _src, _cage = "nowcast", _nc.snapshot_age_s
+                elif mac is not None:
+                    _cf, _cw, _cg = (mac.get("flip"), mac.get("flip_width"),
+                                     mac.get("net_gex"))
+                    _src, _cage = "radar", ts - float(mac.get("ts") or ts)
+                else:
+                    _cf = _cw = _cg = None
+                    _src, _cage = "none", 0.0
+                cascade_ev = detectors[idx].update(
+                    ts=ts, day=report.date, spot=spot, flip=_cf,
+                    flip_width=_cw, net_gex=_cg,
+                    strike_step=float(config.INDICES[idx]["strike_step"]),
+                    flip_source=_src, flip_age_s=float(_cage))
+                if cascade_ev is not None:
+                    cascade_fired[idx] += 1
+                    _row = cascade_ev.as_dict()
+                    _row["hm"] = hm
+                    _row["mode"] = casc_mode
+                    if pm.pos is not None:
+                        _row["skip"] = f"in {pm.pos.symbol}"
+                    report.d["cascade"]["events"].append(_row)
+                    log.warning("⚡ CASCADE %s %s %s z=%+.2f | spot %.0f < "
+                                "flip %.0f−hyst | netGEX %.2e [%s %.0fs] | %s",
+                                idx, cascade_ev.kind, cascade_ev.direction,
+                                cascade_ev.z, spot, cascade_ev.flip,
+                                cascade_ev.net_gex, _src, _cage,
+                                f"{casc_mode.upper()} — attempting entry"
+                                if casc_mode != "telemetry"
+                                and pm.pos is None
+                                else "telemetry"
+                                if casc_mode == "telemetry"
+                                else _row.get("skip"))
+                # ---- v9.4 telemetry: dealer-flow vector + rv accumulation
+                dflows[idx].update_snapshot(mac)
+                _dfw = dflows[idx].vector(
+                    spot, ts, walls=((mac or {}).get("call_wall"),
+                                     (mac or {}).get("put_wall")))
+                if _dfw is not None:
+                    last_dflow[idx] = _dfw
+                last_mac_lite[idx] = {"spot": spot,
+                    "dte": (mac or {}).get("dte"),
+                    "atm_iv": (mac or {}).get("atm_iv")}
+                _acc = _rv_acc[idx]
+                _m_now = (int((ts + 19800) % 86400) - _OPEN_SOD_B) // 60
+                if 0 <= _m_now < RVF.SESSION_MIN:
+                    if _acc["m"] != _m_now:
+                        if _acc["px"] and spot > 0 and _acc["m"] >= 0:
+                            _r_ = math.log(spot / _acc["px"])
+                            _acc["rv"] += _r_ * _r_
+                        _acc["m"], _acc["px"] = _m_now, spot
+                    _mdl = rv_models.get(idx)
+                    if _mdl:
+                        _prj = RVF.predict_remaining(_mdl, _m_now, _acc["rv"])
+                        if _prj:
+                            _ivn = (mac or {}).get("atm_iv")
+                            last_rv[idx] = {
+                                "rv_hat": round(_prj["day_ann_vol"], 4),
+                                "rem_ann": round(_prj["rem_ann_vol"], 4),
+                                "vrp": (round(float(_ivn)
+                                              - _prj["day_ann_vol"], 4)
+                                        if _ivn else None)}
+                # ---- v9.3 SHORT-VOL gate (1 Hz): cascade state is the
+                # veto, exactly as the harness applies it --------------------
+                _step_sv = float(config.INDICES[idx]["strike_step"])
+                _hy_sv = max(config.CASCADE_HYST_MULT * float(_cw or 0.0),
+                             _step_sv)
+                sv_blocked_now[idx] = bool(
+                    cascade_ev is not None
+                    or ts < getattr(detectors[idx], "_cooldown_until", -1e18)
+                    or (_cf is not None and _cg is not None
+                        and spot < _cf - _hy_sv
+                        and _cg <= config.CASCADE_NET_GEX_MAX))
+                _svg = SVOL.evaluate_gate(
+                    hm=hm, spot=spot, mac=mac,
+                    net_gex_now=(_cg if _src == "nowcast" else None),
+                    dte=ctx_m.get("dte"), strike_step=_step_sv,
+                    vix_bump=vix_bump,
+                    cascade_blocked=sv_blocked_now[idx])
+                if not _svg.ok:
+                    _bk = sv_gate_block[idx]
+                    _k = _svg.reason[:40]
+                    if _k in _bk or len(_bk) < 12:
+                        _bk[_k] = _bk.get(_k, 0) + 1
+                elif (sv_mode != "telemetry" and svbook.pos is None
+                      and pm.pos is None and not risk.halted
+                      and mapper is not None):
+                    _rungs = mapper.hierarchy(idx, spot, _svg.side)
+                    _spec, _why = SVOL.build_spread(
+                        idx, _svg.side, _step_sv,
+                        (mac or {}).get("call_wall") or 0,
+                        (mac or {}).get("put_wall") or 0, _rungs)
+                    if _spec is None:
+                        sv_gate_block[idx][_why[:40]] = (
+                            sv_gate_block[idx].get(_why[:40], 0) + 1)
+                        svbook.last_try[idx] = ts
+                    else:
+                        _r = svbook.try_open(
+                            ts=ts, hm=hm, spec=_spec,
+                            quotes=_sv_quotes(_spec),
+                            capital=config.TRADING_CAPITAL, mode=sv_mode)
+                        if "opened" in _r:
+                            log.warning(
+                                "Ⓥ SHORTVOL OPEN %s %s %g/%g credit ₹%.2f "
+                                "×%d (max loss ₹%.0f, pop~%.2f, ivr %.2f, "
+                                "gex %.1e) [%s]", idx, _svg.side,
+                                _spec.short_k, _spec.long_k, _r["credit"],
+                                _r["lots"], _r["max_loss"], _r["pop"],
+                                _svg.iv_rank or 0, _svg.net_gex or 0,
+                                sv_mode)
+                            _r["hm"] = hm
+                            report.d["shortvol"]["events"].append(_r)
+                        elif _r.get("skip") not in ("throttled",
+                                                    "book occupied"):
+                            _kk = str(_r.get("skip"))[:40]
+                            sv_gate_block[idx][_kk] = (
+                                sv_gate_block[idx].get(_kk, 0) + 1)
                 node = frame[i * config.NODES_PER_INDEX]
                 f30 = ((p945[idx] - open_px[idx]) / open_px[idx]
                        if idx in p945 and open_px.get(idx) else 0.0)
@@ -710,6 +1079,25 @@ def main():
                         log.info("%s", snap)
                 continue
 
+            # ---- v9.3: spread book management (~5 Hz) + index occupancy ----
+            if svbook.pos is not None and svbook.pos.spec.index == idx:
+                _crow = svbook.manage(
+                    ts=ts, hm=hm, spot=spot,
+                    quotes=_sv_quotes(svbook.pos.spec),
+                    cascade_event=sv_blocked_now.get(idx, False))
+                if _crow is not None:
+                    log.warning("Ⓥ SHORTVOL CLOSE %s %s → ₹%+.2f via %s "
+                                "(credit %.2f→%.2f, %ds) [%s]", idx,
+                                _crow["side"], _crow["pnl"], _crow["why"],
+                                _crow["credit"], _crow["close_cost"],
+                                _crow["hold_s"], _crow["mode"])
+                    report.d["shortvol"]["events"].append(_crow)
+                else:
+                    skip_reason[idx] = f"in spread {svbook.pos.spread_id}"
+                    if decide_now:
+                        funnel.record(idx, "in_position", "spread")
+                    continue                  # index occupied by the spread
+
             # ================= 1 Hz ENTRY PATH (gates → attempt) =============
             if not decide_now:
                 continue                       # decisions only on ring seconds
@@ -719,6 +1107,112 @@ def main():
                 skip_reason[idx] = f"risk halted ({risk.halt_reason or 'drawdown'})"
                 funnel.record(idx, "risk_halted")
                 continue
+            # ---- shared attempt tail: ladder → quotes → governor → fill ----
+            def _attempt(direction: str, conv_a: float, wp_a: float,
+                         gate_desc: str, tag: str) -> None:
+                if not mapper:
+                    funnel.record(idx, "no_chain", "no kite mapper")
+                    return
+                hier_rows = mapper.hierarchy(idx, spot, direction)
+                if not hier_rows:
+                    skip_reason[idx] = "no option chain"
+                    funnel.record(idx, "no_chain")
+                    return
+                quotes = qc.get([(r["exchange"], r["symbol"])
+                                 for r in hier_rows])
+                T = float(ctx_m.get("T", 0.01))
+                F = spot * math.exp(config.RISK_FREE_RATE * T)
+                hierarchy: list[LegQuote] = []
+                for r in hier_rows:
+                    q = quotes.get(r["symbol"])
+                    if not q:
+                        continue
+                    d = q.get("depth") or {}
+                    b0 = (d.get("buy") or [{}])[0]
+                    s0 = (d.get("sell") or [{}])[0]
+                    bid = float(b0.get("price") or 0)
+                    ask = float(s0.get("price") or 0)
+                    if not (bid and ask):
+                        continue
+                    mid = (bid + ask) / 2
+                    iv = builder.surface.atm_iv(idx, ctx_m.get("expiry", ""), T)
+                    g = black76_greeks(F, r["strike"], T, max(iv, 0.05),
+                                       direction == "CE",
+                                       config.RISK_FREE_RATE)
+                    hierarchy.append(LegQuote(
+                        leg=r["symbol"], symbol=r["symbol"],
+                        exchange=r["exchange"], token=r["token"],
+                        strike=r["strike"], premium=mid, bid=bid, ask=ask,
+                        bid_qty=float(b0.get("quantity") or 0),
+                        ask_qty=float(s0.get("quantity") or 0),
+                        lot=r["lot"], delta=float(g["delta"]),
+                        dte=float(ctx_m.get("dte", 1.0))))
+                if not hierarchy:
+                    skip_reason[idx] = "no two-sided quotes"
+                    funnel.record(idx, "no_quotes")
+                    return
+                # Seed ring_quotes with the exact freshly-fetched book the
+                # decision was priced from, so the paper engine fills against
+                # what the brain saw (live fills via Kite, not this dict).
+                for _lq in hierarchy:
+                    ring_quotes[_lq.token] = {
+                        "bid": _lq.bid, "ask": _lq.ask,
+                        "bid_qty": _lq.bid_qty, "ask_qty": _lq.ask_qty,
+                        "ltp": _lq.premium}
+                log.info("%s entry signal — gate: %s | P(win) %.2f | %s",
+                         idx, gate_desc, wp_a, tag)
+                pm.try_enter(tctx, direction, conv_a, wp_a, hierarchy)
+                if pm.pos:
+                    skip_reason[idx] = f"in {pm.pos.symbol}"
+                    funnel.record(idx, "entered", tag)
+                    if tag.startswith("CASCADE"):
+                        cascade_entered[idx] += 1
+                        report.d["cascade"]["events"][-1]["entered"] = \
+                            pm.pos.symbol
+                else:
+                    _blk = pm.last_block_reason or "no fill"
+                    skip_reason[idx] = _blk
+                    funnel.record(idx,
+                                  "risk_blocked" if pm.last_block_reason
+                                  else "no_fill", f"{tag}: {_blk}")
+                    if tag.startswith("CASCADE"):
+                        report.d["cascade"]["events"][-1]["skip"] = _blk
+
+            # ---- CASCADE ENTRY (certificate-gated): the structural trigger
+            # bypasses the meta gate, persistence and throttle BY DESIGN — the
+            # regime state replaces statistical persistence, and the meta was
+            # trained on a different (momentum) signal family. Everything
+            # downstream is untouched: the ladder, the spread gate, the FULL
+            # RiskGovernor (Kelly, floors, curfew, cooldown, halt), the same
+            # shaped barriers the harness certified. Direction from structure.
+            if cascade_ev is not None and casc_mode != "telemetry":
+                last_try[idx] = ts               # normal path stands down 5 s
+                # Tier-specific sizing prior: CERTIFIED uses the harness's
+                # LOWER-bound win rate; PAPER-EXPLORE (no cert yet) uses the
+                # same exploration prior the heuristic ledger was built with —
+                # its purpose is forward evidence, and this tier is hard-
+                # blocked from ever being live (cascade_mode ∧ four locks).
+                _wp_c = (CS.certificate_wp(cascade_cert)
+                         if casc_mode == "certified"
+                         else config.PAPER_EXPLORE_WINPROB)
+                _attempt(cascade_ev.direction,
+                         math.copysign(config.CASCADE_ENTRY_CONV,
+                                       1 if cascade_ev.direction == "CE"
+                                       else -1),
+                         _wp_c,
+                         f"cascade {cascade_ev.kind} z={cascade_ev.z:+.1f}",
+                         f"CASCADE-{casc_mode}-{cascade_ev.kind}")
+                if pm.pos is not None:           # forward-evidence join keys
+                    CS.log_forward_entry({
+                        "symbol": pm.pos.symbol, "entry_ts": pm.pos.entry_ts,
+                        "event_ts": cascade_ev.ts, "index": idx,
+                        "direction": cascade_ev.direction,
+                        "kind": cascade_ev.kind,
+                        "z": round(cascade_ev.z, 3), "mode": casc_mode,
+                        "flip": round(cascade_ev.flip, 1),
+                        "net_gex": cascade_ev.net_gex})
+                continue
+
             # DECISION GATE — model-driven when a trained meta-model exists,
             # else the fixed conviction bar (bootstrap). One shared copy in
             # core/decision.entry_gate — the forge grades with the same bytes.
@@ -742,67 +1236,9 @@ def main():
                 funnel.record(idx, "throttled")
                 continue                       # one attempt per 5 s per index
             last_try[idx] = ts
-            direction = "CE" if conv > 0 else "PE"
-            if not mapper:
-                funnel.record(idx, "no_chain", "no kite mapper")
-                continue
-            hier_rows = mapper.hierarchy(idx, spot, direction)
-            if not hier_rows:
-                skip_reason[idx] = "no option chain"
-                funnel.record(idx, "no_chain")
-                continue
-            quotes = qc.get([(r["exchange"], r["symbol"]) for r in hier_rows])
-            T = float(ctx_m.get("T", 0.01))
-            F = spot * math.exp(config.RISK_FREE_RATE * T)
-            hierarchy: list[LegQuote] = []
-            for r in hier_rows:
-                q = quotes.get(r["symbol"])
-                if not q:
-                    continue
-                d = q.get("depth") or {}
-                b0 = (d.get("buy") or [{}])[0]
-                s0 = (d.get("sell") or [{}])[0]
-                bid, ask = float(b0.get("price") or 0), float(s0.get("price") or 0)
-                if not (bid and ask):
-                    continue
-                mid = (bid + ask) / 2
-                iv = builder.surface.atm_iv(idx, ctx_m.get("expiry", ""), T)
-                g = black76_greeks(F, r["strike"], T, max(iv, 0.05),
-                                   direction == "CE", config.RISK_FREE_RATE)
-                hierarchy.append(LegQuote(
-                    leg=r["symbol"], symbol=r["symbol"], exchange=r["exchange"],
-                    token=r["token"], strike=r["strike"], premium=mid,
-                    bid=bid, ask=ask,
-                    bid_qty=float(b0.get("quantity") or 0),
-                    ask_qty=float(s0.get("quantity") or 0),
-                    lot=r["lot"], delta=float(g["delta"]),
-                    dte=float(ctx_m.get("dte", 1.0))))
-            if not hierarchy:
-                skip_reason[idx] = "no two-sided quotes"
-                funnel.record(idx, "no_quotes")
-            if hierarchy:
-                # Seed ring_quotes with the exact freshly-fetched book the
-                # decision was priced from, so the paper engine fills against
-                # what the brain saw (live fills via Kite, not this dict).
-                for _lq in hierarchy:
-                    ring_quotes[_lq.token] = {
-                        "bid": _lq.bid, "ask": _lq.ask,
-                        "bid_qty": _lq.bid_qty, "ask_qty": _lq.ask_qty,
-                        "ltp": _lq.premium}
-                log.info("%s entry signal — gate: %s | P(win) %.2f | %s",
-                         idx, _gate, wp,
-                         "MODEL-DRIVEN" if gate.model_driven
-                         else "bootstrap (fixed bar)")
-                pm.try_enter(tctx, direction, conv, wp, hierarchy)
-                if pm.pos:
-                    skip_reason[idx] = f"in {pm.pos.symbol}"
-                    funnel.record(idx, "entered")
-                else:
-                    _blk = pm.last_block_reason or "no fill"
-                    skip_reason[idx] = _blk
-                    funnel.record(idx,
-                                  "risk_blocked" if pm.last_block_reason
-                                  else "no_fill", _blk)
+            _attempt("CE" if conv > 0 else "PE", conv, wp, _gate,
+                     "MODEL-DRIVEN" if gate.model_driven
+                     else "bootstrap (fixed bar)")
 
     # ---- session end: final diagnostics report ------------------------------
     _write_report(final=True)
