@@ -1000,7 +1000,12 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None,
         if a_["graded"] >= config.CF_MAX_PER_GATE:
             a_["capped"] += 1
             return
-        pnl_ = _shadow_trade(rep, s_, t_)
+        try:
+            pnl_ = _shadow_trade(rep, s_, t_)
+        except Exception as e_:                           # noqa: BLE001
+            log.warning("counterfactual shadow failed (%s): %s — telemetry "
+                        "degrades, the exam continues", gate_, e_)
+            return
         if pnl_ is None:
             return
         a_["graded"] += 1
@@ -1069,7 +1074,7 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None,
             if funnel:                       # the permit's own words (v9.1.1)
                 funnel.record(idx, "risk_blocked",
                               str(permit.reason)[:80] if permit else "blocked")
-            _cf("risk_blocked", {"idx": idx, **{k: s[k] for k in ("t", "ts", "conv", "wp", "direction", "spot", "mac", "hm")}, "dte": s["ctx"].get("dte", 9.0), "T": s["ctx"].get("T") or 0.01}, t)
+            _cf("risk_blocked", {"idx": idx, **{k: s[k] for k in ("t", "ts", "conv", "wp", "direction", "spot", "mac", "hm")}, "dte": s.get("dte") or (s.get("ctx") or {}).get("dte", 9.0), "T": s.get("T") or (s.get("ctx") or {}).get("T") or 0.01}, t)
             continue
         kk, lot, Kstrike = leg["_k"], leg["lot"], leg["_strike"]
         e = float(leg["price"])                           # ASK — live crosses ★
@@ -1114,7 +1119,7 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None,
     return float(total), {"trades": trades, "wins": wins}
 
 
-def evaluate(model, vec, con, day, meta, cal, funnel=None):
+def evaluate(model, vec, con, day, meta, cal, funnel=None, attribution=None):
     """SAC candidate on `day`, live-faithful (see _grade_day)."""
     def decide(obs, frame, iidx):
         o = vec.normalize_obs(obs[None]) if vec else obs[None]
@@ -1924,13 +1929,15 @@ def main():
     # ---- SAVE + FREE the candidate BEFORE walk-forward (memory fix part 2:
     # the candidate's tensors have no business coexisting with fold training;
     # the promotion gate below only needs its SCORE and the saved paths) ------
+    trained = model is not None          # survives the del below (v9.6.4)
     ver = time.strftime("v91_%Y%m%d_%H%M%S")
     mpath = config.MODEL_DIR / f"apex_sac_{ver}.zip"
     npath = config.MODEL_DIR / f"apex_norm_{ver}.pkl"
-    model.save(mpath); vec.save(str(npath))
-    del model, vec
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if trained:
+        model.save(mpath); vec.save(str(npath))
+        del model, vec                    # memory fix: free before WF folds
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ---- WALK-FORWARD (bootstrap path both policies; promotion day excluded).
     # Each fold trains a FRESH candidate only on strictly-earlier days, inner-
@@ -1946,7 +1953,7 @@ def main():
         return (f"{_meta_samples_stamp()}:"
                 f"{_h.sha1(repr(train_days).encode()).hexdigest()[:8]}")
 
-    if model is not None:
+    if trained:
         wf_rows = []
         wf_funnel = D.GateFunnel(config.TRADABLE)
         wf_hits = wf_new = 0
@@ -2001,10 +2008,11 @@ def main():
         # pre-registry forge_history era is back-filled once, idempotently.
         TR.ensure_forge_backfill()
     else:
-        wf_rows, sac_wf = [], []
-    if model is not None:
+        wf_rows, sac_wf, heur_wf = [], [], []
+    if trained:
         TR.register("forge", ver, "candidate", day=final_day)
 
+    hist_path = config.MODEL_DIR / "forge_history.jsonl"
     trials = TR.trials_for_deflation("forge")
     dsr, psr = _deflated_psr(sac_wf, trials) if len(sac_wf) >= 3 else (None, None)
     if psr:

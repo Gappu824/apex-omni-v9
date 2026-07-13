@@ -355,7 +355,8 @@ def _term_probe(kite, index: str, spot: float, rows, exps, d):
             and abs(r["strike"] - spot) <= bandw + 1e-6]
     if len(band) < 4:
         return
-    keys = [f'{r["exchange"]}:{r["symbol"]}' for r in band]
+    exch = config.INDICES[index]["exchange"]
+    keys = [f'{exch}:{r["symbol"]}' for r in band]
     try:
         quotes = kite.quote(keys[:config.MACRO_QUOTE_CHUNK])
     except Exception:                                 # noqa: BLE001
@@ -367,7 +368,7 @@ def _term_probe(kite, index: str, spot: float, rows, exps, d):
     F2 = spot * math.exp(config.RISK_FREE_RATE * T2)
     Ks, ivs = [], []
     for r in band:
-        q = quotes.get(f'{r["exchange"]}:{r["symbol"]}') or {}
+        q = quotes.get(f'{exch}:{r["symbol"]}') or {}
         dq = q.get("depth") or {}
         b0 = (dq.get("buy") or [{}])[0].get("price") or 0
         s0 = (dq.get("sell") or [{}])[0].get("price") or 0
@@ -375,7 +376,7 @@ def _term_probe(kite, index: str, spot: float, rows, exps, d):
             else float(q.get("last_price") or 0)
         if mid <= 0:
             continue
-        is_call = r["symbol"].endswith("CE")
+        is_call = r.get("itype", r["symbol"][-2:]) == "CE"
         if (is_call and r["strike"] < spot) or \
            (not is_call and r["strike"] > spot):
             continue                                  # OTM side only
@@ -417,7 +418,8 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put,
     lot = band[0]["lot"]
     dte = max((exp - dt.date.today()).days, 0) + config.DTE_PART_DAY
 
-    keys = [f'{r["exchange"]}:{r["symbol"]}' for r in band]
+    exch = config.INDICES[index]["exchange"]
+    keys = [f'{exch}:{r["symbol"]}' for r in band]
     quotes = {}
     for i in range(0, len(keys), config.MACRO_QUOTE_CHUNK):
         quotes.update(kite.quote(keys[i:i + config.MACRO_QUOTE_CHUNK]))

@@ -416,12 +416,12 @@ def main():
             if svbook.pos is not None:
                 _sp, _sc = svbook.pos, svbook.pos.spec
                 for _sym, _K, _q in (
-                        (_sc.short_symbol, _sc.short_strike,
+                        (_sc.short_symbol, _sc.short_k,
                          -_sp.lots * _sc.lot),
-                        (_sc.long_symbol, _sc.long_strike,
+                        (_sc.long_symbol, _sc.long_k,
                          _sp.lots * _sc.lot)):
                     _legs.append({"index": _sc.index, "strike": _K,
-                                  "is_call": _sc.direction == "CE",
+                                  "is_call": _sc.side == "CE",
                                   "qty": _q, "mid": None})
                     _lm.append((f"{_sc.exchange}:{_sym}", len(_legs) - 1))
             if _lm:
