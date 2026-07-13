@@ -75,6 +75,7 @@ from core.diagnostics import DailyReport, Reservoir
 from core.gamma_nowcast import GammaNowcast
 from core import cascade as CS
 from core import shortvol as SVOL
+from core import butterfly as BFLY
 from core.dealer_flow import DealerFlow
 from core import rv_forecaster as RVF
 from core import book as BOOK
@@ -338,7 +339,10 @@ def main():
     # live spread ROUTING stays unbuilt until a certificate justifies it.
     sv_cert = SVOL.load_certificate()
     sv_mode = SVOL.shortvol_mode(sv_cert)
-    svbook = SVOL.SpreadBook(risk=risk, kite=kite)
+    # v9.7: shortvol's SIGNAL (evaluate_gate) still fires; the traded
+    # INSTRUMENT is now the buy-only long butterfly. FlyBook mirrors
+    # SpreadBook's surface (try_open/manage/mark/pos/closed_today).
+    flybook = BFLY.FlyBook(risk=risk)
     sv_gate_block: dict[str, dict] = {i: {} for i in config.TRADABLE}
     sv_blocked_now: dict[str, bool] = {i: False for i in config.TRADABLE}
     report.d.setdefault("shortvol", {}).setdefault("events", [])
@@ -390,6 +394,22 @@ def main():
                          "ask": float(s0.get("price") or 0)}
         return out
 
+    def _fly_quotes(spec):
+        """Fresh three-leg book via the throttled QuoteCache (≈1 Hz)."""
+        qq = qc.get([(spec.exchange, spec.wing_in_symbol),
+                     (spec.exchange, spec.body_symbol),
+                     (spec.exchange, spec.wing_out_symbol)])
+        out = {}
+        for tokn, sym in ((spec.wing_in_token, spec.wing_in_symbol),
+                          (spec.body_token, spec.body_symbol),
+                          (spec.wing_out_token, spec.wing_out_symbol)):
+            d = (qq.get(sym) or {}).get("depth") or {}
+            b0 = (d.get("buy") or [{}])[0]
+            s0 = (d.get("sell") or [{}])[0]
+            out[tokn] = {"bid": float(b0.get("price") or 0),
+                         "ask": float(s0.get("price") or 0)}
+        return out
+
     def _write_report(final: bool = False):
         report.d["mode"] = ("LIVE" if config.live_fire_armed() else
                             ("paper-explore" if config.PAPER_EXPLORE else "paper"))
@@ -413,12 +433,14 @@ def main():
                                   "qty": _p.pos.qty, "mid": None})
                     _lm.append((f"{_p.pos.exchange}:{_p.pos.symbol}",
                                 len(_legs) - 1))
-            if svbook.pos is not None:
-                _sp, _sc = svbook.pos, svbook.pos.spec
+            if flybook.pos is not None:
+                _sp, _sc = flybook.pos, flybook.pos.spec
                 for _sym, _K, _q in (
-                        (_sc.short_symbol, _sc.short_k,
-                         -_sp.lots * _sc.lot),
-                        (_sc.long_symbol, _sc.long_k,
+                        (_sc.wing_in_symbol, _sc.wing_in_k,
+                         _sp.lots * _sc.lot),
+                        (_sc.body_symbol, _sc.body_k,
+                         -2 * _sp.lots * _sc.lot),
+                        (_sc.wing_out_symbol, _sc.wing_out_k,
                          _sp.lots * _sc.lot)):
                     _legs.append({"index": _sc.index, "strike": _K,
                                   "is_call": _sc.side == "CE",
@@ -455,17 +477,22 @@ def main():
                 if (_v := last_dflow.get(i)) is not None else None)
             for i in config.TRADABLE}
         report.d["rv"] = dict(last_rv)
+        report.d["shortvol"]["open_mark"] = (
+            flybook.mark(ts=ts,
+                         spot=last_spot.get(flybook.pos.spec.index, 0.0),
+                         quotes=_fly_quotes(flybook.pos.spec))
+            if flybook.pos is not None else None)
         report.d["shortvol"]["mode"] = sv_mode
         report.d["shortvol"]["gate_blockers"] = {
             i: dict(sorted(b.items(), key=lambda kv: -kv[1])[:6])
             for i, b in sv_gate_block.items()}
-        report.d["shortvol"]["closed_today"] = svbook.closed_today
-        report.d["shortvol"]["open"] = (None if svbook.pos is None else {
-            "id": svbook.pos.spread_id, "index": svbook.pos.spec.index,
-            "side": svbook.pos.spec.side,
-            "credit": round(svbook.pos.credit, 2), "lots": svbook.pos.lots,
-            "max_loss": round(svbook.pos.max_loss, 2),
-            "opened": svbook.pos.open_hm})
+        report.d["shortvol"]["closed_today"] = flybook.closed_today
+        report.d["shortvol"]["open"] = (None if flybook.pos is None else {
+            "id": flybook.pos.fly_id, "index": flybook.pos.spec.index,
+            "side": flybook.pos.spec.side,
+            "debit": round(flybook.pos.debit, 2), "lots": flybook.pos.lots,
+            "max_loss": round(flybook.pos.max_loss, 2),
+            "opened": flybook.pos.open_hm})
         report.d["cascade"]["fired"] = dict(cascade_fired)
         report.d["cascade"]["entered"] = dict(cascade_entered)
         report.d["cascade"]["flip_now"] = {
@@ -524,11 +551,11 @@ def main():
         risk.on_tick()
         hm = dt.datetime.now().strftime("%H:%M")
         if hm >= config.SESSION_CLOSE:
-            if svbook.pos is not None:
-                _cr = svbook.manage(ts=ts, hm=hm,
+            if flybook.pos is not None:
+                _cr = flybook.manage(ts=ts, hm=hm,
                                     spot=last_spot.get(
-                                        svbook.pos.spec.index, 0.0),
-                                    quotes=_sv_quotes(svbook.pos.spec),
+                                        flybook.pos.spec.index, 0.0),
+                                    quotes=_fly_quotes(flybook.pos.spec),
                                     cascade_event=True)
                 if _cr is not None:
                     log.warning("Ⓥ SHORTVOL session-close flat → ₹%+.2f",
@@ -553,10 +580,10 @@ def main():
             for idx in config.TRADABLE:
                 funnel.record(idx, "stale_feed")
             if age > config.DATA_STALE_FLATTEN_S:
-                if svbook.pos is not None:
-                    _cr = svbook.manage(
+                if flybook.pos is not None:
+                    _cr = flybook.manage(
                         ts=ts, hm=hm,
-                        spot=last_spot.get(svbook.pos.spec.index, 0.0),
+                        spot=last_spot.get(flybook.pos.spec.index, 0.0),
                         quotes={}, cascade_event=True)
                     if _cr is not None:
                         log.warning("Ⓥ SHORTVOL stale-feed flat → ₹%+.2f "
@@ -609,7 +636,18 @@ def main():
             elif drift_grade == "WATCH":
                 log.info("drift WATCH: %d features moderately shifted — "
                          "tape is moving, still trading", d.get("moderate"))
-            poss = {i: (pms[i].pos.symbol if pms[i].pos else "—")
+            # v9.6.5: mark the open spread ONCE per heartbeat, BEFORE any
+            # consumer (pos field, PnL, Ⓥ line). Side-effect-free; reuses the
+            # same leg quotes manage() reads this tick, so no extra API load.
+            _fly_mark = (flybook.mark(
+                ts=ts, spot=last_spot.get(flybook.pos.spec.index, 0.0),
+                quotes=_fly_quotes(flybook.pos.spec))
+                if flybook.pos is not None else None)
+            poss = {i: (pms[i].pos.symbol if pms[i].pos else
+                        (f"FLY {_fly_mark['body_k']:.0f} "
+                         f"±{_fly_mark['body_k'] - _fly_mark['wing_in_k']:.0f}"
+                         f" {_fly_mark['unreal']:+.0f}"
+                         if _fly_mark and _fly_mark["index"] == i else "—"))
                     for i in config.TRADABLE}
             _reg = regime_now.get(config.TRADABLE[0])
             _reg_s = f"{_reg.label}×{_reg.conv_mult:.2f}" if _reg else "—"
@@ -638,13 +676,16 @@ def main():
             casc_mode = CS.cascade_mode(cascade_cert)
             sv_cert = SVOL.load_certificate()
             sv_mode = SVOL.shortvol_mode(sv_cert)
-            _svtok = ((f"{svbook.pos.spec.index}·open" if svbook.pos
-                       else f"{svbook.closed_today}c") + f" {sv_mode}")
+            _svtok = ((f"{flybook.pos.spec.index}·fly" if flybook.pos
+                       else f"{flybook.closed_today}c") + f" {sv_mode}")
             log.info("♥ %s | feed age %.1fs | PnL ₹%+.0f | deployed ₹%.0f | "
                      "halted=%s | pos %s | conv %s | policy %s | VIX %s | "
                      "regime %s | walkaway %s | cascade %s | sv %s | drift %s | "
                      "no-trade: %s",
-                     hm, age, risk.realized_pnl, risk.deployed,
+                     hm, age,
+                     risk.realized_pnl + (_fly_mark["unreal"]
+                                          if _fly_mark else 0.0),
+                     risk.deployed,
                      risk.halted or risk.halt_reason or False, poss, convs,
                      policy.kind,
                      f"{vix_hist[-1][1]:.2f}" if vix_hist else "—",
@@ -693,6 +734,20 @@ def main():
                          + df_s + rv_s + bk_s
                 log.info("  levels %-6s | spot %.0f  %s  %s  %s | %s",
                          i, sp, pdc_s, pdh_s, pdl_s, wall_s)
+            if _fly_mark is not None:
+                _tt = "live" if _fly_mark["live_quote"] else "stale-mark"
+                log.info("  Ⓕ %-6s %s | BUY %s + BUY %s + SELL 2× %s | "
+                         "debit ₹%.2f → credit ₹%.2f | unreal ₹%+.0f | "
+                         "target %+.0f%% floor %+.0f%% | pin dist %g | pop "
+                         "%.2f | held %ds | %s [%s]",
+                         _fly_mark["index"], _fly_mark["fly_id"],
+                         _fly_mark["wing_in_symbol"],
+                         _fly_mark["wing_out_symbol"], _fly_mark["body_symbol"],
+                         _fly_mark["debit"], _fly_mark["close_credit"],
+                         _fly_mark["unreal"], _fly_mark["to_target_pct"],
+                         _fly_mark["to_floor_pct"], _fly_mark["dist_from_body"],
+                         _fly_mark["pop"], _fly_mark["held_s"], _tt,
+                         _fly_mark["mode"])
 
         # refresh ring-backed quotes for the paper engine + surfaces from macro
         ring_quotes.clear()
@@ -895,32 +950,34 @@ def main():
                     _k = _svg.reason[:40]
                     if _k in _bk or len(_bk) < 12:
                         _bk[_k] = _bk.get(_k, 0) + 1
-                elif (sv_mode != "telemetry" and svbook.pos is None
+                elif (sv_mode != "telemetry" and flybook.pos is None
                       and pm.pos is None and not risk.halted
                       and mapper is not None):
                     _rungs = mapper.hierarchy(idx, spot, _svg.side)
-                    _spec, _why = SVOL.build_spread(
+                    _spec, _why = BFLY.build_fly(
                         idx, _svg.side, _step_sv,
                         (mac or {}).get("call_wall") or 0,
                         (mac or {}).get("put_wall") or 0, _rungs)
                     if _spec is None:
                         sv_gate_block[idx][_why[:40]] = (
                             sv_gate_block[idx].get(_why[:40], 0) + 1)
-                        svbook.last_try[idx] = ts
+                        flybook.last_try[idx] = ts
                     else:
-                        _r = svbook.try_open(
+                        _r = flybook.try_open(
                             ts=ts, hm=hm, spec=_spec,
-                            quotes=_sv_quotes(_spec),
+                            quotes=_fly_quotes(_spec),
                             capital=config.TRADING_CAPITAL, mode=sv_mode)
                         if "opened" in _r:
                             log.warning(
-                                "Ⓥ SHORTVOL OPEN %s %s %g/%g credit ₹%.2f "
-                                "×%d (max loss ₹%.0f, pop~%.2f, ivr %.2f, "
-                                "gex %.1e) [%s]", idx, _svg.side,
-                                _spec.short_k, _spec.long_k, _r["credit"],
+                                "Ⓕ BUTTERFLY OPEN %s %s body %g wings ±%g "
+                                "debit ₹%.2f ×%d (max loss ₹%.0f = debit paid,"
+                                " pop~%.2f, ivr %.2f, gex %.1e) [%s] | BUY %s "
+                                "+ BUY %s + SELL 2× %s", idx, _svg.side,
+                                _spec.body_k, _spec.wing_width, _r["debit"],
                                 _r["lots"], _r["max_loss"], _r["pop"],
-                                _svg.iv_rank or 0, _svg.net_gex or 0,
-                                sv_mode)
+                                _svg.iv_rank or 0, _svg.net_gex or 0, sv_mode,
+                                _spec.wing_in_symbol, _spec.wing_out_symbol,
+                                _spec.body_symbol)
                             _r["hm"] = hm
                             report.d["shortvol"]["events"].append(_r)
                         elif _r.get("skip") not in ("throttled",
@@ -1080,10 +1137,10 @@ def main():
                 continue
 
             # ---- v9.3: spread book management (~5 Hz) + index occupancy ----
-            if svbook.pos is not None and svbook.pos.spec.index == idx:
-                _crow = svbook.manage(
+            if flybook.pos is not None and flybook.pos.spec.index == idx:
+                _crow = flybook.manage(
                     ts=ts, hm=hm, spot=spot,
-                    quotes=_sv_quotes(svbook.pos.spec),
+                    quotes=_fly_quotes(flybook.pos.spec),
                     cascade_event=sv_blocked_now.get(idx, False))
                 if _crow is not None:
                     log.warning("Ⓥ SHORTVOL CLOSE %s %s → ₹%+.2f via %s "
@@ -1093,7 +1150,7 @@ def main():
                                 _crow["hold_s"], _crow["mode"])
                     report.d["shortvol"]["events"].append(_crow)
                 else:
-                    skip_reason[idx] = f"in spread {svbook.pos.spread_id}"
+                    skip_reason[idx] = f"in fly {flybook.pos.fly_id}"
                     if decide_now:
                         funnel.record(idx, "in_position", "spread")
                     continue                  # index occupied by the spread

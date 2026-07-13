@@ -169,7 +169,7 @@ def uncalibrated_winprob() -> float:
 # additionally syncs against kite.margins() and always uses the SMALLER of
 # (this number, broker available cash) — the bot may never believe it has
 # more money than the broker says.
-TRADING_CAPITAL = 5000.0           # ₹ — LIVE knob only (v9.1.1): the forge,
+TRADING_CAPITAL = 60000.0           # ₹ — LIVE knob only (v9.1.1): the forge,
 #                                    meta, drift and every cache are sized off
 #                                    FORGE_EVAL_CAPITAL below; change this any
 #                                    time, nothing re-forges or invalidates.
@@ -786,6 +786,12 @@ SV_DTE_MAX              = 9.0
 SV_AFTER_HM             = "10:00" # let the open's gamma flush settle
 SV_WIDTH_STEPS          = 1       # long leg = wall ± 1 step (tightest hedge)
 SV_MIN_CREDIT_FRAC      = 0.15    # reject if credit < this × width (junk premium)
+# --- v9.7 LONG BUTTERFLY (buy-only VRP expression; same gate as shortvol) ---
+SV_FLY_WING_STEPS       = 2       # wings this many strike-steps from the body
+SV_FLY_MIN_DEBIT_FRAC   = 0.05    # reject fly if debit < this × wing width
+SV_FLY_MAX_DEBIT_FRAC   = 0.70    # reject if debit > this × width (no room)
+SV_FLY_TP_FRAC          = 0.50    # take profit at this frac of debit→maxvalue
+SV_FLY_SL_FRAC          = 0.50    # stop if unwind credit ≤ debit×(1−this)
 SV_TP_FRAC              = 0.50    # take profit at 50% of credit captured
 SV_SL_CREDIT_MULT       = 1.00    # stop when loss ≥ 1× credit (2× credit to close)
 SV_TOUCH_EXIT           = True    # urgent close if spot touches the short strike
@@ -918,6 +924,8 @@ _HASH_EXCLUDE = frozenset({
     "SV_NET_GEX_MIN", "SV_WALL_BUFFER_STEPS", "SV_CORRIDOR_MIN_STEPS",
     "SV_DTE_MIN", "SV_DTE_MAX", "SV_AFTER_HM", "SV_WIDTH_STEPS",
     "SV_MIN_CREDIT_FRAC", "SV_TP_FRAC", "SV_SL_CREDIT_MULT", "SV_TOUCH_EXIT",
+    "SV_FLY_WING_STEPS", "SV_FLY_MIN_DEBIT_FRAC", "SV_FLY_MAX_DEBIT_FRAC",
+    "SV_FLY_TP_FRAC", "SV_FLY_SL_FRAC",
     "SV_CLOSE_HM", "SV_ATTEMPT_THROTTLE_S", "SV_POP_HAIRCUT", "SV_RISK_PCT",
     "CF_NEAR_MISS", "CF_MAX_PER_GATE",
     "LC_WINDOW", "LC_MIN_EVENTS", "MACRO_TERM_STRUCTURE", "TERM_BAND_STEPS",

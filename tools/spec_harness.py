@@ -49,6 +49,7 @@ from core import vol_surface as VS                       # noqa: E402
 from core.diagnostics import _atomic_write_json          # noqa: E402
 import tools.cascade_harness as CH                       # noqa: E402
 import tools.shortvol_harness as SH                      # noqa: E402
+import tools.butterfly_harness as BH                     # noqa: E402
 from nightly_forge_v9 import trading_days, spot_token_for  # noqa: E402
 
 import logging                                           # noqa: E402
@@ -57,8 +58,9 @@ log = logging.getLogger("spec_harness")
 
 def load_spec(path: str) -> dict:
     sp = json.loads(Path(path).read_text())
-    assert sp.get("id") and sp.get("base") in ("cascade", "shortvol"), \
-        "spec needs id + base ∈ {cascade, shortvol}"
+    assert sp.get("id") and sp.get("base") in (
+        "cascade", "shortvol", "butterfly"), \
+        "spec needs id + base ∈ {cascade, shortvol, butterfly}"
     for k in sp.get("knobs", {}):
         assert hasattr(config, k), f"unknown knob {k}"
         assert k in getattr(config, "_HASH_EXCLUDE", set()) or True
@@ -174,20 +176,32 @@ def main():
             skips = [r for r in rows if "pnl" not in r]
             cert = CH._assemble_certificate(bt, [], skips, len(days),
                                             [days[0], days[-1]], upside, 0)
-        else:
+        elif spec["base"] == "shortvol":
             bt, skips, blockers = [], [], {}
             for day in days:
-                c, s, b = SH._run_day(con, day, N, verbose=False,
-                                      extra_gate=extra)
+                c, sk, b = SH._run_day(con, day, N, verbose=False,
+                                       extra_gate=extra)
                 bt += c
-                skips += s
+                skips += sk
                 for k, v in b.items():
                     blockers[k] = blockers.get(k, 0) + v
             for r in bt:
                 r["source"] = "backtest"
             cert = SH._assemble_certificate(bt, [], skips, blockers,
-                                            len(days), [days[0], days[-1]],
-                                            0)
+                                            len(days), [days[0], days[-1]], 0)
+        else:                                     # base == "butterfly"
+            bt, skips, blockers = [], [], {}
+            for day in days:
+                c, sk, b = BH._run_day(con, day, N, verbose=False,
+                                       extra_gate=extra)
+                bt += c
+                skips += sk
+                for k, v in b.items():
+                    blockers[k] = blockers.get(k, 0) + v
+            for r in bt:
+                r["source"] = "backtest"
+            cert = BH._assemble_certificate(bt, [], skips, blockers,
+                                            len(days), [days[0], days[-1]], 0)
     cert["spec_id"] = sid
     cert["spec"] = {k: spec.get(k) for k in
                     ("base", "knobs", "detector", "extra", "note")}

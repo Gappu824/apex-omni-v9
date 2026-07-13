@@ -398,6 +398,50 @@ class SpreadBook:
                 "lots": lots, "max_loss": round(sp.max_loss, 2),
                 "pop": round(sp.pop, 2)}
 
+    # ---------------- mark (telemetry only; NO side effects) ----------
+    def mark(self, *, ts: float, spot: float, quotes: dict) -> dict | None:
+        """Live vitals of the open spread WITHOUT touching it — the exact
+        parity of PositionManager.status(): mark-to-market unrealized P&L,
+        live close cost, distance to the TARGET and STOP thresholds manage()
+        enforces, pop, and hold time. Uses the same leg quotes manage() reads
+        this same tick, so it adds no API load. Returns None when flat."""
+        sp = self.pos
+        if sp is None:
+            return None
+        sq = quotes.get(sp.spec.short_token) or {}
+        lq = quotes.get(sp.spec.long_token) or {}
+        sa, lb = float(sq.get("ask") or 0), float(lq.get("bid") or 0)
+        if sa > 0 and lb > 0:
+            cc = close_cost(sa, lb)
+            live = True
+        else:                                   # dead book: intrinsic-worst
+            cc = sp.credit * (1.0 + config.SV_SL_CREDIT_MULT)
+            live = False
+        unreal = spread_pnl(sp.credit, cc, sp.spec.lot, sp.lots,
+                            sp.open_short_bid, sp.open_long_ask,
+                            sa if live else sp.open_short_bid + sp.spec.width,
+                            lb if live else max(sp.open_long_ask
+                                                - sp.spec.width, 0.05))
+        tgt_cc = sp.credit * (1.0 - config.SV_TP_FRAC)   # close cost at TARGET
+        stp_cc = sp.credit * (1.0 + config.SV_SL_CREDIT_MULT)  # …at STOP
+        # % of the credit→target and credit→stop journey the mark has traveled
+        to_target = ((sp.credit - cc) / max(sp.credit - tgt_cc, 1e-9)) * 100
+        to_stop = ((cc - sp.credit) / max(stp_cc - sp.credit, 1e-9)) * 100
+        touch = ((sp.spec.side == "CE" and spot >= sp.spec.short_k)
+                 or (sp.spec.side == "PE" and spot <= sp.spec.short_k))
+        return {"spread_id": sp.spread_id, "index": sp.spec.index,
+                "side": sp.spec.side, "short_k": sp.spec.short_k,
+                "long_k": sp.spec.long_k,
+                "short_symbol": sp.spec.short_symbol,
+                "long_symbol": sp.spec.long_symbol,
+                "credit": round(sp.credit, 2),
+                "close_cost": round(cc, 2), "unreal": round(unreal, 2),
+                "lots": sp.lots, "pop": round(sp.pop, 2),
+                "to_target_pct": round(to_target, 0),
+                "to_stop_pct": round(to_stop, 0),
+                "held_s": int(ts - sp.open_ts), "live_quote": live,
+                "touch": touch, "mode": sp.mode, "max_loss": sp.max_loss}
+
     # ---------------- manage / close
     def manage(self, *, ts: float, hm: str, spot: float, quotes: dict,
                cascade_event: bool) -> dict | None:
