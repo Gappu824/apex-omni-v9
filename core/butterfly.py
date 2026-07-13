@@ -52,6 +52,23 @@ from core.execution_engine import round_trip_costs
 from core.shortvol import log_forward         # reuse the shared forward log
 
 
+import hashlib as _hashlib
+
+
+def fly_knob_hash() -> str:
+    """Stable hash of the butterfly's certifiable knobs — the cert locks to
+    this, fails closed if any structural parameter changes (Bailey–LdP: a new
+    knob set is a new hypothesis and must re-earn its certificate)."""
+    payload = "|".join(str(x) for x in (
+        config.SV_FLY_WING_STEPS, config.SV_FLY_MIN_DEBIT_FRAC,
+        config.SV_FLY_MAX_DEBIT_FRAC, config.SV_FLY_TP_FRAC,
+        config.SV_FLY_SL_FRAC, config.SV_IVRANK_MIN,
+        config.SV_NET_GEX_MIN, config.SV_CORRIDOR_MIN_STEPS,
+        config.SV_WALL_BUFFER_STEPS, config.SV_DTE_MIN, config.SV_DTE_MAX,
+        config.SV_RISK_PCT))
+    return _hashlib.sha1(payload.encode()).hexdigest()[:10]
+
+
 # ============================================================ pricing (pure)
 def price_fly(*, wing_in: dict, body: dict, wing_out: dict,
               wing_width: float) -> tuple[float | None, str]:

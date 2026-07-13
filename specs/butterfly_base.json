@@ -1,0 +1,6 @@
+{
+ "id": "butterfly_base",
+ "base": "butterfly",
+ "knobs": {},
+ "note": "Reproduction/certification of the base long-fly on the shared VRP gate. Certified by tools/butterfly_harness.py (buy-only, risk=debit)."
+}

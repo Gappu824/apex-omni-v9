@@ -1,0 +1,8 @@
+{
+ "id": "butterfly_wide",
+ "base": "butterfly",
+ "knobs": {
+  "SV_FLY_WING_STEPS": 3
+ },
+ "note": "REGISTERED TRIAL: wider wings (3 steps) \u2014 more room to the body, larger debit, higher max-value if pinned. Wider profit tent vs higher cost."
+}

@@ -1,0 +1,8 @@
+{
+ "id": "butterfly_tight_tp",
+ "base": "butterfly",
+ "knobs": {
+  "SV_FLY_TP_FRAC": 0.35
+ },
+ "note": "REGISTERED TRIAL: take profit earlier (35% of debit\u2192max-value) \u2014 harvest the fly before pin decays, higher hit-rate/lower avg win."
+}
