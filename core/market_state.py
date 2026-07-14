@@ -268,7 +268,14 @@ class StateBuilder:
         return np.stack(self.frames).reshape(-1).astype(np.float32)  # 5700
 
     def fit_surface(self, index, expiry, strikes, ivs, F, T):
-        """Feed REAL Newton IVs in; store total variance per (index, expiry)."""
-        k = np.log(np.asarray(strikes, float) / max(F, 1e-6))
-        w = np.square(np.asarray(ivs, float)) * max(T, 1e-6)
+        """Feed REAL Newton IVs in; store total variance per (index, expiry).
+        Also stash the ATM Newton IV (nearest strike to F) as the unfit-surface
+        fallback, so the obs vector and forge never read the DEFAULT curve
+        before the SVI slice is fit."""
+        strikes = np.asarray(strikes, float); ivs = np.asarray(ivs, float)
+        k = np.log(strikes / max(F, 1e-6))
+        w = np.square(ivs) * max(T, 1e-6)
+        if strikes.size and ivs.size == strikes.size:
+            j = int(np.argmin(np.abs(strikes - F)))       # ATM strike
+            self.surface.set_fallback(index, expiry, float(ivs[j]), T)
         self.surface.fit(index, expiry, k, w)

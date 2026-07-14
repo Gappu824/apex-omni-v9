@@ -805,6 +805,7 @@ SV_RISK_PCT             = 5.0     # % of capital at risk per spread (max loss ×
 #                                   risk-neutral-p), so fractional risk is the
 #                                   literature-standard prespecification.
 SHORTVOL_CERT_PATH      = STATE_DIR / "shortvol_certificate.json"
+FLY_CERT_PATH           = STATE_DIR / "butterfly_certificate.json"
 SV_CERT_MIN_EVENTS      = 25      # cert bar: ≥ events …
 SV_CERT_MIN_DAYS        = 6       # … across ≥ event-days …
 SV_CERT_CI              = 0.90    # … bootstrap CI lower bound of ₹/event > 0

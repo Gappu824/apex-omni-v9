@@ -218,6 +218,17 @@ class QuoteCache:
         return {k.split(":", 1)[1]: v for k, v in fresh.items()}
 
 
+def _surface_atm_iv(builder, idx, expiry, T, mac):
+    """SVI ATM IV once the (idx,expiry) slice is really fit; the trusted macro
+    Newton ATM IV as fallback before that. The unfit DEFAULT surface curve is
+    a fixed total variance sane only near 30–45 d — for weeklies it explodes
+    (~138% at 2 d), which would poison leg-delta selection at the open."""
+    if builder.surface.has_fit(idx, expiry):
+        return builder.surface.atm_iv(idx, expiry, T)
+    nwt = (mac or {}).get("atm_iv")
+    return float(nwt) if nwt else builder.surface.atm_iv(idx, expiry, T)
+
+
 def main():
     config.setup_logging("brain")
     kite = None
@@ -1102,8 +1113,9 @@ def main():
             tctx = TickContext(
                 ts=ts, hm=hm, spot=spot, spot_velocity_1s=vel,
                 data_age_s=age,
-                atm_iv=builder.surface.atm_iv(idx, ctx_m.get("expiry", ""),
-                                              float(ctx_m.get("T", 0.01))),
+                atm_iv=_surface_atm_iv(builder, idx,
+                                       ctx_m.get("expiry", ""),
+                                       float(ctx_m.get("T", 0.01)), mac),
                 minutes_to_close=mins_left,
                 gex_put_wall=(mac or {}).get("put_wall"),
                 gex_call_wall=(mac or {}).get("call_wall"),
@@ -1192,7 +1204,8 @@ def main():
                     if not (bid and ask):
                         continue
                     mid = (bid + ask) / 2
-                    iv = builder.surface.atm_iv(idx, ctx_m.get("expiry", ""), T)
+                    iv = _surface_atm_iv(builder, idx,
+                                         ctx_m.get("expiry", ""), T, mac)
                     g = black76_greeks(F, r["strike"], T, max(iv, 0.05),
                                        direction == "CE",
                                        config.RISK_FREE_RATE)

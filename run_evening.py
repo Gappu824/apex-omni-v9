@@ -13,6 +13,7 @@ import sys
 import time
 
 SEQ = ["tools/cascade_harness.py", "tools/shortvol_harness.py",
+       "tools/butterfly_harness.py",
        "tools/rv_skill_report.py", "tools/rvnet_train.py",
        "tools/epistemic_health.py", "run_nightly.py"]
 

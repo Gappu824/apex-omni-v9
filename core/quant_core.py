@@ -91,6 +91,10 @@ class SVISurface:
 
     def __init__(self):
         self.params: dict[tuple, np.ndarray] = {}
+        # (index,expiry) → (atm_iv, T): the macro Newton ATM IV stashed by
+        # fit_surface so an UNFIT slice serves a sane flat IV at the point of
+        # use (obs vector, forge) instead of the T-inappropriate DEFAULT curve.
+        self.fallback: dict[tuple, tuple] = {}
 
     @staticmethod
     def _w(p, k):
@@ -106,33 +110,79 @@ class SVISurface:
              - 0.25 * dw * dw * (1.0 / w + 0.25) + 0.5 * d2w)
         return bool(np.all(g > -1e-6))
 
-    def fit(self, index, expiry, k, w_obs, steps=60, lr=0.05):
-        """Warm-started gradient fit (kept from v8 — it was a good idea) but
-        per-key, on REAL IV-derived variances, with a butterfly gate."""
+    def fit(self, index, expiry, k, w_obs):
+        """Deterministic RAW-SVI fit. For fixed (m,σ) the model is LINEAR in
+        (a, bρ, b) via features [1, x, √(x²+σ²)] → constrained lstsq on a
+        coarse (m,σ) grid, refined once around the winner. This is the SAME
+        proven method as vol_surface.fit_svi, promoted to the live path (the
+        v8 finite-difference gradient descent applied one learning rate across
+        five parameters of scale 1e-4…1 and was fragile). No lr, no
+        convergence risk, sub-ms at radar sizes; the Gatheral butterfly gate
+        still guards what is stored, so an arbitrageable slice is never served.
+        """
         k = np.asarray(k, float); w_obs = np.asarray(w_obs, float)
-        mask = np.isfinite(w_obs) & (w_obs > 0)
-        if mask.sum() < 3:
-            return self.params.get((index, expiry), self.DEFAULT.copy())
+        mask = np.isfinite(k) & np.isfinite(w_obs) & (w_obs > 0)
         k, w_obs = k[mask], w_obs[mask]
-        p = self.params.get((index, expiry), self.DEFAULT.copy()).astype(float)
-        for _ in range(steps):
-            eps = 1e-5; grad = np.zeros(5)
-            base = float(np.mean((self._w(p, k) - w_obs) ** 2))
-            for i in range(5):
-                q = p.copy(); q[i] += eps
-                grad[i] = (np.mean((self._w(q, k) - w_obs) ** 2) - base) / eps
-            p -= lr * grad
-            p[0] = max(p[0], 1e-6); p[1] = max(p[1], 1e-4)
-            p[2] = float(np.clip(p[2], -0.999, 0.999)); p[4] = max(p[4], 1e-3)
+        if k.size < 6:                    # too few strikes → keep incumbent
+            return self.params.get((index, expiry), self.DEFAULT.copy())
+        span = float(k.max() - k.min()) or 1e-2
+        best = None
+        m_grid = np.linspace(k.min(), k.max(), 7)
+        s_grid = np.geomspace(max(span / 20, 1e-3), max(span, 5e-3), 7)
+        for _ in range(2):
+            for m in m_grid:
+                for sg in s_grid:
+                    x = k - m
+                    f2 = np.sqrt(x * x + sg * sg)
+                    A = np.column_stack([np.ones_like(x), x, f2])
+                    coef, *_ = np.linalg.lstsq(A, w_obs, rcond=None)
+                    a, c1, b = float(coef[0]), float(coef[1]), float(coef[2])
+                    b = max(b, 1e-9)
+                    rho = float(np.clip(c1 / b, -0.999, 0.999))
+                    fitw = a + b * (rho * x + f2)
+                    sse = float(np.sum((fitw - w_obs) ** 2))
+                    if best is None or sse < best[0]:
+                        best = (sse, a, b, rho, float(m), float(sg))
+            _, a, b, rho, m0, s0 = best
+            m_grid = np.linspace(m0 - span / 6, m0 + span / 6, 5)
+            s_grid = np.geomspace(max(s0 / 2, 1e-4), s0 * 2, 5)
+        _, a, b, rho, m, sg = best
+        p = np.array([max(a, 1e-6), max(b, 1e-4), rho, m, max(sg, 1e-3)])
         if self._butterfly_ok(p, np.linspace(-0.15, 0.15, 41)):
             self.params[(index, expiry)] = p
         return self.params.get((index, expiry), self.DEFAULT.copy())
 
+    def has_fit(self, index, expiry) -> bool:
+        """True once a REAL (butterfly-passing) fit exists for this slice.
+        Before that, atm_iv/total_variance return the DEFAULT curve — a fixed
+        total variance sane only near 30–45 d (≈138% at 2 d) — so callers on
+        the live path override an unfit slice with the macro Newton ATM IV."""
+        return (index, expiry) in self.params
+
+    def set_fallback(self, index, expiry, atm_iv, T):
+        """Stash the macro Newton ATM IV (+ tenor) for this slice. Called by
+        fit_surface every sweep, so even a slice whose SVI fit fails or hasn't
+        happened yet serves this flat IV rather than the DEFAULT curve."""
+        if atm_iv and atm_iv > 0 and T and T > 0:
+            self.fallback[(index, expiry)] = (float(atm_iv), float(T))
+
     def total_variance(self, index, expiry, k):
-        return self._w(self.params.get((index, expiry), self.DEFAULT), np.asarray(k, float))
+        key = (index, expiry)
+        if key in self.params:
+            return self._w(self.params[key], np.asarray(k, float))
+        fb = self.fallback.get(key)
+        if fb is not None:                       # flat Newton smile at its T
+            iv0, t0 = fb
+            return np.full_like(np.asarray(k, float), iv0 * iv0 * t0)
+        return self._w(self.DEFAULT, np.asarray(k, float))
 
     def atm_iv(self, index, expiry, T_years):
-        """THE sigma. Annualized ATM implied vol — the one unit everyone uses."""
+        """THE sigma. Annualized ATM implied vol. An unfit slice with a stashed
+        Newton fallback returns it exactly; otherwise √(w/T) from the fit (or,
+        last resort, the DEFAULT curve)."""
+        key = (index, expiry)
+        if key not in self.params and key in self.fallback:
+            return self.fallback[key][0]
         w = float(self.total_variance(index, expiry, 0.0))
         return math.sqrt(max(w, 1e-8) / max(T_years, 1e-6))
 
