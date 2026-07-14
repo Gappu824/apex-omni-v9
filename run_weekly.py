@@ -17,7 +17,8 @@ steps = [["tools/stress_exam.py"]]
 steps += [["tools/spec_harness.py", "--spec", str(p)]
           for p in sorted(Path("specs").glob("*.json"))]
 steps += [["tools/execution_report.py"], ["-m", "core.graduation"],
-          ["tools/weekly_digest.py"]]
+          ["tools/leadlag_report.py"],
+         ["tools/weekly_digest.py"]]
 
 fails = 0
 for step in steps:

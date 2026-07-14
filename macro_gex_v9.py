@@ -42,6 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
+from core import flow_intel as FI
 import config
 from core.instruments import LiveMapper
 from core.quant_core import implied_vol_newton, black76_greeks
@@ -443,6 +444,27 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put,
         d["skip_thin_quotes"] = d.get("skip_thin_quotes", 0) + 1
         return
 
+    # ---- v9.9 FLOW INTEL: the sellers' footprint from the RAW band ----
+    try:
+        _step = float(config.INDICES[index]["strike_step"])
+        flow = FI.chain_flow(index, K, prem, oi, is_call, lot, spot, _step)
+    except Exception as _fe:                              # noqa: BLE001
+        d["flow_err"] = str(_fe)[:60]
+        flow = {}
+    # optional front-future basis (config.FUT_SYMBOLS, e.g. "NFO:NIFTY25JULFUT")
+    try:
+        _fsym = (getattr(config, "FUT_SYMBOLS", {}) or {}).get(index)
+        if _fsym:
+            _fq = (kite.quote([_fsym]) or {}).get(_fsym) or {}
+            _fd = _fq.get("depth") or {}
+            flow["basis"] = FI.futures_basis(
+                spot,
+                float((_fd.get("buy") or [{}])[0].get("price") or 0),
+                float((_fd.get("sell") or [{}])[0].get("price") or 0),
+                float(dte))
+    except Exception:                                     # noqa: BLE001
+        pass
+
     res = assemble_snapshot(
         ts=time.time(), index=index, spot=spot, exp=exp, dte=dte, K=K,
         mid=prem, oi=oi, is_call=is_call, lot=lot, s_call=s_call, s_put=s_put)
@@ -478,6 +500,7 @@ def compute_index(kite, mapper: LiveMapper, index: str, s_call, s_put,
     iv_rank = (float(np.mean([v <= atm_iv for v in past]))
                if len(past) >= config.IVRANK_MIN_DAYS else None)
     payload["iv_rank"] = iv_rank
+    payload["flow"] = flow
 
     # intraday ATM-IV sample for the vol-surface forecaster (daily history is
     # too coarse to forecast crush). Real recorded series, no fabrication.

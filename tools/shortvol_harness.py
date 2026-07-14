@@ -43,7 +43,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config                                            # noqa: E402
-from core import trial_registry as TR                   # noqa: E402
+from core import trial_registry as TR
+from core import stat_bootstrap as SB                   # noqa: E402
 from core import shortvol as SV                          # noqa: E402
 from core.cascade import CascadeDetector                 # noqa: E402
 from core.gamma_nowcast import GammaNowcast              # noqa: E402
@@ -312,6 +313,9 @@ def _assemble_certificate(bt, fw, skips, blockers, days_scanned,
             "mean_pnl": round(mean, 2),
             "sum_pnl": round(float(np.sum(pnls)), 2) if n else 0.0,
             "ci_lo": round(ci_lo, 2) if ci_lo is not None else None,
+            "stationary_ci_lo": (round(SB.stat_boot_lo(
+                pnls, config.SV_CERT_CI, config.EDGE_BOOTSTRAP_N), 2)
+                if len(pnls) >= 5 else None),
             "ci_level": config.SV_CERT_CI,
             "win_rate": round(wins / n, 4) if n else 0.0,
             "win_rate_lo": round(_wilson_lo(wins, n, config.SV_CERT_CI), 4),

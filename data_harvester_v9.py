@@ -200,6 +200,12 @@ class Harvester:
         self.subscribed: set[int] = set()
         self.chains: dict[str, dict] = {}
         self._resolve_spot_tokens()
+        if int(getattr(config, "VIX_TOKEN", 0)):
+            # v10: archive INDIA VIX like any spot — the brain already
+            # consumes it live; this puts it in the VAULT so harnesses can
+            # apply the spike veto HISTORICALLY.
+            self.spot_tokens["_VIX"] = int(self.vix_token
+                                           or config.VIX_TOKEN)
         self.vault.record_spot_tokens(self.spot_tokens)
         self.kws = KiteTicker(config.KITE_API_KEY, config.KITE_ACCESS_TOKEN)
         self.kws.on_ticks = lambda ws, ticks: self.q.put(ticks)

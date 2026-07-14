@@ -122,6 +122,9 @@ def meta_win_prob(meta: dict | None, frame: np.ndarray, iidx: int,
                          math.copysign(min(abs(f30) * 100, 3), f30)
                          if f30 else 0.0,
                          1.0 if dirn > 0 else -1.0]]).astype(np.float32)
+    if meta.get("engine") == "gbm":
+        from core import meta_gbm as MG
+        return MG.score_vec(meta, x)
     mu = np.asarray(meta["mu"], np.float32)
     sd = np.asarray(meta["sd"], np.float32)
     w = np.asarray(meta["w"], np.float32)

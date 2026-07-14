@@ -76,6 +76,7 @@ from core.gamma_nowcast import GammaNowcast
 from core import cascade as CS
 from core import shortvol as SVOL
 from core import butterfly as BFLY
+from core.bocpd import BOCPD
 from core.dealer_flow import DealerFlow
 from core import rv_forecaster as RVF
 from core import book as BOOK
@@ -382,6 +383,9 @@ def main():
     rv_models = {i: RVF.load_model(i) for i in config.TRADABLE}
     _rv_acc = {i: {"m": -1, "px": None, "rv": 0.0} for i in config.TRADABLE}
     last_rv: dict[str, dict] = {}
+    _bocpd: dict[str, BOCPD] = {}   # v9.9 regime-break sentinel
+    _rv_prev: dict[str, float] = {}
+    _cp_logged: dict[str, float] = {}
     last_mac_lite: dict[str, dict] = {}
     last_book: dict = {}
     _OPEN_SOD_B = (int(config.SESSION_OPEN.split(":")[0]) * 3600
@@ -939,6 +943,24 @@ def main():
                                 "vrp": (round(float(_ivn)
                                               - _prj["day_ann_vol"], 4)
                                         if _ivn else None)}
+                            # v9.9 BOCPD: did the vol world just BREAK? (telemetry only)
+                            try:
+                                _rvp = _rv_prev.get(idx)
+                                _rvn = last_rv[idx].get("rv")
+                                if _rvp and _rvn and _rvp > 0 and _rvn > 0:
+                                    _st = _bocpd.setdefault(idx, BOCPD()).update(
+                                        math.log(_rvn / _rvp))
+                                    last_rv[idx]["cp_prob"] = _st["cp_prob"]
+                                    last_rv[idx]["cp_run"] = _st["map_run"]
+                                    if _st["cp_prob"] >= 0.80 and ts - _cp_logged.get(
+                                            idx, 0) > 120:
+                                        _cp_logged[idx] = ts
+                                        log.warning("⚡ BOCPD %s: vol regime BREAK "
+                                                    "p=%.2f (run was %d)", idx,
+                                                    _st["cp_prob"], _st["map_run"])
+                                _rv_prev[idx] = _rvn
+                            except Exception:                              # noqa: BLE001
+                                pass
                 # ---- v9.3 SHORT-VOL gate (1 Hz): cascade state is the
                 # veto, exactly as the harness applies it --------------------
                 _step_sv = float(config.INDICES[idx]["strike_step"])

@@ -475,6 +475,24 @@ META_MIN_TRAIN  = 300          # labeled signals before the meta model is truste
 META_LR         = 0.05
 META_EPOCHS     = 300
 META_L2         = 1e-3
+# --- v9.8 META-FORGE v2 (LightGBM + purged CV + isotonic; logistic fallback)
+META_ENGINE       = "gbm"      # "gbm" (seconds, calibrated) | "logit" (v9.1)
+META_EMBARGO_DAYS = 1          # purge ± this many days around each CV fold
+META_GBM_LEAVES   = 15
+META_GBM_LR       = 0.05
+META_GBM_ROUNDS   = 600        # ceiling; early stopping picks the real one
+META_GBM_MINCHILD = 25
+META_USE_PLO      = False      # serve the per-bin Wilson LOWER bound of
+                               # P(win) instead of the point estimate — the
+                               # conformal-style gate. Flip only as a
+                               # registered trial once bins are populated.
+META_PLO_MIN_N    = 30
+# v9.9 front-month futures for the basis read (update at rollover, e.g.
+# {"NIFTY": "NFO:NIFTY25JULFUT", "SENSEX": "BFO:SENSEX25JULFUT"}); empty = off
+FUT_SYMBOLS       = {}
+VIX_TOKEN         = 264969     # NSE INDIA VIX — harvester archives it so
+                               # future harnesses can apply the spike veto
+                               # HISTORICALLY (brain already consumes live)
 META_P_FLOOR    = 0.50
 META_P_CAP      = 0.85
 
@@ -858,6 +876,12 @@ FORGE_TRAIN_SAC     = True    # False = freeze the directional SAC (gravestone);
 # updates this list. Operational additions you don't want to force a re-forge
 # must be named with a path suffix or added to _HASH_EXCLUDE.
 _HASH_EXCLUDE = frozenset({
+    # v9.8 meta-forge engine knobs (trainer choice — model files carry their
+    # own provenance; these must not fingerprint the feature world)
+    "META_ENGINE", "META_EMBARGO_DAYS", "META_GBM_LEAVES", "META_GBM_LR",
+    "META_USE_PLO", "META_PLO_MIN_N", "FUT_SYMBOLS",
+    "VIX_TOKEN",
+    "META_GBM_ROUNDS", "META_GBM_MINCHILD",
     # the hash must never fingerprint itself (else recompute is unstable)
     "CONFIG_HASH",
     # identity / run-mode (no effect on features or the trained model)

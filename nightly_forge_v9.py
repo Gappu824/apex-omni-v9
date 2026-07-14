@@ -651,12 +651,13 @@ def _gen_meta_samples(con, day: str):
     Returns (X, Y, W, R): features, win labels, uniqueness weights, drift rows.
     Affordability uses the static Kelly budget on the ASK we would pay (the
     label-time sizer, as before; the GRADER uses the dynamic governor)."""
+    RET = []   # v10: barrier P&L per sample
     from simulation.scenario_engine import N
     import math as _m
     R: list = []
     rep = _Replayer(con, day, meta=None, cal={}, funnel=None, collect_ref=R)
     if not rep.ok:
-        return [], [], [], []
+        return [], [], [], [], []
     pol = HeuristicPolicy()
 
     def decide(obs, frame, iidx):
@@ -719,6 +720,7 @@ def _gen_meta_samples(con, day: str):
                              1.0 if d == "CE" else -1.0]]).astype(np.float32)
         X.append(x)
         Y.append(1.0 if pnl > 0 else 0.0)
+        RET.append(float(pnl))
         spans.append((idx, t, t + off + 1))
     # ---- AFML uniqueness: w_i = mean over the label span of 1/concurrency ----
     W = np.ones(len(X), np.float32)
@@ -735,7 +737,7 @@ def _gen_meta_samples(con, day: str):
             seg = c[a:min(b, N)]
             if seg.size:
                 W[j] = float(np.mean(1.0 / np.maximum(seg, 1)))
-    return X, Y, list(W), R
+    return X, Y, list(W), R, RET
 
 
 def train_meta(con, days: list[str]):
@@ -743,10 +745,12 @@ def train_meta(con, days: list[str]):
     BY DAY (the last training day). Saved atomically; the live brain blends it
     into the Kelly win-probability. Returns (model_dict|None, diag_dict)."""
     perday = []
+    dee_rows = []
     R_all: list = []
     for day in days:
-        x, y, w, r = _gen_meta_samples_cached(con, day)
+        x, y, w, r, ret = _gen_meta_samples_cached(con, day)
         perday.append((day, x, y, w))
+        dee_rows += [(day, xi, ri, wi) for xi, ri, wi in zip(x, ret, w)]
         R_all += r
         log.info("meta samples %s: %d signals (mean uniq %.3f)", day, len(x),
                  float(np.mean(w)) if w else float("nan"))
@@ -771,6 +775,44 @@ def train_meta(con, days: list[str]):
         log.info("meta-labeler: %d/%d labeled signals — keep harvesting",
                  n, config.META_MIN_TRAIN)
         return None, diag
+    # ---- META-FORGE v2: purged-CV LightGBM + isotonic (v9.8). Falls back
+    # to the proven logistic below if lightgbm is absent or CV is too thin —
+    # a missing package can never cost a nightly.
+    if getattr(config, "META_ENGINE", "logit") == "gbm":
+        try:
+            from core import meta_gbm as MG
+            out = MG.fit_gbm(perday, config.META_MIN_TRAIN)
+        except Exception as e:                            # noqa: BLE001
+            log.error("meta-gbm failed (%s) — falling back to logistic", e)
+            out = None
+        if out is not None:
+            tmp = config.META_MODEL_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(out))
+            tmp.replace(config.META_MODEL_PATH)
+            log.info("META-FORGE v2: %d signals | OOF Brier %.4f→%.4f "
+                     "(raw→isotonic) | acc %.1f%% | %s | fit %.1fs → %s",
+                     out["n"], out["oof_brier_raw"], out["oof_brier_cal"],
+                     100 * out["holdout_acc"], out["holdout"],
+                     out["fit_seconds"], config.META_MODEL_PATH.name)
+            diag.update({"base_rate": out["base_rate"],
+                         "holdout_acc": out["holdout_acc"],
+                         "engine": "gbm",
+                         "oof_brier_cal": out["oof_brier_cal"]})
+            try:                       # v10 DISTRIBUTIONAL EDGE (fail-open)
+                from core import dist_edge as DE
+                dee = DE.fit_dee(dee_rows, config.META_MIN_TRAIN)
+                if dee:
+                    (config.STATE_DIR / "dist_edge.json").write_text(
+                        json.dumps(dee))
+                    log.info("DIST-EDGE: n=%d cover[q10,q90]=%.2f "
+                             "pinball(q50)=%.4f fit %.1fs", dee["n"],
+                             dee["oof_cover_q10_q90"], dee["pinball_q50"],
+                             dee["fit_seconds"])
+                    diag["dee_cover"] = dee["oof_cover_q10_q90"]
+            except Exception as e_:                       # noqa: BLE001
+                log.warning("dist-edge skipped: %s", e_)
+            return out, diag
+        log.info("meta-gbm unavailable — using logistic path")
     # day-based holdout: last day with samples; fall back to time-ordered 20%
     # only if that day is too thin to judge on.
     ho_day = next((d for d, x, _, _ in reversed(perday) if x), None)
@@ -1660,7 +1702,7 @@ def _meta_cache_path(day: str):
 
 
 def _meta_samples_stamp() -> str:
-    return f"{_data_stamp()}:{_decision_stamp()}"
+    return (f"{_data_stamp()}:{_decision_stamp()}") + "|ret1"
 
 
 def _gen_meta_samples_cached(con, day: str):
@@ -1670,10 +1712,10 @@ def _gen_meta_samples_cached(con, day: str):
             z = np.load(p, allow_pickle=False)
             if str(z["stamp"]) == _meta_samples_stamp():
                 return (list(z["X"]), list(z["Y"]), list(z["W"]),
-                        list(z["R"]))
+                        list(z["R"]), list(z["RET"]))
         except Exception:                                 # noqa: BLE001
             pass                                          # torn/old ⇒ rebuild
-    X, Y, W, R = _gen_meta_samples(con, day)
+    X, Y, W, R, RET = _gen_meta_samples(con, day)
     try:
         _CACHE_DIR.mkdir(exist_ok=True)
         dim = 3 * config.FEATURES_PER_NODE + 4
@@ -1682,10 +1724,11 @@ def _gen_meta_samples_cached(con, day: str):
                  Y=np.asarray(Y, np.float32),
                  W=np.asarray(W, np.float32),
                  R=(np.stack(R) if R else
-                    np.zeros((0, config.FEATURES_PER_NODE), np.float32)))
+                    np.zeros((0, config.FEATURES_PER_NODE), np.float32)),
+                 RET=np.asarray(RET, np.float32))
     except Exception as e:                                # noqa: BLE001
         log.warning("meta-sample cache write failed for %s: %s", day, e)
-    return X, Y, W, R
+    return X, Y, W, R, RET
 
 
 def _prepare_cache(days: list[str], report: DailyReport):
