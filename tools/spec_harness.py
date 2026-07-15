@@ -49,7 +49,10 @@ from core import vol_surface as VS                       # noqa: E402
 from core.diagnostics import _atomic_write_json          # noqa: E402
 import tools.cascade_harness as CH                       # noqa: E402
 import tools.shortvol_harness as SH                      # noqa: E402
-import tools.butterfly_harness as BH                     # noqa: E402
+import tools.butterfly_harness as BH
+from core import day_cache as DC
+from core import shortvol as SVK
+from core import butterfly as BFK                     # noqa: E402
 from nightly_forge_v9 import trading_days, spot_token_for  # noqa: E402
 
 import logging                                           # noqa: E402
@@ -178,9 +181,17 @@ def main():
                                             [days[0], days[-1]], upside, 0)
         elif spec["base"] == "shortvol":
             bt, skips, blockers = [], [], {}
+            _st = SVK.sv_knob_hash()      # spec knobs are live → own cache
             for day in days:
-                c, sk, b = SH._run_day(con, day, N, verbose=False,
-                                       extra_gate=extra)
+                if extra is None:
+                    c, sk, b = DC.run_cached(
+                        "shortvol", _st, day,
+                        lambda d=day: SH._run_day(con, d, N,
+                                                     verbose=False,
+                                                     extra_gate=None))
+                else:               # extra gates aren't in the knob hash —
+                    c, sk, b = SH._run_day(con, day, N, verbose=False,
+                                              extra_gate=extra)
                 bt += c
                 skips += sk
                 for k, v in b.items():
@@ -191,9 +202,17 @@ def main():
                                             len(days), [days[0], days[-1]], 0)
         else:                                     # base == "butterfly"
             bt, skips, blockers = [], [], {}
+            _st = BFK.fly_knob_hash()      # spec knobs are live → own cache
             for day in days:
-                c, sk, b = BH._run_day(con, day, N, verbose=False,
-                                       extra_gate=extra)
+                if extra is None:
+                    c, sk, b = DC.run_cached(
+                        "butterfly", _st, day,
+                        lambda d=day: BH._run_day(con, d, N,
+                                                     verbose=False,
+                                                     extra_gate=None))
+                else:               # extra gates aren't in the knob hash —
+                    c, sk, b = BH._run_day(con, day, N, verbose=False,
+                                              extra_gate=extra)
                 bt += c
                 skips += sk
                 for k, v in b.items():

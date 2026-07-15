@@ -984,7 +984,9 @@ def main():
                     if _k in _bk or len(_bk) < 12:
                         _bk[_k] = _bk.get(_k, 0) + 1
                 elif (sv_mode != "telemetry" and flybook.pos is None
-                      and pm.pos is None and not risk.halted
+                      and all(pms[_j].pos is None
+                              for _j in config.TRADABLE)
+                      and not risk.halted
                       and mapper is not None):
                     _rungs = mapper.hierarchy(idx, spot, _svg.side)
                     _spec, _why = BFLY.build_fly(
@@ -1177,17 +1179,26 @@ def main():
                     quotes=_fly_quotes(flybook.pos.spec),
                     cascade_event=sv_blocked_now.get(idx, False))
                 if _crow is not None:
-                    log.warning("Ⓥ SHORTVOL CLOSE %s %s → ₹%+.2f via %s "
-                                "(credit %.2f→%.2f, %ds) [%s]", idx,
+                    log.warning("Ⓕ BUTTERFLY CLOSE %s %s → ₹%+.2f via %s "
+                                "(debit %.2f→credit %.2f, %ds) [%s]", idx,
                                 _crow["side"], _crow["pnl"], _crow["why"],
-                                _crow["credit"], _crow["close_cost"],
+                                _crow["debit"], _crow["close_credit"],
                                 _crow["hold_s"], _crow["mode"])
                     report.d["shortvol"]["events"].append(_crow)
                 else:
                     skip_reason[idx] = f"in fly {flybook.pos.fly_id}"
                     if decide_now:
                         funnel.record(idx, "in_position", "spread")
-                    continue                  # index occupied by the spread
+                    continue                  # index occupied by the fly
+
+            # v10.1 GLOBAL SINGLE-POSITION LOCK: one live position in the
+            # WHOLE system. A fly on either index blocks entries on BOTH.
+            if flybook.pos is not None:
+                skip_reason[idx] = (f"in fly {flybook.pos.fly_id} "
+                                    f"(global lock)")
+                if decide_now:
+                    funnel.record(idx, "in_position", "fly_global")
+                continue
 
             # ================= 1 Hz ENTRY PATH (gates → attempt) =============
             if not decide_now:

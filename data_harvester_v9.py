@@ -200,13 +200,16 @@ class Harvester:
         self.subscribed: set[int] = set()
         self.chains: dict[str, dict] = {}
         self._resolve_spot_tokens()
-        if int(getattr(config, "VIX_TOKEN", 0)):
-            # v10: archive INDIA VIX like any spot — the brain already
-            # consumes it live; this puts it in the VAULT so harnesses can
-            # apply the spike veto HISTORICALLY.
-            self.spot_tokens["_VIX"] = int(self.vix_token
-                                           or config.VIX_TOKEN)
-        self.vault.record_spot_tokens(self.spot_tokens)
+        # v10.2.2: record "_VIX" in the vault's spot_tokens META TABLE so
+        # replay tools can discover the stream — WITHOUT putting it in
+        # self.spot_tokens, which downstream loops treat as index-keyed
+        # (config.INDICES[idx] — "_VIX" there crashed startup on 07-15).
+        # Subscription needs nothing: the harvester already subscribes VIX
+        # via self.vix_token / token_role.
+        _rec = dict(self.spot_tokens)
+        if int(self.vix_token or getattr(config, "VIX_TOKEN", 0)):
+            _rec["_VIX"] = int(self.vix_token or config.VIX_TOKEN)
+        self.vault.record_spot_tokens(_rec)
         self.kws = KiteTicker(config.KITE_API_KEY, config.KITE_ACCESS_TOKEN)
         self.kws.on_ticks = lambda ws, ticks: self.q.put(ticks)
         self.kws.on_order_update = lambda ws, d: self._order_update(d)

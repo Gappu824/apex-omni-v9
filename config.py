@@ -482,6 +482,11 @@ META_GBM_LEAVES   = 15
 META_GBM_LR       = 0.05
 META_GBM_ROUNDS   = 600        # ceiling; early stopping picks the real one
 META_GBM_MINCHILD = 25
+# v10.2 SCALE DOCTRINE: evenings must stay O(new days) as the vault grows.
+HARNESS_MAX_DAYS    = 60      # certificates graded on the trailing N vault
+                              # days (0 = all history). Recency-relevant
+                              # evaluation window; cache makes even 0 cheap.
+META_TRAIN_MAX_DAYS = 90      # meta/DEE training window (0 = all).
 META_USE_PLO      = False      # serve the per-bin Wilson LOWER bound of
                                # P(win) instead of the point estimate — the
                                # conformal-style gate. Flip only as a
@@ -849,7 +854,9 @@ GRAD_MICRO_CAPITAL  = 25000.0 # micro-live stage capital (one-lot)
 GRAD_KELLY_FRAC     = 0.25    # fractional Kelly at scaling stage
 GRAD_DD_MAX_PCT     = 10.0    # Grossman-Zhou drawdown throttle ceiling
 SPREAD_LIVE_TOKEN   = STATE_DIR / "ARM_LIVE_SPREADS"  # operator lock #4
-FORGE_TRAIN_SAC     = True    # False = freeze the directional SAC (gravestone);
+FORGE_TRAIN_SAC     = False   # v10.2 default: the directional thesis was
+                              # FALSIFIED — training it nightly bought hours
+                              # and no edge. Exams/counterfactual still run;
                               # meta/heur exam/counterfactual/drift still run
 
 # ============================================================================
@@ -957,6 +964,7 @@ _HASH_EXCLUDE = frozenset({
     "STRESS_SPLIT_HM", "RCT_LIMIT_TIMEOUT_S", "RCT_MIN_FIT",
     "GRAD_MICRO_CAPITAL", "GRAD_KELLY_FRAC", "GRAD_DD_MAX_PCT",
     "FORGE_TRAIN_SAC",
+    "HARNESS_MAX_DAYS", "META_TRAIN_MAX_DAYS",
     "SV_CERT_MIN_EVENTS", "SV_CERT_MIN_DAYS", "SV_CERT_CI",
 })
 

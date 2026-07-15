@@ -44,7 +44,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config                                            # noqa: E402
-from core import trial_registry as TR                   # noqa: E402
+from core import trial_registry as TR
+from core import day_cache as DC                   # noqa: E402
 from core.cascade import (CascadeDetector, cascade_knob_hash)   # noqa: E402
 from core.gamma_nowcast import GammaNowcast              # noqa: E402
 from core.instruments import AsOfMapper                  # noqa: E402
@@ -421,14 +422,21 @@ def main():
     days = trading_days(con)
     if args.days > 0:
         days = days[-args.days:]
+    if getattr(config, "HARNESS_MAX_DAYS", 0) > 0:
+        days = days[-config.HARNESS_MAX_DAYS:]   # v10.2 window
     log.info("cascade harness | %d day(s) %s → %s | knob %s | eval ₹%.0f",
              len(days), days[0], days[-1], cascade_knob_hash(),
              config.FORGE_EVAL_CAPITAL)
 
     all_rows: list[dict] = []
     upside_total = 0
+    _stamp = cascade_knob_hash()
     for day in days:
-        rr, up = _run_day(con, day, N, primary_rows=all_rows)
+        _c, _s, _ = DC.run_cached(
+            "cascade", _stamp, day,
+            lambda d=day: (lambda t: (t[0], [t[1]], {}))(
+                _run_day(con, d, N, primary_rows=all_rows)))
+        rr, up = _c, _s[0]
         all_rows += rr
         upside_total += up
 
@@ -462,9 +470,13 @@ def main():
             config.CASCADE_NET_GEX_MAX = og * gm
             try:
                 rr = []
+                _st2 = cascade_knob_hash()   # knob-patched → own cache
                 for day in days:
-                    _r, _ = _run_day(con, day, N, primary_rows=None)
-                    rr += _r
+                    _c2, _s2, _ = DC.run_cached(
+                        "cascade", _st2, day,
+                        lambda d=day: (lambda t: (t[0], [t[1]], {}))(
+                            _run_day(con, d, N, primary_rows=None)))
+                    rr += _c2
                 pf = [r["pnl"] for r in rr if "pnl" in r]
                 TR.register("cascade",
                             f"{cascade_knob_hash()}:z{z}g{gm}",

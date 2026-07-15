@@ -744,6 +744,8 @@ def train_meta(con, days: list[str]):
     """Triple-barrier labels → UNIQUENESS-WEIGHTED logistic P(win|x), holdout
     BY DAY (the last training day). Saved atomically; the live brain blends it
     into the Kelly win-probability. Returns (model_dict|None, diag_dict)."""
+    if getattr(config, "META_TRAIN_MAX_DAYS", 0) > 0:
+        days = days[-config.META_TRAIN_MAX_DAYS:]   # v10.2 bounded window
     perday = []
     dee_rows = []
     R_all: list = []

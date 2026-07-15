@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config                                            # noqa: E402
 from core import trial_registry as TR
+from core import day_cache as DC
 from core import stat_bootstrap as SB                    # noqa: E402
 from core import shortvol as SV                           # noqa: E402
 from core import butterfly as BF                          # noqa: E402
@@ -336,12 +337,17 @@ def main():
     days = trading_days(con)
     if args.days > 0:
         days = days[-args.days:]
+    if getattr(config, "HARNESS_MAX_DAYS", 0) > 0:
+        days = days[-config.HARNESS_MAX_DAYS:]   # v10.2 trailing window
     log.info("butterfly harness | %d day(s) %s → %s | knob %s | eval ₹%.0f",
              len(days), days[0], days[-1], BF.fly_knob_hash(),
              config.FORGE_EVAL_CAPITAL)
     bt, skips, blockers = [], [], {}
+    _stamp = BF.fly_knob_hash()
     for day in days:
-        c, s, b = _run_day(con, day, N, verbose=True)
+        c, s, b = DC.run_cached("butterfly", _stamp, day,
+                                lambda d=day: _run_day(con, d, N,
+                                                       verbose=True))
         bt += c
         skips += s
         for k, v in b.items():
@@ -367,8 +373,11 @@ def main():
             config.SV_IVRANK_MIN, config.SV_FLY_TP_FRAC = ivr, tp
             try:
                 rr = []
+                _st2 = BF.fly_knob_hash()   # knob-patched → own cache
                 for day in days:
-                    c, _, _ = _run_day(con, day, N, verbose=False)
+                    c, _, _ = DC.run_cached("butterfly", _st2, day,
+                                            lambda d=day: _run_day(
+                                                con, d, N, verbose=False))
                     rr += c
                 pf = [r["pnl"] for r in rr]
                 TR.register("butterfly",
