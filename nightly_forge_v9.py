@@ -1998,10 +1998,21 @@ def main():
         return (f"{_meta_samples_stamp()}:"
                 f"{_h.sha1(repr(train_days).encode()).hexdigest()[:8]}")
 
+    # v9.7.1 crash fix (flow-sensitive del/unbound class — the same family
+    # /tmp/del_sweep.py was built to catch): wf_hits / wf_new were initialized
+    # ONLY inside `if trained:`, but the cache-report dict below reads them
+    # UNCONDITIONALLY. With FORGE_TRAIN_SAC=False the SAC candidate is None →
+    # trained=False → the else branch set wf_rows/sac_wf/heur_wf but NOT the
+    # two counters, so `report.d["cache"]` raised UnboundLocalError and took
+    # the whole nightly down AFTER all real work (meta, exams, counterfactual)
+    # had already succeeded. Bind every name the merge point consumes here,
+    # before the split, so neither branch can leave a hole.
+    wf_rows: list = []
+    wf_hits = wf_new = 0
+    sac_wf: list = []
+    heur_wf: list = []
     if trained:
-        wf_rows = []
         wf_funnel = D.GateFunnel(config.TRADABLE)
-        wf_hits = wf_new = 0
         K = min(int(config.FORGE_WF_FOLDS), max(len(pool) - 2, 0))
         for fd in pool[len(pool) - K:] if K > 0 else []:
             j = pool.index(fd)
@@ -2052,8 +2063,9 @@ def main():
         # v9.4: deflation charges the GLOBAL trial registry (Pillar 1) — the
         # pre-registry forge_history era is back-filled once, idempotently.
         TR.ensure_forge_backfill()
-    else:
-        wf_rows, sac_wf, heur_wf = [], [], []
+    # else: SAC frozen / untrained — wf_rows, wf_hits, wf_new, sac_wf, heur_wf
+    # keep their pre-bound empty/zero values from above (no re-assignment
+    # needed; the merge point below is now hole-free on both branches).
     if trained:
         TR.register("forge", ver, "candidate", day=final_day)
 

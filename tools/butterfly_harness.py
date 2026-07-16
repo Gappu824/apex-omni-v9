@@ -247,10 +247,18 @@ def _boot_lo(pnls, ci, n_boot):
 
 
 def _forward_fills():
-    """Pair the SHARED forward log by fly_id (spread rows are ignored)."""
+    """Pair the SHARED forward log by fly_id (spread rows are ignored).
+
+    v9.7.1 censoring honesty: a why=DISPLACED close is a PORTFOLIO decision
+    by core/displacement.py — the fly was cut for a better trade, not by its
+    own exit policy. Grading the fly's certificate on those truncated rows
+    would blame (or credit) the fly for the governor's choices, so they are
+    EXCLUDED from the blend and returned separately for the report.
+
+    Returns (fills, pending_opens, displaced_rows)."""
     if not SV.FORWARD_LOG.exists():
-        return [], []
-    opens, fills = {}, []
+        return [], [], []
+    opens, fills, displaced = {}, [], []
     for line in SV.FORWARD_LOG.read_text(encoding="utf-8").splitlines():
         try:
             e = json.loads(line)
@@ -263,15 +271,19 @@ def _forward_fills():
             opens[fid] = e
         elif e.get("phase") == "close" and fid in opens:
             o = opens.pop(fid)
-            fills.append({
+            row = {
                 "source": "forward", "fly_id": fid,
                 "day": str(dt.datetime.fromtimestamp(
                     float(e.get("close_ts") or 0)).date()),
                 "index": o.get("index"), "side": o.get("side"),
                 "why": e.get("why"), "pnl": float(e.get("pnl") or 0),
                 "debit": o.get("debit"), "hold_s": e.get("hold_s"),
-                "mode": o.get("mode")})
-    return fills, list(opens.values())
+                "mode": o.get("mode")}
+            if str(e.get("why") or "").startswith("DISPLACED"):
+                displaced.append(row)
+            else:
+                fills.append(row)
+    return fills, list(opens.values()), displaced
 
 
 def _assemble_certificate(bt, fw, skips, blockers, days_scanned,
@@ -354,13 +366,15 @@ def main():
             blockers[k] = blockers.get(k, 0) + v
     for r in bt:
         r["source"] = "backtest"
-    fw, pending = _forward_fills()
-    if fw or pending:
+    fw, pending, displaced = _forward_fills()
+    if fw or pending or displaced:
         log.info("forward evidence: %d closed paper fly(s) blended "
-                 "(Σ ₹%.2f), %d still open", len(fw),
-                 sum(r["pnl"] for r in fw), len(pending))
+                 "(Σ ₹%.2f), %d still open, %d DISPLACED (censored — "
+                 "excluded from the certificate)", len(fw),
+                 sum(r["pnl"] for r in fw), len(pending), len(displaced))
     cert = _assemble_certificate(bt, fw, skips, blockers, len(days),
                                  [days[0], days[-1]], len(pending))
+    cert["forward_displaced"] = len(displaced)   # censored, NOT blended
     TR.register("butterfly", BF.fly_knob_hash(), "primary",
                 n_events=cert["n_events"], ok=cert["ok"])
     _atomic_write_json(config.FLY_CERT_PATH, cert)
@@ -396,6 +410,7 @@ def main():
     report = {"certificate": cert, "backtest_events": bt,
               "skipped_attempts": skips[-400:],
               "forward_events": fw, "forward_pending": pending,
+              "forward_displaced_CENSORED": displaced,
               "sensitivity_DIAGNOSTIC_ONLY": {
                   "note": "9 trials, backtest tier only — choosing a cell and "
                           "re-certifying is multiple testing (Bailey–LdP).",

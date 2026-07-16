@@ -76,6 +76,9 @@ from core.gamma_nowcast import GammaNowcast
 from core import cascade as CS
 from core import shortvol as SVOL
 from core import butterfly as BFLY
+from core.displacement import DisplacementGovernor
+from core.exit_engine import signed_efficiency
+from core import fly_intel as FI
 from core.bocpd import BOCPD
 from core.dealer_flow import DealerFlow
 from core import rv_forecaster as RVF
@@ -282,6 +285,14 @@ def main():
     actions = np.zeros(config.ACTION_DIM, np.float32)
     last_conv: dict[str, float] = {}       # post-regime conv, ≤1 s old
     last_wp_hold: dict[str, float | None] = {}
+    # v9.7.1: signed Kaufman ER of the recent spot path, refreshed 1 Hz — the
+    # ride gate's tape evidence (None until enough history) + the
+    # DisplacementGovernor that weighs an incoming read against a held fly.
+    last_tape_er: dict[str, float | None] = {}
+    last_fly_intel: dict[str, object] = {}   # the fly's pinning read, mined
+    #                                          into a directional modulation +
+    #                                          boundary map (core/fly_intel.py)
+    disp = DisplacementGovernor()
     last_mac: dict[str, dict | None] = {}
     # ---- v9.1 diagnostics: gate funnel + daily report -----------------------
     # v9.2: resume=True — a mid-session restart merges into the day's report;
@@ -359,7 +370,18 @@ def main():
     sv_blocked_now: dict[str, bool] = {i: False for i in config.TRADABLE}
     report.d.setdefault("shortvol", {}).setdefault("events", [])
     report.d["shortvol"]["mode"] = sv_mode
-    if sv_mode == "paper-explore":
+    report.d["shortvol"]["fly_trading_enabled"] = bool(
+        getattr(config, "FLY_TRADING_ENABLED", False))
+    if not getattr(config, "FLY_TRADING_ENABLED", False):
+        log.info("FLY: TELEMETRY-ONLY by operator config "
+                 "(FLY_TRADING_ENABLED=False) — the butterfly gate evaluates "
+                 "every second and feeds core/fly_intel (its read sharpens "
+                 "DIRECTIONAL entries: dampen breakouts INTO a wall, boost "
+                 "fades toward the pin, cap the target runway), but NO fly is "
+                 "ever opened — not paper, not live. The global lock is never "
+                 "held by a fly; directional capital stays free. (cert mode "
+                 "would be '%s' if trading were on.)", sv_mode)
+    elif sv_mode == "paper-explore":
         log.info("SHORTVOL ARMED (PAPER-EXPLORE) — VRP credit spreads: short "
                  "the tested wall, long one step out; +gamma corridor + rich "
                  "IV only; cascade-vetoed; paper fills feed the certificate "
@@ -693,6 +715,29 @@ def main():
             sv_mode = SVOL.shortvol_mode(sv_cert)
             _svtok = ((f"{flybook.pos.spec.index}·fly" if flybook.pos
                        else f"{flybook.closed_today}c") + f" {sv_mode}")
+            # displacement token is only meaningful when the fly can hold the
+            # lock; when fly trading is off, the fly is pure telemetry and
+            # there is nothing to displace — say so instead.
+            if getattr(config, "FLY_TRADING_ENABLED", False):
+                _dtok = (f"{disp.count_today}/"
+                         f"{getattr(config, 'DISP_MAX_PER_DAY', 2)}")
+                if flybook.pos is not None and disp.last_refusal:
+                    _dtok += f" ({disp.last_refusal})"
+                _svtok += f" | disp {_dtok}"
+            else:
+                _svtok = "fly telemetry-only (feeds directional)"
+            # v9.7.1: surface the fly's mined directional read (pinning regime,
+            # near wall, pin pressure) for whichever tradable index has it live
+            _fi_live = next((last_fly_intel.get(i) for i in config.TRADABLE
+                             if getattr(last_fly_intel.get(i), "active",
+                                        False)), None)
+            if _fi_live is not None:
+                _svtok += (f" | fly-intel {_fi_live.near_wall}wall "
+                           f"pin{_fi_live.pin_pressure:.2f} "
+                           f"runway×{_fi_live.target_runway_mult:.2f}"
+                           + (f" revert→{_fi_live.revert_hint_side}"
+                              if _fi_live.revert_hint_side else ""))
+
             log.info("♥ %s | feed age %.1fs | PnL ₹%+.0f | deployed ₹%.0f | "
                      "halted=%s | pos %s | conv %s | policy %s | VIX %s | "
                      "regime %s | walkaway %s | cascade %s | sv %s | drift %s | "
@@ -751,10 +796,18 @@ def main():
                          i, sp, pdc_s, pdh_s, pdl_s, wall_s)
             if _fly_mark is not None:
                 _tt = "live" if _fly_mark["live_quote"] else "stale-mark"
+                _tv = _fly_mark.get("trail") or {}
+                _tr_s = (f" | smooth ₹{_fly_mark['cc_smooth']:.2f} "
+                         f"hwm {_tv.get('hwm', 0):.2f}"
+                         + (f" ratchet {_tv['ratchet']:.2f}"
+                            if _tv.get("ratchet") is not None else "")
+                         + (f" σ {_tv.get('sigma', 0):.2f}" if _tv else "")
+                         + (" ★tagged" if _fly_mark.get("tgt_tagged") else "")
+                         ) if _tv else ""
                 log.info("  Ⓕ %-6s %s | BUY %s + BUY %s + SELL 2× %s | "
                          "debit ₹%.2f → credit ₹%.2f | unreal ₹%+.0f | "
                          "target %+.0f%% floor %+.0f%% | pin dist %g | pop "
-                         "%.2f | held %ds | %s [%s]",
+                         "%.2f | held %ds | %s [%s]%s",
                          _fly_mark["index"], _fly_mark["fly_id"],
                          _fly_mark["wing_in_symbol"],
                          _fly_mark["wing_out_symbol"], _fly_mark["body_symbol"],
@@ -762,7 +815,7 @@ def main():
                          _fly_mark["unreal"], _fly_mark["to_target_pct"],
                          _fly_mark["to_floor_pct"], _fly_mark["dist_from_body"],
                          _fly_mark["pop"], _fly_mark["held_s"], _tt,
-                         _fly_mark["mode"])
+                         _fly_mark["mode"], _tr_s)
 
         # refresh ring-backed quotes for the paper engine + surfaces from macro
         ring_quotes.clear()
@@ -978,12 +1031,36 @@ def main():
                     dte=ctx_m.get("dte"), strike_step=_step_sv,
                     vix_bump=vix_bump,
                     cascade_blocked=sv_blocked_now[idx])
+                # ---- v9.7.1 FLY INTELLIGENCE: mine the gate read for the
+                # DIRECTIONAL book (the fly's job is now to make better long
+                # trades, not to be the trade). Regime map captured every
+                # second the gate grants; the per-candidate conv modulation is
+                # applied below once `conv` exists. Ungranted ⇒ neutral.
+                last_fly_intel[idx] = (FI.assess(
+                    granted=_svg.ok, side=_svg.side, spot=spot,
+                    call_wall=(mac or {}).get("call_wall"),
+                    put_wall=(mac or {}).get("put_wall"),
+                    corridor_steps=_svg.corridor_steps,
+                    iv_rank=_svg.iv_rank, net_gex=_svg.net_gex,
+                    strike_step=_step_sv, direction=None, conviction=0.0)
+                    if getattr(config, "FLY_INTEL_ENABLED", True)
+                    else FI.FlyIntel(active=False))
                 if not _svg.ok:
                     _bk = sv_gate_block[idx]
                     _k = _svg.reason[:40]
                     if _k in _bk or len(_bk) < 12:
                         _bk[_k] = _bk.get(_k, 0) + 1
-                elif (sv_mode != "telemetry" and flybook.pos is None
+                # ---- FLY OPEN PATH — DISABLED BY DEFAULT (v9.7.1) ----------
+                # The operator's standing instruction: the butterfly must NOT
+                # take positions, not even paper. Its gate still evaluates
+                # above (feeding core/fly_intel for the directional book); this
+                # branch — the ONLY place a fly is ever opened — is gated off
+                # by FLY_TRADING_ENABLED (default False). Off ⇒ no fly ever
+                # occupies the global lock, so displacement is moot and the
+                # capital is always free for directional trades. Set the knob
+                # True only to resurrect the paper-explore fly engine.
+                elif (getattr(config, "FLY_TRADING_ENABLED", False)
+                      and sv_mode != "telemetry" and flybook.pos is None
                       and all(pms[_j].pos is None
                               for _j in config.TRADABLE)
                       and not risk.halted
@@ -1068,7 +1145,35 @@ def main():
                 # LOGIT-space scaling — dampened regimes demand a stronger raw
                 # signal instead of arithmetically vetoing (audit fix).
                 conv = D.apply_regime(conv, regime.conv_mult)
+                # ---- v9.7.1 FLY-INTEL directional modulation: in a live
+                # pinning regime, DAMPEN conviction pointing INTO the near
+                # wall (the dealers will fade that breakout — the operator's
+                # exact trap) and mildly BOOST a read trading AWAY from it /
+                # with the fade. Logit-space, stacked on the regime mult, so
+                # it scales-never-vetoes. Neutral whenever the fly gate isn't
+                # granting. Toggle: FLY_INTEL_MODULATE_CONV.
+                _fi = last_fly_intel.get(idx)
+                if (getattr(config, "FLY_INTEL_MODULATE_CONV", True)
+                        and _fi is not None and getattr(_fi, "active", False)
+                        and conv != 0.0):
+                    _fim = FI.assess(
+                        granted=True, side=_fi.near_wall, spot=spot,
+                        call_wall=(mac or {}).get("call_wall"),
+                        put_wall=(mac or {}).get("put_wall"),
+                        corridor_steps=_fi.corridor_steps,
+                        iv_rank=_fi.iv_rank, net_gex=_fi.net_gex,
+                        strike_step=_step_sv,
+                        direction=("CE" if conv > 0 else "PE"),
+                        conviction=conv)
+                    last_fly_intel[idx] = _fim
+                    if _fim.conv_mult != 1.0:
+                        _conv_pre = conv
+                        conv = FI.apply_conv(conv, _fim.conv_mult)
+                        log.debug("%s fly-intel %s: conv %+.2f→%+.2f (%s)",
+                                  idx, _fim.regime, _conv_pre, conv, _fim.note)
                 last_conv[idx] = conv
+                last_tape_er[idx] = signed_efficiency(
+                    sh, int(getattr(config, "RIDE_ER_WINDOW_S", 120)))
                 # wall-clock persistence sampling — 1/second, replay-identical
                 persist[idx].push(ts, conv)
                 conv_res[idx].add(abs(conv))
@@ -1147,7 +1252,12 @@ def main():
                 oi_delta_since=float(oi_node[2]),
                 avg_spread_pct=spread_ew[idx], conviction=conv,
                 live_win_prob=last_wp_hold.get(idx),
-                regime_label=(regime.label if regime else ""))
+                regime_label=(regime.label if regime else ""),
+                tape_er=last_tape_er.get(idx),
+                fly_runway_mult=(getattr(last_fly_intel.get(idx),
+                                         "target_runway_mult", 1.0)
+                                 if getattr(config, "FLY_INTEL_TARGET_CAP",
+                                            True) else 1.0))
 
             for oid, fill in engine.on_quote(
                     pm.pos.token if pm.pos else -1,
@@ -1171,6 +1281,56 @@ def main():
                     if snap:
                         log.info("%s", snap)
                 continue
+
+            # ---- v9.7.1 DISPLACEMENT: while a fly holds the global lock,
+            # weigh THIS index's fresh read against the position being held
+            # (1 Hz decision cadence; core/displacement.py — every grant and
+            # every refusal is named). A grant closes the fly through the
+            # normal accounting (close_now → ledger/forward/risk) and falls
+            # through: the entry constitution below prices the replacement
+            # THIS second through the untouched gates (decision gate,
+            # persistence, throttle, RiskGovernor, spread gate, chase cap).
+            if (flybook.pos is not None and decide_now and pm.pos is None
+                    and getattr(config, "DISP_ENABLED", True)):
+                _fm_d = flybook.mark(
+                    ts=ts, spot=last_spot.get(flybook.pos.spec.index, 0.0),
+                    quotes=_fly_quotes(flybook.pos.spec))
+                _bar_d = D.effective_bar(entry_bar, vix_bump,
+                                         (mac or {}).get("iv_rank"))
+                _pok, _pwhy, _ = persist[idx].check(
+                    conv, spot_secs.get(idx, ()),
+                    _bar_d + getattr(config, "DISP_CONV_MARGIN", 0.10))
+                _v = disp.evaluate(
+                    ts=ts, idx=idx, conv=conv, eff_bar=_bar_d,
+                    persist_ok=_pok, persist_why=_pwhy,
+                    tape_er=last_tape_er.get(idx), cascade_ev=cascade_ev,
+                    fly_open_ts=flybook.pos.open_ts,
+                    fly_progress_pct=(_fm_d or {}).get("progress_smooth_pct"),
+                    fly_unreal=(_fm_d or {}).get("unreal"),
+                    fly_pin_frac=(_fm_d or {}).get("pin_frac"),
+                    minutes_to_close=mins_left)
+                if _v.displace:
+                    _crow = flybook.close_now(
+                        ts=ts, hm=hm, quotes=_fly_quotes(flybook.pos.spec),
+                        reason=f"DISPLACED[{_v.tier}]→{_v.index} {_v.side}")
+                    if _crow is not None:
+                        disp.register(ts)
+                        log.warning(
+                            "⇄ DISPLACED fly %s (unreal ₹%+.0f → realized "
+                            "₹%+.2f via 4-leg unwind) for %s %s — %s "
+                            "[%d/%d today]",
+                            _crow["fly_id"],
+                            float((_fm_d or {}).get("unreal") or 0.0),
+                            _crow["pnl"], _v.index, _v.side, _v.reason,
+                            disp.count_today,
+                            int(getattr(config, "DISP_MAX_PER_DAY", 2)))
+                        report.d["shortvol"]["events"].append(_crow)
+                        report.d.setdefault("displacements", []).append({
+                            "ts": ts, "hm": hm, "tier": _v.tier,
+                            "index": _v.index, "side": _v.side,
+                            "fly_id": _crow["fly_id"],
+                            "fly_pnl": _crow["pnl"],
+                            "reason": _v.reason, "diag": _v.diag})
 
             # ---- v9.3: spread book management (~5 Hz) + index occupancy ----
             if flybook.pos is not None and flybook.pos.spec.index == idx:

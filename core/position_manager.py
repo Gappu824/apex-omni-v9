@@ -13,9 +13,31 @@ Exit ladder, evaluated every tick, strictly in this order:
    1. DISASTER FLOOR     — absolute; overrides everything incl. the shield.
    2. EOD FLATTEN        — 15:15, before the broker's MIS square-off.
    3. STALE-FEED FLATTEN — feed dead > DATA_STALE_FLATTEN_S.
-   4. TARGET             — corrected expected-move (single √T) + GEX runway.
-   5. THETA GUILLOTINE   — max-hold minutes for short-dated longs.
-   6. CONVICTION REVERSAL— model flips hard against the position.
+   4. TARGET / RIDE      — corrected expected-move (single √T) + GEX runway.
+                           v9.7.1: a tagged target is EXTENDED — not banked —
+                           when the edge is demonstrably still on: trained
+                           meta P(win) when it exists (unchanged), else the
+                           Kaufman-ER efficiency-gated ride (the SAME tape
+                           physics the entry gate trusts). 2026-07-15: with
+                           the meta dormant the old rung banked EVERY first
+                           touch, so a breakdown that smashed through the
+                           runway-anchored target left with a fraction of the
+                           move — the "jackpot exited early" failure.
+   4.6 PEAK-CAPTURE TRAIL— core/exit_engine: chandelier ratchet on the
+                           SMOOTHED mark, noise-scaled giveback, dwell-
+                           confirmed (a spike that fails to sustain never
+                           fires), regime-conditioned (Kaminski–Lo 2014),
+                           stagnation-take in chop. Every trail fire is shown
+                           to the TrapShield first, exactly like a stop
+                           breach — the shield may hold a winner through a
+                           confirmed flush down to the profit-lock floor.
+   5. THETA GUILLOTINE   — max-hold minutes for short-dated longs; v9.7.1: a
+                           still-efficient WINNER may ride past it, bounded
+                           by MAX_HOLD_RIDE_MULT (floors/locks unaffected).
+   6. CONVICTION REVERSAL— model flips hard against the position — now
+                           SUSTAINED for REVERSAL_CONFIRM_S, not one tick
+                           (the exit side gets the persistence the entry
+                           side always had).
    7. STOP (trail/base)  — but a breach is first shown to the TrapShield;
                            a suspected institutional flush is HELD through,
                            under the floor, for a bounded grace window. A
@@ -35,6 +57,7 @@ from pathlib import Path
 
 import config
 from core.execution_engine import ExecutionEngine, Fill, round_trip_costs
+from core.exit_engine import PeakCaptureTrail, TrailParams, ride_ok
 from core.risk_manager import RiskGovernor, TradePermit
 from core.trap_shield import TrapShield, TrapSignals
 from core.quant_core import expected_move, micro_price
@@ -86,6 +109,17 @@ class TickContext:
     #                                      the disaster floor / EOD / hard stop.
     regime_label: str = ""               # market regime at this tick (for the
     #                                      per-regime performance breakdown)
+    tape_er: float | None = None         # SIGNED Kaufman ER of the recent spot
+    #                                      path (core/exit_engine.signed_
+    #                                      efficiency): the ride gate's tape
+    #                                      evidence. None until enough history
+    #                                      — every consumer degrades to the
+    #                                      legacy (bank-the-target) behavior.
+    fly_runway_mult: float = 1.0         # v9.7.1: fly-intel regime-conditional
+    #                                      shrink of the wall runway the target
+    #                                      is planted within (deep +gamma pin ⇒
+    #                                      the move arrests before the wall).
+    #                                      1.0 = no fly read = legacy behavior.
 
 
 @dataclass
@@ -118,6 +152,10 @@ class Position:
     shield: TrapShield = field(default=None)            # type: ignore
     spike_ref_spot: float = 0.0
     spike_ref_oi: float = 0.0
+    # ---- v9.7.1 peak-capture exit state -------------------------------------
+    trail: object = None          # PeakCaptureTrail over the executable mark
+    reversal_since: float = 0.0   # dwell clock: conviction hard against us
+    theta_rides: int = 0          # 0/1 flag: rode past the theta guillotine
 
 
 class PositionManager:
@@ -284,6 +322,12 @@ class PositionManager:
             runway = ctx.gex_call_wall - ctx.spot
         if direction == "PE" and ctx.gex_put_wall and ctx.gex_put_wall < ctx.spot:
             runway = ctx.spot - ctx.gex_put_wall
+        # v9.7.1: in a deep +gamma pinning regime the fly-intel read shrinks the
+        # runway — the pin arrests the move BEFORE the wall, so a target planted
+        # at the full wall distance is one the dealers won't let us reach. 1.0
+        # (no fly read) leaves the legacy target untouched.
+        if runway is not None and ctx.fly_runway_mult != 1.0:
+            runway *= max(min(ctx.fly_runway_mult, 1.0), 0.1)
         spot_room = min(em, runway) if runway else em
         prem_room = p.delta_at_entry * spot_room
         p.target = fill.avg_price + max(prem_room,
@@ -291,6 +335,22 @@ class PositionManager:
         p.peak = fill.avg_price
         p.shield = TrapShield(direction)
         p.spike_ref_spot = ctx.spot
+        # v9.7.1 peak-capture trail — parameters read at construction so the
+        # scenario simulator / any knob-patching harness binds fresh values.
+        p.trail = PeakCaptureTrail(fill.avg_price, ctx.ts, TrailParams(
+            arm_frac=config.TRAIL_ARM_PCT,
+            give_frac_trend=getattr(config, "EXIT_GIVE_FRAC_TREND", 0.25),
+            give_frac_chop=getattr(config, "EXIT_GIVE_FRAC_CHOP", 0.15),
+            k_sigma=getattr(config, "EXIT_K_SIGMA", 3.0),
+            give_floor_frac=getattr(config, "EXIT_GIVE_FLOOR_FRAC", 0.12),
+            ema_hl_s=getattr(config, "EXIT_MARK_EMA_HL_S", 6.0),
+            sigma_prior_frac=getattr(config, "EXIT_SIGMA_PRIOR_FRAC", 0.02),
+            confirm_s=getattr(config, "EXIT_CONFIRM_S", 12.0),
+            hard_mult=getattr(config, "EXIT_HARD_BREACH_MULT", 2.5),
+            stagnation_s=getattr(config, "EXIT_STAGNATION_S", 420.0),
+            tighten_min_left=getattr(config, "EXIT_THETA_TIGHTEN_MIN_LEFT",
+                                     75.0),
+            tighten_floor=getattr(config, "EXIT_THETA_TIGHTEN_MIN", 0.40)))
         p.gtt_id = self.engine.arm_gtt_floor(symbol=p.symbol,
             exchange=p.exchange, qty=p.qty, floor_px=p.floor,
             last_price=p.entry)
@@ -347,10 +407,18 @@ class PositionManager:
             else ""
         armed = "TRAIL" if p.trail_armed else "warm"
         lock = f" lock {p.profit_lock:.2f}" if p.profit_lock > 0 else ""
+        tvs = ""
+        if p.trail is not None:
+            tv = p.trail.vitals()
+            tvs = (f" | ratchet {tv['ratchet']:.2f} σ {tv['sigma']:.2f}"
+                   if tv.get("ratchet") is not None
+                   else f" | σ {tv['sigma']:.2f}")
+            if tv.get("breach_s"):
+                tvs += f" breach {tv['breach_s']:.0f}s"
         return (f"  ↳ {p.symbol} {p.direction} ×{p.qty} | mark ₹{mark:.2f} "
                 f"(entry {p.entry:.2f}) | uPnL ₹{upnl:+.0f} ({upnl_pct:+.1f}%) | "
                 f"peak {p.peak:.2f} | stop {p.stop:.2f} (+{to_stop:.0f}%) "
-                f"target {p.target:.2f} (+{to_tgt:.0f}%) | {armed}{lock} | "
+                f"target {p.target:.2f} (+{to_tgt:.0f}%) | {armed}{lock}{tvs} | "
                 f"held {held_s:.0f}s | OIΔ {oi:+.2%}{trap}{wp}")
 
     def manage(self, ctx: TickContext, quote: dict) -> str | None:
@@ -362,11 +430,20 @@ class PositionManager:
         ask = float(quote.get("ask") or 0)
         ltp = float(quote.get("ltp") or bid or p.entry)
         mark = bid if bid > 0 else ltp
-        p.peak = max(p.peak, mark)
-        if not p.trail_armed and p.peak >= p.entry * (1 + config.TRAIL_ARM_PCT):
+        p.peak = max(p.peak, mark)              # raw peak: telemetry only
+        # v9.7.1: advance the peak-capture trail on the executable mark. The
+        # SMOOTHED high-water mark now feeds the legacy giveback ratchet and
+        # the profit lock — a single spiked bid print can no longer inflate
+        # the peak and stop the position out on the very next normal tick.
+        td = None
+        if p.trail is not None:
+            td = p.trail.update(ctx.ts, mark, regime_label=ctx.regime_label,
+                                minutes_to_close=ctx.minutes_to_close)
+        hwm = p.trail.hwm if p.trail is not None else p.peak
+        if not p.trail_armed and hwm >= p.entry * (1 + config.TRAIL_ARM_PCT):
             p.trail_armed = True
         if p.trail_armed:
-            gain = p.peak - p.entry
+            gain = hwm - p.entry
             p.stop = max(p.stop, p.entry + gain * (1 - config.TRAIL_GIVEBACK_PCT))
             # set/raise the profit-lock floor: breakeven, optionally lifted to
             # lock a fraction of the best gain. Ratchets up with the peak, never
@@ -395,17 +472,35 @@ class PositionManager:
         # 3) stale feed
         if ctx.data_age_s > config.DATA_STALE_FLATTEN_S:
             return self._exit(ctx, quote, "STALE_FEED_FLATTEN", urgent=True)
-        # 4) target — model may EXTEND it when the edge is still strong
+        # 4) target — EXTENDED, not banked, while the edge is demonstrably on.
+        # Two judges, in strict precedence:
+        #   a) trained meta P(win) (unchanged v9 semantics) when it exists;
+        #   b) HEURISTIC MODE (meta dormant, live_win_prob is None — today's
+        #      reality until META_MIN_TRAIN labels accrue): the Kaufman-ER
+        #      efficiency gate on the tape itself (core/exit_engine.ride_ok,
+        #      the same physics the entry persistence gate trusts). ER high
+        #      AND with the position AND conviction not hard against ⇒ push
+        #      the target out one expected-move increment; anything else
+        #      banks the touch exactly as before. The armed trail + profit
+        #      lock protect the gain underneath either way.
         if mark >= p.target:
+            extend, why_x = False, ""
             if (config.META_DECISION_ENABLED
-                    and ctx.live_win_prob is not None
-                    and ctx.live_win_prob >= config.META_HOLD_PAST_TARGET_P
-                    and p.extends_used < config.TARGET_EXTEND_MAX
+                    and ctx.live_win_prob is not None):
+                if ctx.live_win_prob >= config.META_HOLD_PAST_TARGET_P:
+                    extend = True
+                    why_x = (f"P(win) {ctx.live_win_prob:.2f} ≥ "
+                             f"{config.META_HOLD_PAST_TARGET_P:.2f}")
+            elif (ctx.live_win_prob is None
+                    and getattr(config, "RIDE_WINNER_ENABLED", True)):
+                extend, why_x = ride_ok(
+                    ctx.tape_er, p.direction, ctx.conviction,
+                    er_min=getattr(config, "RIDE_ER_MIN", 0.30),
+                    oppose_conv=getattr(config, "RIDE_OPPOSE_CONV", 0.35),
+                    ride_conv=getattr(config, "RIDE_CONV", 0.62))
+                why_x = f"tape: {why_x}"
+            if (extend and p.extends_used < config.TARGET_EXTEND_MAX
                     and p.trail_armed):
-                # edge says there's more in the move: push the target out by
-                # another expected-move increment and keep riding. The armed
-                # trail and the profit-lock floor protect the gain underneath,
-                # so this can never give back to a loss. Re-evaluated next tag.
                 em = expected_move(ctx.spot, ctx.atm_iv, ctx.minutes_to_close)
                 step_prem = max(p.delta_at_entry * em, p.entry * config.BASE_TP_PCT)
                 old_t = p.target
@@ -414,24 +509,93 @@ class PositionManager:
                 self._log(ts=ctx.ts, event="TARGET_EXTEND", index=self.index,
                           symbol=p.symbol, direction=p.direction,
                           price=f"{mark:.2f}",
-                          reason=f"P(win) {ctx.live_win_prob:.2f} ≥ "
-                                 f"{config.META_HOLD_PAST_TARGET_P:.2f} — riding "
+                          reason=f"{why_x} — riding "
                                  f"(#{p.extends_used}/{config.TARGET_EXTEND_MAX}), "
                                  f"target {old_t:.2f}→{p.target:.2f}, lock "
                                  f"{p.profit_lock:.2f}",
-                          conviction=f"{ctx.live_win_prob:.3f}")
+                          conviction=(f"{ctx.live_win_prob:.3f}"
+                                      if ctx.live_win_prob is not None
+                                      else f"{ctx.conviction:.3f}"))
                 # fall through: do NOT exit this tick
             else:
                 return self._exit(ctx, quote, "TARGET")
-        # 5) theta guillotine (0-DTE regime cuts faster)
+        # 4.6) PEAK-CAPTURE TRAIL — the ratchet on the SMOOTHED mark fired
+        # (dwell-confirmed breach / hard breach / stagnation-take). A flush-
+        # shaped fire (not stagnation) is shown to the TrapShield first, with
+        # the SAME fingerprints a stop breach presents: a confirmed
+        # institutional sweep is held through — the profit-lock floor and the
+        # disaster floor still bound the hold underneath.
+        if td is not None and td.exit_now:
+            if td.reason == "STAGNATION_TAKE":
+                return self._exit(ctx, quote, "STAGNATION_TAKE")
+            sig_t = TrapSignals(
+                spot_velocity_1s=ctx.spot_velocity_1s, spot=ctx.spot,
+                absorption=ctx.absorption,
+                aggressive_sell_ratio=ctx.aggressive_sell_ratio,
+                oi_delta_break=ctx.oi_delta_since,
+                premium_move_pct=(mark - p.entry) / p.entry,
+                delta_implied_move_pct=p.delta_at_entry
+                    * abs(ctx.spot - p.spike_ref_spot) / max(p.entry, 0.5),
+                spread_pct=(ask - bid) / max((ask + bid) / 2, 0.05)
+                    if ask > bid > 0 else 0.0,
+                avg_spread_pct=ctx.avg_spread_pct,
+                gex_put_wall=ctx.gex_put_wall,
+                gex_call_wall=ctx.gex_call_wall)
+            hold_t, why_t, score_t = p.shield.on_stop_breach(ctx.ts, sig_t)
+            if hold_t:
+                self._log(ts=ctx.ts, event="TRAIL_TRAP_HOLD",
+                          index=self.index, symbol=p.symbol,
+                          direction=p.direction, price=f"{mark:.2f}",
+                          reason=f"{td.reason} suspended: {why_t}",
+                          conviction=f"{score_t:.2f}")
+            else:
+                return self._exit(ctx, quote, td.reason,
+                                  urgent=td.urgent)
+        # 5) theta guillotine (0-DTE regime cuts faster). v9.7.1: a WINNER
+        # in a still-efficient trend may ride past it — the guillotine exists
+        # to stop theta bleeding on trades going NOWHERE, and 2026-07-15
+        # showed it beheading runners at minute 25 of a trend day. Bounded:
+        # hard cap at MAX_HOLD_RIDE_MULT × the limit; must be above breakeven
+        # with the trail armed; tape must be efficient WITH the position.
+        # EOD / floors / locks are untouched above this rung.
         hold_lim = config.MAX_HOLD_MINUTES_0DTE \
             if p.dte < config.EXPIRY_DTE_LT else config.MAX_HOLD_MINUTES
         if (ctx.ts - p.entry_ts) / 60.0 > hold_lim:
-            return self._exit(ctx, quote, "MAX_HOLD_THETA")
-        # 6) conviction reversal
+            ride, why_r = False, ""
+            if (getattr(config, "RIDE_WINNER_ENABLED", True)
+                    and p.trail_armed and mark > p.breakeven_px
+                    and (ctx.ts - p.entry_ts) / 60.0
+                    <= hold_lim * getattr(config, "MAX_HOLD_RIDE_MULT", 2.0)):
+                ride, why_r = ride_ok(
+                    ctx.tape_er, p.direction, ctx.conviction,
+                    er_min=getattr(config, "RIDE_ER_MIN", 0.30),
+                    oppose_conv=getattr(config, "RIDE_OPPOSE_CONV", 0.35),
+                    ride_conv=getattr(config, "RIDE_CONV", 0.62))
+            if not ride:
+                return self._exit(ctx, quote, "MAX_HOLD_THETA")
+            if p.theta_rides == 0:
+                p.theta_rides = 1
+                self._log(ts=ctx.ts, event="THETA_RIDE", index=self.index,
+                          symbol=p.symbol, direction=p.direction,
+                          price=f"{mark:.2f}",
+                          reason=f"past {hold_lim:.0f}m guillotine — {why_r}; "
+                                 f"hard cap "
+                                 f"{hold_lim * getattr(config, 'MAX_HOLD_RIDE_MULT', 2.0):.0f}m, "
+                                 f"lock {p.profit_lock:.2f}",
+                          conviction=f"{ctx.conviction:.3f}")
+        # 6) conviction reversal — SUSTAINED, not one tick. The entry side
+        # has always demanded a persistent read; the exit side dumped a
+        # winner on a single flicker of the fused signal. REVERSAL_CONFIRM_S
+        # gives the exit the same dignity (0 restores the legacy behavior).
         flip = -ctx.conviction if p.direction == "CE" else ctx.conviction
         if flip >= config.ENTRY_CONVICTION:
-            return self._exit(ctx, quote, "CONVICTION_REVERSAL")
+            if p.reversal_since <= 0.0:
+                p.reversal_since = ctx.ts
+            if (ctx.ts - p.reversal_since
+                    >= getattr(config, "REVERSAL_CONFIRM_S", 20.0)):
+                return self._exit(ctx, quote, "CONVICTION_REVERSAL")
+        else:
+            p.reversal_since = 0.0
         # 6.5) MODEL-SHAPED EXIT — only when a trained meta-model is live. If the
         # model's fresh P(win) for THIS position's direction has decayed below the
         # floor, the edge is gone: exit early. This sits BELOW the disaster floor,

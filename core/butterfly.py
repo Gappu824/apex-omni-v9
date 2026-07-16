@@ -49,6 +49,7 @@ from pathlib import Path
 
 import config
 from core.execution_engine import round_trip_costs
+from core.exit_engine import PeakCaptureTrail, TrailParams
 from core.shortvol import log_forward         # reuse the shared forward log
 
 
@@ -65,7 +66,29 @@ def fly_knob_hash() -> str:
         config.SV_FLY_SL_FRAC, config.SV_IVRANK_MIN,
         config.SV_NET_GEX_MIN, config.SV_CORRIDOR_MIN_STEPS,
         config.SV_WALL_BUFFER_STEPS, config.SV_DTE_MIN, config.SV_DTE_MAX,
-        config.SV_RISK_PCT))
+        config.SV_RISK_PCT,
+        # v9.7.1 peak-capture exit policy — a NEW exit rule is a NEW
+        # hypothesis (Bailey–LdP): changing any of these fails the existing
+        # certificate closed until tools/butterfly_harness.py re-passes.
+        # (DISP_* knobs are deliberately ABSENT: displacement is a
+        #  portfolio-level decision; the harness EXCLUDES why=DISPLACED
+        #  forward rows instead of fingerprinting the governor here.)
+        getattr(config, "SV_FLY_SL_HARD_FRAC", 0.65),
+        getattr(config, "FLY_STOP_CONFIRM_S", 45.0),
+        getattr(config, "FLY_TRAIL_ARM_FRAC", 0.20),
+        getattr(config, "FLY_GIVE_FRAC", 0.30),
+        getattr(config, "FLY_GIVE_FLOOR_FRAC", 0.20),
+        getattr(config, "FLY_K_SIGMA", 3.0),
+        getattr(config, "FLY_MARK_EMA_HL_S", 25.0),
+        getattr(config, "FLY_SIGMA_PRIOR_FRAC", 0.05),
+        getattr(config, "FLY_EXIT_CONFIRM_S", 45.0),
+        getattr(config, "FLY_HARD_BREACH_MULT", 2.5),
+        getattr(config, "FLY_STAGNATION_S", 900.0),
+        getattr(config, "FLY_THETA_TIGHTEN_MIN_LEFT", 60.0),
+        getattr(config, "FLY_THETA_TIGHTEN_MIN", 0.40),
+        getattr(config, "FLY_RIDE_ENABLED", True),
+        getattr(config, "FLY_PIN_LOSS_WING_FRAC", 1.00),
+        getattr(config, "FLY_PIN_LOSS_CONFIRM_S", 60.0)))
     return _hashlib.sha1(payload.encode()).hexdigest()[:10]
 
 
@@ -191,10 +214,36 @@ class OpenFly:
     pop: float
     mode: str
     max_loss: float = field(init=False)
+    # ---- v9.7.1 peak-capture exit state (deterministic, replay-identical) --
+    trail: object = None            # PeakCaptureTrail over the unwind credit
+    tgt_tagged: bool = False        # smoothed credit reached the TP line once
+    stop_breach_since: float = 0.0  # dwell clock: smoothed cc under the stop
+    pin_lost_since: float = 0.0     # dwell clock: spot outside the wings
 
     def __post_init__(self):
         # a long fly's max loss is exactly the debit paid × qty
         self.max_loss = self.debit * self.spec.lot * self.lots
+
+    def ensure_trail(self, ts: float) -> "PeakCaptureTrail":
+        if self.trail is None:
+            self.trail = PeakCaptureTrail(self.debit, ts, TrailParams(
+                arm_frac=getattr(config, "FLY_TRAIL_ARM_FRAC", 0.20),
+                give_frac_trend=getattr(config, "FLY_GIVE_FRAC", 0.30),
+                give_frac_chop=getattr(config, "FLY_GIVE_FRAC", 0.30),
+                k_sigma=getattr(config, "FLY_K_SIGMA", 3.0),
+                give_floor_frac=getattr(config, "FLY_GIVE_FLOOR_FRAC", 0.20),
+                ema_hl_s=getattr(config, "FLY_MARK_EMA_HL_S", 25.0),
+                sigma_prior_frac=getattr(config, "FLY_SIGMA_PRIOR_FRAC", 0.05),
+                confirm_s=getattr(config, "FLY_EXIT_CONFIRM_S", 45.0),
+                hard_mult=getattr(config, "FLY_HARD_BREACH_MULT", 2.5),
+                stagnation_s=getattr(config, "FLY_STAGNATION_S", 900.0),
+                tighten_min_left=getattr(config, "FLY_THETA_TIGHTEN_MIN_LEFT",
+                                         60.0),
+                tighten_floor=getattr(config, "FLY_THETA_TIGHTEN_MIN", 0.40),
+                # a fly is a theta structure: a stalled armed winner is
+                # banked in ANY regime, not just labeled chop
+                chop_labels=("*",)))
+        return self.trail
 
 
 def build_fly(index: str, side: str, strike_step: float,
@@ -360,6 +409,14 @@ class FlyBook:
         # loss floor is total debit (cc → 0); how far down we are
         to_floor = ((fp.debit - cc) / max(fp.debit, 1e-9)) * 100
         dist_body = abs(spot - fp.spec.body_k)
+        # v9.7.1 trail vitals — READ-ONLY here (the trail advances only in
+        # manage(); mark() stays side-effect-free per its contract). Smoothed
+        # progress is what the heartbeat and the DisplacementGovernor consume
+        # so a single raw quote-print can neither protect nor doom the fly.
+        tv = fp.trail.vitals() if fp.trail is not None else None
+        smooth = tv["ema"] if tv else cc
+        prog_smooth = ((smooth - fp.debit)
+                       / max(tgt_credit - fp.debit, 1e-9)) * 100
         return {"fly_id": fp.fly_id, "index": fp.spec.index,
                 "side": fp.spec.side, "body_k": fp.spec.body_k,
                 "wing_in_k": fp.spec.wing_in_k,
@@ -374,37 +431,140 @@ class FlyBook:
                 "to_floor_pct": round(to_floor, 0),
                 "dist_from_body": round(dist_body, 0),
                 "held_s": int(ts - fp.open_ts), "live_quote": live,
-                "mode": fp.mode, "max_loss": fp.max_loss}
+                "mode": fp.mode, "max_loss": fp.max_loss,
+                "cc_smooth": round(smooth, 2),
+                "progress_smooth_pct": round(prog_smooth, 0),
+                "pin_frac": round(dist_body / max(fp.spec.wing_width, 1e-9),
+                                  2),
+                "trail": tv, "tgt_tagged": fp.tgt_tagged}
 
     # ------------------------------------------------------- manage / close
+    @staticmethod
+    def _mins_to_close(hm: str) -> float:
+        """Minutes from hm to SV_CLOSE_HM (theta-clock for the trail)."""
+        try:
+            h1, m1 = (int(x) for x in hm.split(":"))
+            h2, m2 = (int(x) for x in config.SV_CLOSE_HM.split(":"))
+            return max(float((h2 * 60 + m2) - (h1 * 60 + m1)), 0.0)
+        except Exception:                                 # noqa: BLE001
+            return 60.0
+
     def manage(self, *, ts: float, hm: str, spot: float, quotes: dict,
                cascade_event: bool) -> dict | None:
         """Every-tick exit engine (buy-only; no live short unwind path).
-        Exits on: cascade veto, hard-flat time, profit target hit, or the
-        debit-fraction stop. Returns a close row when it exits."""
+
+        v9.7.1 exit ladder, strictly in this order (constitution first):
+          1. CASCADE_VETO / TIME_FLAT      — unchanged, unconditional.
+          2. PIN_LOST                      — spot has SAT outside the wings
+             for a confirmed dwell: the pin thesis is dead, salvage the
+             remaining credit instead of riding the structure to zero.
+          3. STOP_HARD                     — SMOOTHED credit through the hard
+             floor: fire now (waterfall escape; waiting is how −50% becomes
+             −100% of debit).
+          4. STOP                          — smoothed credit under the normal
+             stop, SUSTAINED for FLY_STOP_CONFIRM_S. The 2026-07-15 telemetry
+             showed the raw four-leg unwind mark bouncing ±8% of the debit
+             per minute on a still spot — a single wide-quote print may no
+             longer stop the structure out at the worst mark of the day.
+          5. TARGET / ride                 — at the TP line: bank it exactly
+             as before when FLY_RIDE_ENABLED is off; otherwise tag it and
+             let the peak-capture ratchet own the exit (TARGET_TRAIL), so a
+             fly grinding toward max value is no longer sold at first touch.
+          6. Trail decisions               — dwell-confirmed ratchet breach /
+             hard breach / stagnation-take from core/exit_engine (the same
+             engine, science and literature the long book now uses).
+        Returns a close row when it exits."""
         fp = self.pos
         if fp is None:
             return None
         wi, bd, wo = self._legs_from(fp.spec, quotes)
         wib, ba, wob = (float(wi.get("bid") or 0), float(bd.get("ask") or 0),
                         float(wo.get("bid") or 0))
+        live = wib > 0 and ba > 0 and wob > 0
         why = None
-        cc = None
+        urgent = False
         if cascade_event:
             why = "CASCADE_VETO"
         elif hm >= config.SV_CLOSE_HM:
             why = "TIME_FLAT"
-        elif wib > 0 and ba > 0 and wob > 0:
+        elif live:
             cc = fly_close_credit(wing_in_bid=wib, body_ask=ba,
                                   wing_out_bid=wob)
+            tr = fp.ensure_trail(ts)
+            td = tr.update(ts, cc,
+                           minutes_to_close=self._mins_to_close(hm))
+            smooth = tr.ema
             maxv = fly_max_value(fp.spec.wing_width)
             tgt = fp.debit + config.SV_FLY_TP_FRAC * (maxv - fp.debit)
-            if cc >= tgt:
-                why = "TARGET"
-            elif cc <= fp.debit * (1.0 - config.SV_FLY_SL_FRAC):
-                why = "STOP"
+            # ---- 2. PIN_LOST: the wall thesis is falsified by the tape ----
+            pin_frac = getattr(config, "FLY_PIN_LOSS_WING_FRAC", 1.00)
+            if abs(spot - fp.spec.body_k) >= fp.spec.wing_width * pin_frac:
+                if fp.pin_lost_since <= 0.0:
+                    fp.pin_lost_since = ts
+                elif ts - fp.pin_lost_since >= getattr(
+                        config, "FLY_PIN_LOSS_CONFIRM_S", 60.0):
+                    why = "PIN_LOST"
+            else:
+                fp.pin_lost_since = 0.0
+            # ---- 3./4. loss side on the SMOOTHED mark, dwell-confirmed ----
+            if why is None:
+                hard = fp.debit * (1.0 - getattr(config,
+                                                 "SV_FLY_SL_HARD_FRAC", 0.65))
+                stop = fp.debit * (1.0 - config.SV_FLY_SL_FRAC)
+                if smooth <= hard:
+                    why, urgent = "STOP_HARD", True
+                elif smooth <= stop:
+                    if fp.stop_breach_since <= 0.0:
+                        fp.stop_breach_since = ts
+                    elif ts - fp.stop_breach_since >= getattr(
+                            config, "FLY_STOP_CONFIRM_S", 45.0):
+                        why = "STOP"
+                else:
+                    fp.stop_breach_since = 0.0
+            # ---- 5. target: bank (legacy) or tag-and-ride -----------------
+            if why is None and smooth >= tgt:
+                if not getattr(config, "FLY_RIDE_ENABLED", True):
+                    why = "TARGET"
+                elif not fp.tgt_tagged:
+                    fp.tgt_tagged = True
+                    tr.armed = True            # ratchet owns the exit now
+                    self._row("FLY_TARGET_TAGGED", fp, ts,
+                              reason=f"smoothed credit {smooth:.2f} ≥ tgt "
+                                     f"{tgt:.2f} — riding toward max value "
+                                     f"{maxv:.0f} behind the ratchet")
+            # ---- 6. peak-capture trail decisions --------------------------
+            if why is None and td.exit_now:
+                urgent = td.urgent
+                why = ("TARGET_TRAIL" if fp.tgt_tagged
+                       else "STAGNATION_TAKE"
+                       if td.reason == "STAGNATION_TAKE" else "TRAIL_TAKE")
         if why is None:
             return None
+        return self._close(fp, ts=ts, hm=hm, why=why,
+                           wib=wib, ba=ba, wob=wob, urgent=urgent)
+
+    def close_now(self, *, ts: float, hm: str, quotes: dict,
+                  reason: str) -> dict | None:
+        """Force-close at the current executable unwind — the ONLY path the
+        DisplacementGovernor may use. Same accounting, ledger, risk-governor
+        and forward-log treatment as any other exit; the reason string starts
+        with DISPLACED so the butterfly harness can EXCLUDE these censored
+        rows from the fly's certificate blend."""
+        fp = self.pos
+        if fp is None:
+            return None
+        wi, bd, wo = self._legs_from(fp.spec, quotes)
+        wib, ba, wob = (float(wi.get("bid") or 0), float(bd.get("ask") or 0),
+                        float(wo.get("bid") or 0))
+        return self._close(fp, ts=ts, hm=hm, why=reason,
+                           wib=wib, ba=ba, wob=wob, urgent=True)
+
+    def _close(self, fp: OpenFly, *, ts: float, hm: str, why: str,
+               wib: float, ba: float, wob: float,
+               urgent: bool = False) -> dict:
+        """Shared unwind tail (verbatim economics of the v9.7 close): resolve
+        the executable credit, four-leg costs, risk release, ledger + forward
+        rows, book reset."""
         # resolve the executable unwind (dead book → worthless, full debit loss)
         if not (wib > 0 and ba > 0 and wob > 0):
             wib = wob = 0.05
@@ -425,7 +585,8 @@ class FlyBook:
         row = {"fly_id": fp.fly_id, "index": fp.spec.index,
                "side": fp.spec.side, "why": why, "pnl": round(pnl, 2),
                "debit": round(fp.debit, 2), "close_credit": round(cc, 2),
-               "hold_s": int(ts - fp.open_ts), "hm": hm, "mode": fp.mode}
+               "hold_s": int(ts - fp.open_ts), "hm": hm, "mode": fp.mode,
+               "urgent": urgent}
         self.pos = None
         self.closed_today += 1
         return row

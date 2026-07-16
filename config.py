@@ -797,6 +797,16 @@ CASCADE_CERT_CI         = 0.90    # …with bootstrap CI lower bound of mean
 # exists to justify it.
 SHORTVOL_ENABLED        = True    # master switch; inert without cert/explore
 SHORTVOL_PAPER_EXPLORE  = True    # paper-only entries pre-cert (never live)
+# ---- MASTER FLY TRADING SWITCH (v9.7.1) ----
+# Operator instruction: the butterfly does NOT take positions — not live, not
+# paper. Its GATE still evaluates every second and feeds core/fly_intel (the
+# fly's read is mined to improve DIRECTIONAL trades); this switch governs only
+# whether a fly is ever OPENED. False (default) ⇒ the fly is pure telemetry,
+# never occupies the global single-position lock, so directional capital is
+# always free and the displacement governor is moot. Set True only to bring
+# back the paper-explore fly engine (it still cannot route live — that path is
+# unbuilt regardless).
+FLY_TRADING_ENABLED     = False
 SV_IVRANK_MIN           = 0.60    # premium must be RICH vs its own 60-day range
 SV_NET_GEX_MIN          = 1.0e12  # dealers must be LONG gamma (damping regime)
 SV_WALL_BUFFER_STEPS    = 1.0     # spot must sit ≥ this many strike-steps
@@ -858,6 +868,130 @@ FORGE_TRAIN_SAC     = False   # v10.2 default: the directional thesis was
                               # FALSIFIED — training it nightly bought hours
                               # and no edge. Exams/counterfactual still run;
                               # meta/heur exam/counterfactual/drift still run
+
+
+# ----------------------------------------------------------------------------
+# v9.7.1 — PEAK-CAPTURE EXITS + DISPLACEMENT (2026-07-15 live-evidence fixes)
+# ----------------------------------------------------------------------------
+# Three coordinated behaviors (core/exit_engine.py, core/displacement.py):
+#   1. Winners are ridden while the tape is efficient and exited off a
+#      SMOOTHED, dwell-confirmed chandelier ratchet — not banked at the first
+#      touch of a runway-anchored target ("jackpot exited early" fix).
+#   2. The fly's TP/SL run on the smoothed unwind credit with dwell — the
+#      raw four-leg mark was bouncing ±8% of the debit per minute on a still
+#      spot; one wide print can no longer be an exit.
+#   3. The v10.1 global lock stays, but a fly can be DISPLACED by a strictly
+#      better, sustained directional candidate (or a cascade on either
+#      index) through core/displacement.py — every grant/refusal is named.
+# ALL knobs below are trade-management/portfolio policy: hash-EXCLUDED (the
+# feature/label world is untouched, so no re-forge). The FLY exit knobs are
+# instead fingerprinted by core/butterfly.fly_knob_hash — changing them fails
+# the butterfly certificate closed until tools/butterfly_harness.py re-passes
+# (Bailey–LdP: a new exit rule is a new hypothesis).
+
+# ---- long book: efficiency-gated ride (heuristic mode; meta wins if trained)
+RIDE_WINNER_ENABLED     = True    # master switch — False restores v9.7 exits
+RIDE_ER_MIN             = 0.30    # Kaufman ER over the ride window to extend.
+#                                   Calibration: per-SECOND index ER during a
+#                                   genuine trend (drift μ, tick vol σ) is
+#                                   ≈ μ/E|N(μ,σ)| — a −450pt/20min SENSEX
+#                                   break at σ≈1.5/s reads ~0.30, which is
+#                                   exactly the bar the entry persistence
+#                                   gate already trusts (SIGNAL_PERSIST_ER_
+#                                   MIN=0.30). 0.55 is unreachable at 1 s
+#                                   granularity and would silently disable
+#                                   the ride.
+RIDE_ER_WINDOW_S        = 120     # per-second spots in the signed-ER window
+RIDE_OPPOSE_CONV        = 0.35    # conviction this far AGAINST kills the ride
+RIDE_CONV               = 0.62
+
+# ----------------------------------------------------------------------------
+# FLY INTELLIGENCE (v9.7.1) — the pin engine's read, mined for the DIRECTIONAL
+# book instead of expressed as a trade. core/fly_intel.py translates a granted
+# butterfly gate (positive-gamma + rich-IV + inside-corridor = a pinning /
+# mean-reverting regime) into: (1) a logit-space conviction modulation that
+# DAMPENS momentum INTO the near wall and BOOSTS a read trading away/with the
+# fade; (2) a regime-conditional shrink of the directional target's wall
+# runway; (3) a mean-reversion entry hint when spot is pressed at a corridor
+# edge. All ADVISORY (scale-never-veto), neutral whenever the gate isn't
+# granting, and hash-EXCLUDED (they change WHEN/HOW a directional entry fires
+# and where its target sits — no feature or triple-barrier LABEL — so tuning
+# never forces a re-forge). Validate on the vault with tools/fly_intel_report.py.
+FLY_INTEL_ENABLED         = True   # master switch (False = the fly read is
+#                                    telemetry only; no directional effect)
+FLY_INTEL_MODULATE_CONV   = True   # product 1: conv dampen/boost
+FLY_INTEL_TARGET_CAP      = True   # product 2: shrink the directional runway
+FLY_INTEL_REVERT_HINT     = True   # product 3: surface the fade-to-pin hint
+FLY_INTEL_MAX_DAMP        = 0.45   # deepest conv dampening INTO a near wall
+#                                    (calibrated: a DEEP pin at the wall can
+#                                    push a borderline breakout signal below
+#                                    the entry bar; mild pins stay tradeable)
+FLY_INTEL_MAX_BOOST       = 0.15   # strongest conv boost trading away/with fade
+FLY_INTEL_RUNWAY_MULT_FLOOR = 0.45 # tightest target-runway multiplier at max pin
+FLY_INTEL_EDGE_STEPS      = 0.75   # spot within this many steps of a wall = edge
+FLY_INTEL_GEX_LOG_SCALE   = 0.5    # log10(netGEX/threshold) scale in pin pressure
+    # |conv| ≥ this WITH the position rides even
+#                                   when the tape ER is choppy-but-real: a
+#                                   sustained −0.70 read into a wall IS the
+#                                   directional edge (a −450-pt breakdown with
+#                                   realistic per-second noise nets ER≈0.25–
+#                                   0.35 < RIDE_ER_MIN, yet is the jackpot the
+#                                   operator must not exit early). Tape-against
+#                                   and hard-oppose vetoes still bind.
+
+# ---- long book: peak-capture trail (core/exit_engine.PeakCaptureTrail)
+EXIT_MARK_EMA_HL_S      = 6.0     # mark-smoothing half-life (kills bid bounce)
+EXIT_SIGMA_PRIOR_FRAC   = 0.02    # σ̂ warm-start = entry × this
+EXIT_K_SIGMA            = 3.0     # giveback ≥ k · σ̂ (tick-noise floor)
+EXIT_GIVE_FLOOR_FRAC    = 0.12    # …and ≥ this × entry (pullback floor)
+EXIT_GIVE_FRAC_TREND    = 0.25    # …and ≥ this × peak gain in momentum tape
+EXIT_GIVE_FRAC_CHOP     = 0.15    # tighter in labeled chop (Kaminski–Lo 2014)
+EXIT_CONFIRM_S          = 20.0    # ratchet breach must SUSTAIN this long.
+#                                   A W-second flush wick keeps the SMOOTHED
+#                                   mark under the ratchet for ≈ W + 1.2×EMA
+#                                   half-life (recovery lag), so 20 s covers
+#                                   the common 5–15 s hunt-wick class; longer
+#                                   sweeps are the TrapShield's case (every
+#                                   trail fire is shield-gated in the book).
+EXIT_HARD_BREACH_MULT   = 2.5     # breach ≥ this × giveback ⇒ fire now
+EXIT_STAGNATION_S       = 420.0   # armed + chop + no new HWM this long ⇒ bank
+EXIT_THETA_TIGHTEN_MIN_LEFT = 75.0  # tighten the trail inside this many mins
+EXIT_THETA_TIGHTEN_MIN  = 0.40    # …down to this multiplier at the close
+REVERSAL_CONFIRM_S      = 20.0    # conviction-reversal exit must sustain (0 = legacy one-tick)
+MAX_HOLD_RIDE_MULT      = 2.0     # theta guillotine hard cap while riding
+
+# ---- fly book: smoothed / dwell-confirmed exits (fingerprinted in
+#      core/butterfly.fly_knob_hash — the certificate's invalidation channel)
+SV_FLY_SL_HARD_FRAC     = 0.65    # smoothed cc ≤ debit×(1−this) ⇒ fire NOW
+FLY_STOP_CONFIRM_S      = 45.0    # normal stop breach must sustain this long
+FLY_TRAIL_ARM_FRAC      = 0.20    # arm the ratchet once cc ≥ debit×(1+this)
+FLY_GIVE_FRAC           = 0.30    # giveback ≤ this × peak gain
+FLY_GIVE_FLOOR_FRAC     = 0.20    # …and ≥ this × debit (pullback floor)
+FLY_K_SIGMA             = 3.0     # …and ≥ k · σ̂ of the four-leg mark noise
+FLY_MARK_EMA_HL_S       = 25.0    # 4-leg conservative mark ⇒ heavier smoothing
+FLY_SIGMA_PRIOR_FRAC    = 0.05    # σ̂ warm-start (live 2026-07-15: ~6%/min)
+FLY_EXIT_CONFIRM_S      = 45.0    # ratchet breach dwell
+FLY_HARD_BREACH_MULT    = 2.5     # waterfall escape multiple
+FLY_STAGNATION_S        = 900.0   # armed + no new HWM 15 min ⇒ bank (any regime)
+FLY_THETA_TIGHTEN_MIN_LEFT = 60.0 # tighten inside this many mins of SV_CLOSE_HM
+FLY_THETA_TIGHTEN_MIN   = 0.40
+FLY_RIDE_ENABLED        = True    # False ⇒ bank at SV_FLY_TP_FRAC exactly as v9.7
+FLY_PIN_LOSS_WING_FRAC  = 1.00    # spot ≥ this × wing width from the body …
+FLY_PIN_LOSS_CONFIRM_S  = 60.0    # … sustained this long ⇒ thesis dead, salvage
+
+# ---- displacement governor (core/displacement.py — portfolio policy)
+DISP_ENABLED            = True    # master switch — False restores the blind lock
+DISP_MAX_PER_DAY        = 2       # rotation is a scalpel; churn eats 4-leg costs
+DISP_COOLDOWN_S         = 900.0   # between displacements
+FLY_MIN_HOLD_BEFORE_DISP_S = 600.0  # the pin thesis gets its fair chance
+DISP_MIN_MINUTES_LEFT   = 45.0    # freed capital must have session to work
+DISP_CONV_MARGIN        = 0.10    # candidate must clear entry bar + this
+DISP_CONV_MARGIN_STRONG = 0.20    # …when the fly is pinning AND green
+DISP_ER_MIN             = 0.30    # signed tape ER must agree at least this
+#                                   hard (same per-second calibration as
+#                                   RIDE_ER_MIN / SIGNAL_PERSIST_ER_MIN)
+DISP_CAND_SUSTAIN_S     = 20.0    # the qualifying read must hold this long
+DISP_FLY_PROGRESS_MAX   = 0.60    # never displace a fly ≥60% of the way to TP
 
 # ============================================================================
 # CONFIG_HASH — model/feature fingerprint (computed last, sees all constants)
@@ -952,7 +1086,8 @@ _HASH_EXCLUDE = frozenset({
     # short-vol engine (v9.3): trigger/exit knobs change no feature or label
     # of the main system; the shortvol CERTIFICATE fingerprints them all —
     # tuning invalidates the cert, never forces a re-forge
-    "SHORTVOL_ENABLED", "SHORTVOL_PAPER_EXPLORE", "SV_IVRANK_MIN",
+    "SHORTVOL_ENABLED", "SHORTVOL_PAPER_EXPLORE", "FLY_TRADING_ENABLED",
+    "SV_IVRANK_MIN",
     "SV_NET_GEX_MIN", "SV_WALL_BUFFER_STEPS", "SV_CORRIDOR_MIN_STEPS",
     "SV_DTE_MIN", "SV_DTE_MAX", "SV_AFTER_HM", "SV_WIDTH_STEPS",
     "SV_MIN_CREDIT_FRAC", "SV_TP_FRAC", "SV_SL_CREDIT_MULT", "SV_TOUCH_EXIT",
@@ -966,6 +1101,31 @@ _HASH_EXCLUDE = frozenset({
     "FORGE_TRAIN_SAC",
     "HARNESS_MAX_DAYS", "META_TRAIN_MAX_DAYS",
     "SV_CERT_MIN_EVENTS", "SV_CERT_MIN_DAYS", "SV_CERT_CI",
+    # v9.7.1 peak-capture exits + displacement: trade-management / portfolio
+    # policy only — no feature or label of the main system changes, so none
+    # of these force a re-forge. The FLY exit knobs invalidate through
+    # core/butterfly.fly_knob_hash (certificate channel) instead; the
+    # displacement knobs are logged verbatim on every DISPLACE ledger row.
+    "RIDE_WINNER_ENABLED", "RIDE_ER_MIN", "RIDE_ER_WINDOW_S",
+    "RIDE_OPPOSE_CONV", "RIDE_CONV",
+    "FLY_INTEL_ENABLED", "FLY_INTEL_MODULATE_CONV", "FLY_INTEL_TARGET_CAP",
+    "FLY_INTEL_REVERT_HINT", "FLY_INTEL_MAX_DAMP", "FLY_INTEL_MAX_BOOST",
+    "FLY_INTEL_RUNWAY_MULT_FLOOR", "FLY_INTEL_EDGE_STEPS", "FLY_INTEL_GEX_LOG_SCALE",
+    "EXIT_MARK_EMA_HL_S", "EXIT_SIGMA_PRIOR_FRAC", "EXIT_K_SIGMA",
+    "EXIT_GIVE_FLOOR_FRAC", "EXIT_GIVE_FRAC_TREND", "EXIT_GIVE_FRAC_CHOP",
+    "EXIT_CONFIRM_S", "EXIT_HARD_BREACH_MULT", "EXIT_STAGNATION_S",
+    "EXIT_THETA_TIGHTEN_MIN_LEFT", "EXIT_THETA_TIGHTEN_MIN",
+    "REVERSAL_CONFIRM_S", "MAX_HOLD_RIDE_MULT",
+    "SV_FLY_SL_HARD_FRAC", "FLY_STOP_CONFIRM_S", "FLY_TRAIL_ARM_FRAC",
+    "FLY_GIVE_FRAC", "FLY_GIVE_FLOOR_FRAC", "FLY_K_SIGMA",
+    "FLY_MARK_EMA_HL_S", "FLY_SIGMA_PRIOR_FRAC", "FLY_EXIT_CONFIRM_S",
+    "FLY_HARD_BREACH_MULT", "FLY_STAGNATION_S",
+    "FLY_THETA_TIGHTEN_MIN_LEFT", "FLY_THETA_TIGHTEN_MIN",
+    "FLY_RIDE_ENABLED", "FLY_PIN_LOSS_WING_FRAC", "FLY_PIN_LOSS_CONFIRM_S",
+    "DISP_ENABLED", "DISP_MAX_PER_DAY", "DISP_COOLDOWN_S",
+    "FLY_MIN_HOLD_BEFORE_DISP_S", "DISP_MIN_MINUTES_LEFT",
+    "DISP_CONV_MARGIN", "DISP_CONV_MARGIN_STRONG", "DISP_ER_MIN",
+    "DISP_CAND_SUSTAIN_S", "DISP_FLY_PROGRESS_MAX",
 })
 
 # names ending in any of these are filesystem locations / log toggles → excluded
