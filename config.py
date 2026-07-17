@@ -930,6 +930,69 @@ FLY_INTEL_MAX_BOOST       = 0.15   # strongest conv boost trading away/with fade
 FLY_INTEL_RUNWAY_MULT_FLOOR = 0.45 # tightest target-runway multiplier at max pin
 FLY_INTEL_EDGE_STEPS      = 0.75   # spot within this many steps of a wall = edge
 FLY_INTEL_GEX_LOG_SCALE   = 0.5    # log10(netGEX/threshold) scale in pin pressure
+# ---- polarity (the vault decides the SIGN; ships at 0 = neutral) ----
+FLY_INTEL_USE_POLARITY    = True   # read the vault-measured sign artifact
+FLY_INTEL_POLARITY_PATH   = None   # default: LOG_DIR/fly_intel_polarity.json
+FLY_INTEL_MIN_EVENT_DAYS  = 8      # min granted-days before a sign is trusted
+FLY_INTEL_MIN_SECONDS     = 20000  # min granted-seconds before a sign is trusted
+# ---- retest-survival entry filter (the BankNifty trap-killer; polarity-agnostic)
+FLY_INTEL_RETEST_FILTER   = True   # require a sustained hold at the wall before
+#                                    arming a wall-break directional entry
+FLY_INTEL_RETEST_ARM_S    = 20.0   # base arm-delay seconds (scaled by pin)
+
+# ============================================================================
+# CASCADE EXIT & SMART LOCKOUT (v9.7.1) — core/cascade_exit.py
+# The 2026-07-16 SENSEX jackpot that got away: three short-gamma PE triggers,
+# two whipsaw-stopped, the third (strongest) blocked by a blunt post-loss
+# lockout. Fix: (A) widen the stop for short-gamma cascade violence so the
+# retest wick doesn't pick us off; (B) let a STRONGER, still-aligned cascade
+# re-trigger bypass the lockout (trend continuation ≠ revenge). All hash-
+# excluded (stop WIDTH + lockout TEMPO for cascade trades; no feature/label).
+# ---- Part A: cascade-aware stop width ----
+CASCADE_STOP_MULT_BASE  = 1.5    # base widening for any short-gamma cascade entry
+CASCADE_STOP_K_DEPTH    = 0.35   # extra per unit of log10(|netGEX|/threshold)
+CASCADE_STOP_K_Z        = 0.25   # extra per unit of |z| beyond the trigger floor
+CASCADE_STOP_MULT_MAX   = 2.5    # hard ceiling (disaster floor still binds under)
+CASCADE_Z_FLOOR         = 2.0    # |z| baseline the K_Z term measures beyond
+# ---- Part B: smart post-loss lockout ----
+SMART_LOCKOUT_ENABLED     = True   # allow strengthening-trend cascade re-entry
+LOCKOUT_BYPASS_MAX_PER_DAY = 3     # cap on lockout bypasses per session
+LOCKOUT_BYPASS_COOLDOWN_S  = 60.0  # min seconds between bypasses
+LOCKOUT_BYPASS_Z_MARGIN    = 0.30  # re-trigger |z| must beat the losing |z| by this
+
+# ============================================================================
+# ORDER-FLOW TOXICITY & TRAP DETECTION (v9.7.1) — core/order_flow.py
+# VPIN/OFI-based entry filter (Easley-Lopez de Prado-O'Hara 2012; Cont-Kukanov-
+# Stoikov 2014). Blocks chasing INTO adverse informed flow / engineered sweeps.
+# ADVISORY (raises the bar only). All thresholds SELF-CALIBRATE nightly from the
+# vault (tools/toxicity_report.py writes logs/toxicity_calib.json). Hash-
+# excluded (entry TEMPO/quality — no feature/label the forge trains on).
+TOXICITY_GATE_ENABLED   = True   # master switch for the entry trap filter
+TOX_BUCKET_VOLUME       = 5000.0 # volume-clock bucket size (VPIN); calibrated
+TOX_NUM_BUCKETS         = 50     # rolling buckets for the VPIN average
+TOX_MIN_BUCKETS         = 10     # min buckets before toxicity is trusted
+TOX_HIGH                = 0.40   # "high toxicity" flag threshold (calibrated)
+TOX_BLOCK               = 0.55   # block a CHASE against flow above this (calib)
+TOX_SWING_LOOKBACK_S    = 180    # window for swing-pivot detection
+TOX_PIVOT_HOLD_S        = 30     # a level must stand this long to be a pivot
+TOX_PIVOT_SETTLE_S      = 5      # exclude the last N ticks from pivot definition
+TOX_SWEEP_BUFFER_FRAC   = 0.10   # pierce depth (× strike step) to count a sweep
+TOX_VOL_BASE_S          = 300    # rolling volume baseline for absorption z
+TOX_ABSORB_VOL_Z        = 2.0    # volume z-score for absorption (calibrated)
+TOX_ABSORB_MOVE_FRAC    = 0.25   # …with price move < this × strike step
+TOX_SWEEP_FADE_OK       = True   # allow the post-sweep reversal entry
+
+# ---- dynamic levels + calibration loader (core/calibration.py) ----
+USE_CALIBRATION         = True   # read logs/calibration.json (hot-reloaded)
+CALIBRATION_PATH        = None   # default: LOG_DIR/calibration.json
+CALIB_MIN_TICKS         = 20000  # min per-index ticks before a value is trusted
+DYNAMIC_LEVELS_ENABLED  = True   # vol-scaled initial stop/target (else fixed %)
+DYN_LEVEL_HORIZON_CAP_MIN = 15.0 # cap the √t horizon scaling
+DYN_LEVEL_RR            = 1.6     # target = RR × stop (asymmetric payoff)
+DYN_SL_MIN              = 0.12    # rails: stop can't be tighter than this
+DYN_SL_MAX              = 0.45    #        …or wider than this
+DYN_TP_MIN              = 0.18    #        target rails
+DYN_TP_MAX              = 1.20
     # |conv| ≥ this WITH the position rides even
 #                                   when the tape ER is choppy-but-real: a
 #                                   sustained −0.70 read into a wall IS the
@@ -1111,6 +1174,19 @@ _HASH_EXCLUDE = frozenset({
     "FLY_INTEL_ENABLED", "FLY_INTEL_MODULATE_CONV", "FLY_INTEL_TARGET_CAP",
     "FLY_INTEL_REVERT_HINT", "FLY_INTEL_MAX_DAMP", "FLY_INTEL_MAX_BOOST",
     "FLY_INTEL_RUNWAY_MULT_FLOOR", "FLY_INTEL_EDGE_STEPS", "FLY_INTEL_GEX_LOG_SCALE",
+    "FLY_INTEL_USE_POLARITY", "FLY_INTEL_POLARITY_PATH", "FLY_INTEL_MIN_EVENT_DAYS",
+    "FLY_INTEL_MIN_SECONDS", "FLY_INTEL_RETEST_FILTER", "FLY_INTEL_RETEST_ARM_S",
+    "CASCADE_STOP_MULT_BASE", "CASCADE_STOP_K_DEPTH", "CASCADE_STOP_K_Z",
+    "CASCADE_STOP_MULT_MAX", "CASCADE_Z_FLOOR", "SMART_LOCKOUT_ENABLED",
+    "LOCKOUT_BYPASS_MAX_PER_DAY", "LOCKOUT_BYPASS_COOLDOWN_S", "LOCKOUT_BYPASS_Z_MARGIN",
+    "TOXICITY_GATE_ENABLED", "TOX_BUCKET_VOLUME", "TOX_NUM_BUCKETS",
+    "TOX_MIN_BUCKETS", "TOX_HIGH", "TOX_BLOCK", "TOX_SWING_LOOKBACK_S",
+    "TOX_PIVOT_HOLD_S", "TOX_PIVOT_SETTLE_S", "TOX_SWEEP_BUFFER_FRAC",
+    "TOX_VOL_BASE_S", "TOX_ABSORB_VOL_Z", "TOX_ABSORB_MOVE_FRAC",
+    "TOX_SWEEP_FADE_OK",
+    "USE_CALIBRATION", "CALIBRATION_PATH", "CALIB_MIN_TICKS",
+    "DYNAMIC_LEVELS_ENABLED", "DYN_LEVEL_HORIZON_CAP_MIN", "DYN_LEVEL_RR",
+    "DYN_SL_MIN", "DYN_SL_MAX", "DYN_TP_MIN", "DYN_TP_MAX",
     "EXIT_MARK_EMA_HL_S", "EXIT_SIGMA_PRIOR_FRAC", "EXIT_K_SIGMA",
     "EXIT_GIVE_FLOOR_FRAC", "EXIT_GIVE_FRAC_TREND", "EXIT_GIVE_FRAC_CHOP",
     "EXIT_CONFIRM_S", "EXIT_HARD_BREACH_MULT", "EXIT_STAGNATION_S",

@@ -79,6 +79,8 @@ from core import butterfly as BFLY
 from core.displacement import DisplacementGovernor
 from core.exit_engine import signed_efficiency
 from core import fly_intel as FI
+from core import order_flow as OF
+from core.calibration import tox_thresholds, bucket_volume
 from core.bocpd import BOCPD
 from core.dealer_flow import DealerFlow
 from core import rv_forecaster as RVF
@@ -292,7 +294,21 @@ def main():
     last_fly_intel: dict[str, object] = {}   # the fly's pinning read, mined
     #                                          into a directional modulation +
     #                                          boundary map (core/fly_intel.py)
+    wall_touch_since: dict[str, float | None] = {}   # per-index wall-clock t0
+    #                                          since spot first reached the near
+    #                                          wall — drives the retest-survival
+    #                                          entry gate (BankNifty trap-killer)
     disp = DisplacementGovernor()
+    from core.cascade_exit import SmartLockout
+    smart_lock = SmartLockout()          # v9.7.1: strengthening-trend cascade
+    #                                      re-entry bypasses the blunt post-loss
+    #                                      lockout (2026-07-16 jackpot fix)
+    cascade_pos_z: dict[str, float | None] = {}   # z of the cascade trigger that
+    #                                      opened the CURRENT position (None if
+    #                                      the open position isn't a cascade one)
+    tox_engine = {i: OF.OrderFlowToxicity(i) for i in config.TRADABLE}
+    last_tox: dict[str, object] = {}     # latest TrapVerdict per index, for the
+    #                                      entry gate + heartbeat (VPIN/OFI trap)
     last_mac: dict[str, dict | None] = {}
     # ---- v9.1 diagnostics: gate funnel + daily report -----------------------
     # v9.2: resume=True — a mid-session restart merges into the day's report;
@@ -732,11 +748,24 @@ def main():
                              if getattr(last_fly_intel.get(i), "active",
                                         False)), None)
             if _fi_live is not None:
-                _svtok += (f" | fly-intel {_fi_live.near_wall}wall "
+                _pol_s = {1: "MOM", -1: "REV", 0: "undec"}.get(
+                    getattr(_fi_live, "polarity", 0), "?")
+                _svtok += (f" | fly-intel[{_pol_s}] {_fi_live.near_wall}wall "
                            f"pin{_fi_live.pin_pressure:.2f} "
                            f"runway×{_fi_live.target_runway_mult:.2f}"
-                           + (f" revert→{_fi_live.revert_hint_side}"
+                           + (f" arm{_fi_live.retest_arm_delay_s:.0f}s"
+                              if _fi_live.retest_arm_delay_s else "")
+                           + (f" ride→{_fi_live.revert_hint_side}"
                               if _fi_live.revert_hint_side else ""))
+            # v9.7.1: surface the order-flow toxicity / trap read
+            _tv_live = next((last_tox.get(i) for i in config.TRADABLE
+                             if getattr(last_tox.get(i), "toxicity", 0) > 0),
+                            None)
+            if _tv_live is not None:
+                _svtok += (f" | tox {_tv_live.toxicity:.2f}"
+                           f"{'+' if _tv_live.tox_dir > 0 else '-' if _tv_live.tox_dir < 0 else ''}"
+                           + (f" SWEEP-{_tv_live.sweep_dir}"
+                              if _tv_live.sweep else ""))
 
             log.info("♥ %s | feed age %.1fs | PnL ₹%+.0f | deployed ₹%.0f | "
                      "halted=%s | pos %s | conv %s | policy %s | VIX %s | "
@@ -1236,6 +1265,24 @@ def main():
             if pm.pos is not None:
                 oi_node = frame[i * config.NODES_PER_INDEX +
                                 (1 if pm.pos.direction == "CE" else 2)]
+            # v9.7.1 ORDER-FLOW TOXICITY: the index has no volume, so feed the
+            # VPIN/OFI estimator from the ATM legs' book + traded volume (the
+            # same real flow the shield uses), with SPOT driving the swing-pivot
+            # sweep detection. One update per decision second (replay-parity).
+            _atm_dir_snap = (legs_m.get("atm_pe" if (pm.pos and
+                             pm.pos.direction == "PE") else "atm_ce", {})
+                             .get("snap") or {})
+            _spot_ltp = float((ctx_m.get("spot") or {}).get("ltp") or 0)
+            try:
+                last_tox[idx] = tox_engine[idx].update(
+                    spot=_spot_ltp,
+                    bid=float(_atm_dir_snap.get("bid") or 0),
+                    bid_qty=float(_atm_dir_snap.get("bid_qty") or 0),
+                    ask=float(_atm_dir_snap.get("ask") or 0),
+                    ask_qty=float(_atm_dir_snap.get("ask_qty") or 0),
+                    vol_delta=float(_atm_dir_snap.get("vol_delta") or 0))
+            except Exception:                              # noqa: BLE001
+                pass
             mins_left = max((dt.datetime.strptime(config.SESSION_CLOSE, "%H:%M")
                              - dt.datetime.strptime(hm, "%H:%M")).seconds / 60,
                             1.0)
@@ -1271,7 +1318,17 @@ def main():
                     pm._exit(tctx, ring_quotes.get(pm.pos.token, {}),
                              "RISK_HALT", urgent=True)
                 else:
+                    _pnl_before = pm.risk.realized_pnl
+                    _dir_held = pm.pos.direction
                     pm.manage(tctx, ring_quotes.get(pm.pos.token, {}))
+                    # v9.7.1: if a CASCADE trade just exited at a loss, tell
+                    # SmartLockout the losing z — so a STRONGER re-trigger can
+                    # be recognised as trend continuation, not revenge.
+                    if (pm.pos is None and cascade_pos_z.get(idx) is not None
+                            and pm.risk.realized_pnl < _pnl_before):
+                        smart_lock.note_loss(_dir_held, cascade_pos_z[idx])
+                    if pm.pos is None:
+                        cascade_pos_z[idx] = None
                 # continuous trade tracking on its own cadence
                 if pm.pos is not None and \
                         time.time() - last_track.get(idx, 0.0) >= config.TRADE_TRACK_S:
@@ -1432,6 +1489,9 @@ def main():
                         cascade_entered[idx] += 1
                         report.d["cascade"]["events"][-1]["entered"] = \
                             pm.pos.symbol
+                        # remember which trigger opened this position, for the
+                        # smart-lockout loss-note on exit
+                        cascade_pos_z[idx] = getattr(tctx, "cascade_z", None)
                 else:
                     _blk = pm.last_block_reason or "no fill"
                     skip_reason[idx] = _blk
@@ -1450,6 +1510,22 @@ def main():
             # shaped barriers the harness certified. Direction from structure.
             if cascade_ev is not None and casc_mode != "telemetry":
                 last_try[idx] = ts               # normal path stands down 5 s
+                # v9.7.1: mark tctx as a cascade entry so the stop widens for
+                # short-gamma violence, and ask SmartLockout whether a post-
+                # loss lockout should be bypassed (a STRONGER, still-aligned
+                # re-trigger is trend continuation, not revenge).
+                tctx.from_cascade = True
+                tctx.cascade_z = cascade_ev.z
+                tctx.net_gex = cascade_ev.net_gex
+                _lk = smart_lock.evaluate(
+                    ts=ts, direction=cascade_ev.direction, is_cascade=True,
+                    cascade_z=cascade_ev.z, spot=spot, flip=cascade_ev.flip,
+                    net_gex=cascade_ev.net_gex)
+                tctx.lockout_bypass = _lk.bypass
+                if _lk.bypass:
+                    smart_lock.register_bypass(ts)
+                    log.warning("%s cascade lockout BYPASS — %s",
+                                idx, _lk.reason)
                 # Tier-specific sizing prior: CERTIFIED uses the harness's
                 # LOWER-bound win rate; PAPER-EXPLORE (no cert yet) uses the
                 # same exploration prior the heuristic ledger was built with —
@@ -1495,6 +1571,54 @@ def main():
                 funnel.record(idx, "not_persistent", _why)
                 log.info("%s signal not persistent — %s", idx, _why)
                 continue
+            # ---- RETEST-SURVIVAL GATE (fly-intel, BankNifty trap-killer) ----
+            # When the fly read says spot is AT a wall and the entry points in
+            # the break direction, require a sustained hold since first reaching
+            # the wall before arming — so a first-candle breakout that gets
+            # retest-wicked can't drag us in at the top. Polarity-agnostic: the
+            # retest wick is a trap whether the break rides or fades.
+            _fi_e = last_fly_intel.get(idx)
+            if (getattr(config, "FLY_INTEL_RETEST_FILTER", True)
+                    and _fi_e is not None and getattr(_fi_e, "at_wall", False)
+                    and _fi_e.retest_arm_delay_s > 0):
+                _cand_side = "CE" if conv > 0 else "PE"
+                _break_side = _fi_e.near_wall
+                if _cand_side == _break_side:      # entering the break direction
+                    _t0 = wall_touch_since.get(idx)
+                    if _t0 is None:
+                        wall_touch_since[idx] = ts
+                        _t0 = ts
+                    _held_at_wall = ts - _t0
+                    if _held_at_wall < _fi_e.retest_arm_delay_s:
+                        _rw = (f"retest guard: held {_held_at_wall:.0f}s < "
+                               f"{_fi_e.retest_arm_delay_s:.0f}s at {_break_side} "
+                               f"wall")
+                        skip_reason[idx] = _rw
+                        funnel.record(idx, "retest_guard", _rw)
+                        log.info("%s %s — awaiting retest confirmation (%s)",
+                                 idx, _cand_side, _rw)
+                        continue
+            else:
+                wall_touch_since[idx] = None       # not at wall ⇒ reset clock
+            # ---- ORDER-FLOW TOXICITY TRAP GATE (VPIN/OFI; research-grade) ----
+            # Block CHASING into adverse informed flow or an engineered sweep;
+            # allow (and flag) a genuine break or a confirmed post-sweep
+            # reversal. Thresholds are vault-calibrated per index. Advisory —
+            # it can only RAISE the bar here, never lower a floor.
+            _tv = last_tox.get(idx)
+            if (getattr(config, "TOXICITY_GATE_ENABLED", True)
+                    and _tv is not None):
+                _thi, _tblk = tox_thresholds(idx)
+                _cand_dir = "CE" if conv > 0 else "PE"
+                _allow, _twhy = OF.entry_trap_check(
+                    _tv, _cand_dir, tox_block=_tblk,
+                    sweep_fade_ok=getattr(config, "TOX_SWEEP_FADE_OK", True))
+                if not _allow:
+                    skip_reason[idx] = _twhy
+                    funnel.record(idx, "toxicity_trap", _twhy)
+                    log.info("%s %s BLOCKED by trap filter — %s",
+                             idx, _cand_dir, _twhy)
+                    continue
             if ts - last_try.get(idx, -1e9) < config.ENTRY_ATTEMPT_THROTTLE_S:
                 funnel.record(idx, "throttled")
                 continue                       # one attempt per 5 s per index

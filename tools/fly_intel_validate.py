@@ -41,37 +41,71 @@ def check(name, cond, detail=""):
 # --------------------------------------------------------------------------
 # 1. CONTRACT: the three products behave as specified.
 # --------------------------------------------------------------------------
+def _force(p):
+    """Inject a polarity into the module cache for deterministic testing."""
+    FI._POLARITY_CACHE.update({"mtime": "test", "val": p, "meta": {}})
+
+
 def contract():
-    print("\n=============== CONTRACT — fly_intel products ================")
+    print("\n=============== CONTRACT — polarity-driven products ==========")
     step = 100.0
     base = dict(granted=True, side="CE", call_wall=77500.0, put_wall=77000.0,
                 corridor_steps=5.0, iv_rank=0.72, net_gex=2.4e12,
                 strike_step=step)
-    into = FI.assess(**base, spot=77460, direction="CE", conviction=0.80)
-    away = FI.assess(**base, spot=77460, direction="PE", conviction=0.80)
-    check("conv INTO near wall is dampened (<1)", into.conv_mult < 1.0,
-          f"×{into.conv_mult}")
-    check("conv AWAY from near wall is boosted (>1)", away.conv_mult > 1.0,
-          f"×{away.conv_mult}")
-    check("dampening ⇒ logit conv shrinks",
-          abs(FI.apply_conv(0.80, into.conv_mult)) < 0.80,
-          f"0.80→{FI.apply_conv(0.80, into.conv_mult):.3f}")
-    deep = FI.assess(**{**base, "net_gex": 8.0e12}, spot=77480,
-                     direction=None, conviction=0.0)
-    shallow = FI.assess(**{**base, "net_gex": 1.05e12}, spot=77250,
-                        direction=None, conviction=0.0)
-    check("deeper pin ⇒ tighter target runway",
-          deep.target_runway_mult < shallow.target_runway_mult,
-          f"deep {deep.target_runway_mult} < shallow {shallow.target_runway_mult}")
-    edge = FI.assess(**base, spot=77492, direction=None, conviction=0.0)
-    check("edge-pressed at call wall ⇒ revert hint PE",
-          edge.revert_hint_side == "PE" and edge.revert_hint_strength > 0,
-          f"{edge.revert_hint_side}:{edge.revert_hint_strength}")
+
+    # --- UNDECIDED (default): everything neutral, no directional bias at all
+    _force(0)
+    u_into = FI.assess(**base, spot=77350, direction="CE", conviction=0.80)
+    u_away = FI.assess(**base, spot=77350, direction="PE", conviction=0.80)
+    check("UNDECIDED: no conv modulation either way",
+          u_into.conv_mult == 1.0 and u_away.conv_mult == 1.0,
+          f"into ×{u_into.conv_mult}, away ×{u_away.conv_mult}")
+    check("UNDECIDED: no runway shrink", u_into.target_runway_mult == 1.0)
+
+    # --- MOMENTUM (+1): ride the wall break (this operator's vault sign)
+    _force(+1)
+    m_into = FI.assess(**base, spot=77350, direction="CE", conviction=0.80)
+    m_away = FI.assess(**base, spot=77350, direction="PE", conviction=0.80)
+    check("MOMENTUM: into-wall break is BOOSTED (>1)", m_into.conv_mult > 1.0,
+          f"×{m_into.conv_mult}")
+    check("MOMENTUM: against-break is DAMPENED (<1)", m_away.conv_mult < 1.0,
+          f"×{m_away.conv_mult}")
+    check("MOMENTUM: runway NOT shrunk (break through the wall)",
+          m_into.target_runway_mult == 1.0)
+    m_edge = FI.assess(**base, spot=77460, direction=None, conviction=0.0)
+    check("MOMENTUM: at-wall hint = ride the break (CE)",
+          m_edge.revert_hint_side == "CE",
+          f"{m_edge.revert_hint_side}")
+
+    # --- REVERSION (−1): fade the wall, ride the pin (textbook)
+    _force(-1)
+    r_into = FI.assess(**base, spot=77350, direction="CE", conviction=0.80)
+    r_away = FI.assess(**base, spot=77350, direction="PE", conviction=0.80)
+    check("REVERSION: into-wall is DAMPENED (<1)", r_into.conv_mult < 1.0,
+          f"×{r_into.conv_mult}")
+    check("REVERSION: fade is BOOSTED (>1)", r_away.conv_mult > 1.0,
+          f"×{r_away.conv_mult}")
+    check("REVERSION: runway shrunk (pin arrests before wall)",
+          r_into.target_runway_mult < 1.0, f"×{r_into.target_runway_mult}")
+    r_edge = FI.assess(**base, spot=77460, direction=None, conviction=0.0)
+    check("REVERSION: at-wall hint = fade to pin (PE)",
+          r_edge.revert_hint_side == "PE", f"{r_edge.revert_hint_side}")
+
+    # --- retest filter is polarity-AGNOSTIC (BankNifty trap-killer)
+    for pol in (0, +1, -1):
+        _force(pol)
+        e = FI.assess(**base, spot=77460, direction=None, conviction=0.0)
+        check(f"RETEST arm-delay active at wall (polarity {pol:+d})",
+              e.at_wall and e.retest_arm_delay_s > 0,
+              f"{e.retest_arm_delay_s}s")
+
+    # --- ungranted ⇒ inactive regardless of polarity
+    _force(+1)
     ung = FI.assess(granted=False, side=None, spot=77250, call_wall=None,
                     put_wall=None, corridor_steps=0, iv_rank=None,
                     net_gex=None, strike_step=step, direction="CE",
                     conviction=0.8)
-    check("ungranted gate ⇒ fully neutral",
+    check("ungranted gate ⇒ inactive + neutral",
           (not ung.active) and ung.conv_mult == 1.0
           and ung.target_runway_mult == 1.0)
 
@@ -113,6 +147,9 @@ def _entry_pnl(spots, t0, direction, delta, hold, entry_prem):
 
 def edge_hypothesis():
     print("\n============ EDGE HYPOTHESIS — does the read help? ===========")
+    print("    (reversion-modelled pin ⇒ force REVERSION polarity to match; "
+          "under the RIGHT sign the modulation must add value)")
+    _force(-1)                        # the pin model is mean-reverting
     step = 100.0
     cw, pw = 77500.0, 77000.0
     delta, hold, entry_prem = 0.45, 300, 120.0
@@ -174,6 +211,21 @@ def edge_hypothesis():
 def neutrality():
     print("\n================ NEUTRALITY — no silent drift ===============")
     step, cw, pw = 100.0, 77500.0, 77000.0
+    # UNDECIDED polarity must leave EVERY conviction untouched even inside a
+    # granted regime — the honest default until the vault earns a sign.
+    _force(0)
+    granted_unchanged = True
+    for _ in range(500):
+        conv = random.uniform(-0.99, 0.99)
+        fi = FI.assess(granted=True, side="CE", spot=77350.0, call_wall=cw,
+                       put_wall=pw, corridor_steps=5.0, iv_rank=0.72,
+                       net_gex=2.4e12, strike_step=step,
+                       direction=("CE" if conv > 0 else "PE"), conviction=conv)
+        if FI.apply_conv(conv, fi.conv_mult) != conv:
+            granted_unchanged = False
+            break
+    check("UNDECIDED polarity: no drift even in a GRANTED regime",
+          granted_unchanged)
     unchanged = True
     for _ in range(500):
         conv = random.uniform(-0.99, 0.99)

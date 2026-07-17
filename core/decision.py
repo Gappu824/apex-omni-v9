@@ -225,8 +225,9 @@ def entry_gate(conv: float, wp: float, wp_meta: float | None,
 #    JSON report turns "it doesn't trade" from a mystery into a table.
 # --------------------------------------------------------------------------
 _GATES = ("stale_feed", "no_market", "in_position", "risk_halted",
-          "below_bar", "not_persistent", "throttled", "no_chain",
-          "no_quotes", "risk_blocked", "no_fill", "entered")
+          "below_bar", "not_persistent", "retest_guard", "toxicity_trap",
+          "throttled", "no_chain", "no_quotes", "risk_blocked", "no_fill",
+          "entered")
 
 
 class GateFunnel:

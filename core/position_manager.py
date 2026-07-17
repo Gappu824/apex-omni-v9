@@ -58,6 +58,8 @@ from pathlib import Path
 import config
 from core.execution_engine import ExecutionEngine, Fill, round_trip_costs
 from core.exit_engine import PeakCaptureTrail, TrailParams, ride_ok
+from core.cascade_exit import cascade_stop_mult
+from core.calibration import dynamic_stop_target
 from core.risk_manager import RiskGovernor, TradePermit
 from core.trap_shield import TrapShield, TrapSignals
 from core.quant_core import expected_move, micro_price
@@ -120,6 +122,16 @@ class TickContext:
     #                                      is planted within (deep +gamma pin ⇒
     #                                      the move arrests before the wall).
     #                                      1.0 = no fly read = legacy behavior.
+    from_cascade: bool = False           # v9.7.1: this entry is a cascade
+    #                                      trigger — widen the stop for short-
+    #                                      gamma violence (core/cascade_exit)
+    cascade_z: float | None = None       # the trigger's z-score (stop scaling)
+    net_gex: float | None = None         # signed net dealer gamma (regime sign)
+    lockout_bypass: bool = False         # v9.7.1: SmartLockout grants this for
+    #                                      a strengthening aligned cascade re-
+    #                                      trigger (trend continuation, not
+    #                                      revenge) — overrides the post-loss
+    #                                      directional lockout in RiskGovernor
 
 
 @dataclass
@@ -156,6 +168,8 @@ class Position:
     trail: object = None          # PeakCaptureTrail over the executable mark
     reversal_since: float = 0.0   # dwell clock: conviction hard against us
     theta_rides: int = 0          # 0/1 flag: rode past the theta guillotine
+    _dyn_tp_pct: float = 0.0      # vault-calibrated vol-scaled target fraction
+    _dyn_src: str = ""            # provenance of the dynamic stop/target
 
 
 class PositionManager:
@@ -213,7 +227,8 @@ class PositionManager:
             cands, direction=direction, win_prob=win_prob,
             sl_pct=config.BASE_SL_PCT, tp_pct=config.BASE_TP_PCT,
             data_age_s=ctx.data_age_s, now_hm=ctx.hm, ts=ctx.ts,
-            ann_vol=ctx.atm_iv or None)
+            ann_vol=ctx.atm_iv or None,
+            lockout_bypass=bool(getattr(ctx, "lockout_bypass", False)))
         if leg is None:
             self._log(ts=ctx.ts, event="BLOCKED", index=self.index,
                       direction=direction, reason=permit.reason,
@@ -297,7 +312,40 @@ class PositionManager:
 
         outlay = fill.avg_price * fill.qty
         self.risk.register_entry(outlay)
-        sl_dist = fill.avg_price * config.BASE_SL_PCT
+        # v9.7.1 DYNAMIC STOP/TARGET: size the initial stop from the
+        # instrument's OWN realized volatility (vault-calibrated ATR proxy)
+        # instead of a fixed percent, so it breathes with the instrument and
+        # the horizon (Kaufman vol-scaling). Falls back to BASE_SL_PCT when the
+        # vault hasn't calibrated this index. The cascade widening below then
+        # composes on top for short-gamma violence.
+        _dyn_sl_pct = config.BASE_SL_PCT
+        _dyn_tp_pct = 0.0
+        _dyn_src = ""
+        _entry_delta = abs(q.delta) or 0.4        # q exists here; p does not yet
+        if getattr(config, "DYNAMIC_LEVELS_ENABLED", True):
+            _lv = dynamic_stop_target(
+                self.index, entry_premium=fill.avg_price,
+                delta=_entry_delta, minutes_to_close=ctx.minutes_to_close,
+                atm_iv=ctx.atm_iv)
+            _dyn_sl_pct = _lv.sl_pct
+            _dyn_tp_pct = _lv.tp_pct
+            _dyn_src = _lv.source
+        sl_dist = fill.avg_price * _dyn_sl_pct
+        # v9.7.1 CASCADE-AWARE STOP: a short-gamma cascade breakdown is violent
+        # and retest-wicks second-to-second (2026-07-16: two PE trades stopped
+        # on the wick, then the down-move ran). Widen the stop to sit OUTSIDE
+        # the regime's own noise band — the risk governor already sized off the
+        # base distance, so this trades a touch of size for far fewer whipsaw
+        # exits. The disaster floor below still bounds the absolute loss.
+        _cstop_mult, _cstop_why = cascade_stop_mult(
+            net_gex=ctx.net_gex, cascade_z=ctx.cascade_z,
+            is_cascade=ctx.from_cascade)
+        if _cstop_mult != 1.0:
+            sl_dist *= _cstop_mult
+            self._log(ts=ctx.ts, event="CASCADE_STOP_WIDEN", index=self.index,
+                      symbol=q.symbol, direction=direction,
+                      price=f"{fill.avg_price:.2f}", reason=_cstop_why,
+                      conviction=f"{conviction:.3f}")
         p = Position(index=self.index, direction=direction, symbol=q.symbol,
                      exchange=q.exchange, token=q.token, strike=q.strike,
                      qty=fill.qty, entry=fill.avg_price, entry_ts=ctx.ts,
@@ -305,6 +353,8 @@ class PositionManager:
                      conviction=conviction, win_prob=win_prob,
                      order_id=fill.order_id, n_buy_orders=max(fill.n_orders, 1),
                      dte=float(q.dte))
+        p._dyn_tp_pct = _dyn_tp_pct        # vol-scaled target (0 ⇒ base)
+        p._dyn_src = _dyn_src
         p.stop = fill.avg_price - sl_dist
         p.floor = fill.avg_price - min(sl_dist * config.DISASTER_FLOOR_MULT,
                                        fill.avg_price * config.ABS_DISASTER_PCT)
@@ -330,8 +380,9 @@ class PositionManager:
             runway *= max(min(ctx.fly_runway_mult, 1.0), 0.1)
         spot_room = min(em, runway) if runway else em
         prem_room = p.delta_at_entry * spot_room
+        _tp_floor = getattr(p, "_dyn_tp_pct", 0.0) or config.BASE_TP_PCT
         p.target = fill.avg_price + max(prem_room,
-                                        fill.avg_price * config.BASE_TP_PCT)
+                                        fill.avg_price * _tp_floor)
         p.peak = fill.avg_price
         p.shield = TrapShield(direction)
         p.spike_ref_spot = ctx.spot
@@ -440,7 +491,15 @@ class PositionManager:
             td = p.trail.update(ctx.ts, mark, regime_label=ctx.regime_label,
                                 minutes_to_close=ctx.minutes_to_close)
         hwm = p.trail.hwm if p.trail is not None else p.peak
-        if not p.trail_armed and hwm >= p.entry * (1 + config.TRAIL_ARM_PCT):
+        # Arm on the RAW peak OR the smoothed hwm, whichever crosses first.
+        # Arming earlier is strictly safer: it engages the profit-lock floor
+        # sooner. (The smoothed hwm still drives the ratchet/giveback below —
+        # only the ARM trigger uses the raw peak, so a genuine +ARM_PCT move
+        # that the EMA hasn't caught up to still arms the breakeven guarantee.
+        # Without this, a fast spike past +ARM_PCT that the EMA lags could exit
+        # via the theta stop at a LOSS instead of the armed profit-lock.)
+        if not p.trail_armed and max(p.peak, hwm) >= p.entry * (
+                1 + config.TRAIL_ARM_PCT):
             p.trail_armed = True
         if p.trail_armed:
             gain = hwm - p.entry

@@ -110,7 +110,8 @@ class RiskGovernor:
                       data_age_s: float, now_hm: str,
                       ts: float | None = None, symbol: str | None = None,
                       exchange: str | None = None, price: float | None = None,
-                      ann_vol: float | None = None) -> TradePermit:
+                      ann_vol: float | None = None,
+                      lockout_bypass: bool = False) -> TradePermit:
         ts = ts or time.time()
         if self.halted:
             return TradePermit(False, f"halted: {self.halt_reason}")
@@ -124,7 +125,11 @@ class RiskGovernor:
             return TradePermit(False, "max concurrent positions")
         if ts - self.last_exit_ts < config.COOLDOWN_S:
             return TradePermit(False, "cooldown")
-        if ts < self.lockout_until and direction == self.lockout_direction:
+        if (ts < self.lockout_until and direction == self.lockout_direction
+                and not lockout_bypass):
+            # v9.7.1: lockout_bypass is granted by core/cascade_exit.SmartLockout
+            # ONLY for a STRONGER, still-aligned cascade re-trigger (trend
+            # continuation, not revenge). Everything else is still locked out.
             left = int(self.lockout_until - ts)
             return TradePermit(False, f"post-loss {direction} lockout ({left}s)")
 

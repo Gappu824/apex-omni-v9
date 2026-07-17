@@ -167,14 +167,31 @@ def main():
     boots = rng.choice(diff, size=(2000, len(diff)), replace=True).mean(axis=1)
     ci_lo, ci_hi = (float(np.quantile(boots, 0.05)),
                     float(np.quantile(boots, 0.95)))
-    edge_real = ci_lo > 0                       # fade beats into at 90% CI
+
+    # ---- POLARITY DECISION (data decides the sign; sample floor guards it) --
+    # ci_lo>0 ⇒ fade beats into ⇒ REVERSION (−1).
+    # ci_hi<0 ⇒ into beats fade ⇒ MOMENTUM  (+1).
+    # CI straddles 0, OR too few days/seconds ⇒ UNDECIDED (0): no modulation.
+    n_days = len(sorted({r["day"] for r in allrows}))
+    min_days = int(getattr(config, "FLY_INTEL_MIN_EVENT_DAYS", 8))
+    min_secs = int(getattr(config, "FLY_INTEL_MIN_SECONDS", 20000))
+    enough = (n_days >= min_days and len(allrows) >= min_secs)
+    if not enough:
+        polarity, pol_word = 0, f"UNDECIDED (sample floor: {n_days}d/{len(allrows)}s < {min_days}d/{min_secs}s)"
+    elif ci_lo > 0:
+        polarity, pol_word = -1, "REVERSION (fade the wall, ride the pin)"
+    elif ci_hi < 0:
+        polarity, pol_word = +1, "MOMENTUM (ride the wall break)"
+    else:
+        polarity, pol_word = 0, "UNDECIDED (CI straddles zero — no edge)"
+    edge_real = polarity != 0
 
     tilts = np.array([r["conv_mult_into"] for r in allrows])
     n_tilt = int((tilts < 0.999).sum())
 
     rep = {
         "granted_seconds": len(allrows),
-        "event_days": len(sorted({r["day"] for r in allrows})),
+        "event_days": n_days,
         "horizon_s": args.hold,
         "into_wall": {"mean_ret": round(float(into.mean()), 6),
                       "win_rate": round(into_wr, 4)},
@@ -184,6 +201,8 @@ def main():
             "mean": round(float(diff.mean()), 6),
             "ci90": [round(ci_lo, 6), round(ci_hi, 6)],
             "edge_confirmed": edge_real},
+        "polarity": polarity,
+        "polarity_meaning": pol_word,
         "modulation_activity": {
             "seconds_with_dampen": n_tilt,
             "pct_of_granted": round(100.0 * n_tilt / len(allrows), 1),
@@ -192,30 +211,40 @@ def main():
                 if n_tilt else None),
             "mean_runway_mult": round(float(
                 np.array([r["runway_mult"] for r in allrows]).mean()), 3)},
-        "verdict": ("EDGE CONFIRMED on the vault — fly-intel modulation "
-                    "justified (keep FLY_INTEL_ENABLED=True)" if edge_real
-                    else "NO significant reversion edge in this window — "
-                    "consider FLY_INTEL_ENABLED=False until it appears"),
+        "verdict": (
+            f"POLARITY {polarity:+d} — {pol_word}. fly_intel modulation is "
+            f"{'ACTIVE with this sign' if edge_real else 'OFF (identity) until a decisive, well-sampled sign appears'}."),
         "config_hash": config.CONFIG_HASH, "ts": time.time()}
 
     log.info("granted seconds: %d over %d days | horizon %ds",
-             rep["granted_seconds"], rep["event_days"], args.hold)
+             rep["granted_seconds"], n_days, args.hold)
     log.info("  INTO near wall : mean ret %+.4f%% | win %.1f%%",
              into.mean() * 100, into_wr * 100)
     log.info("  FADE to the pin: mean ret %+.4f%% | win %.1f%%",
              fade.mean() * 100, fade_wr * 100)
-    log.info("  asymmetry (fade−into): %+.4f%% | CI90 [%+.4f%%, %+.4f%%] → %s",
-             diff.mean() * 100, ci_lo * 100, ci_hi * 100,
-             "EDGE CONFIRMED" if edge_real else "not significant")
-    log.info("  modulation tilts %d/%d granted seconds (%.1f%%), mean dampen "
-             "×%s", n_tilt, len(allrows),
-             100.0 * n_tilt / len(allrows),
-             f"{tilts[tilts < 0.999].mean():.3f}" if n_tilt else "—")
+    log.info("  asymmetry (fade−into): %+.4f%% | CI90 [%+.4f%%, %+.4f%%]",
+             diff.mean() * 100, ci_lo * 100, ci_hi * 100)
+    log.info("  → POLARITY %+d: %s", polarity, pol_word)
     log.info("  VERDICT: %s", rep["verdict"])
 
     out = config.LOG_DIR / f"fly_intel_report_{dt.date.today()}.json"
     _atomic_write_json(out, rep)
     log.info("report → %s", out)
+
+    # ---- write the polarity artifact the BRAIN reads (core/fly_intel.polarity)
+    pol_art = {
+        "polarity": polarity, "meaning": pol_word,
+        "into_win": round(into_wr, 4), "fade_win": round(fade_wr, 4),
+        "asym_mean": round(float(diff.mean()), 6),
+        "ci90": [round(ci_lo, 6), round(ci_hi, 6)],
+        "event_days": n_days, "granted_seconds": len(allrows),
+        "horizon_s": args.hold, "config_hash": config.CONFIG_HASH,
+        "written": dt.datetime.now().isoformat(timespec="seconds"),
+        "source": str(out.name)}
+    pol_path = config.LOG_DIR / "fly_intel_polarity.json"
+    _atomic_write_json(pol_path, pol_art)
+    log.info("polarity artifact → %s (brain reads this: %+d)",
+             pol_path, polarity)
 
 
 if __name__ == "__main__":
