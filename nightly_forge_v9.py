@@ -106,14 +106,12 @@ except Exception:                                         # noqa: BLE001
 
 log = logging.getLogger("forge")
 
-try:
-    import torch
-    import gymnasium as gym
-    from stable_baselines3 import SAC
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-    HAVE_RL = True
-except Exception:                                      # noqa: BLE001
-    HAVE_RL = False
+# v9.7.1: the RL stack (torch/gym/SB3, ~10s import + the gym banner) loads
+# ON DEMAND via _load_rl(), never at module import — every evening tool that
+# does `from nightly_forge_v9 import trading_days` was paying this cost.
+HAVE_RL = False
+torch = gym = SAC = DummyVecEnv = VecNormalize = None
+ForgeEnv = Extractor = None
 
 
 # --------------------------------------------------------------- replay
@@ -877,7 +875,22 @@ def train_meta(con, days: list[str]):
     return out, diag
 
 
-if HAVE_RL:
+def _load_rl() -> bool:
+    """Import torch/gym/SB3 and define the SAC-side classes, once, on demand.
+    Returns False (with a log) if the stack is absent — callers skip SAC."""
+    global torch, gym, SAC, DummyVecEnv, VecNormalize, HAVE_RL, ForgeEnv, Extractor
+    if HAVE_RL:
+        return True
+    try:
+        import torch as _torch
+        import gymnasium as _gym
+        from stable_baselines3 import SAC as _SAC
+        from stable_baselines3.common.vec_env import (DummyVecEnv as _DVE,
+                                                      VecNormalize as _VN)
+    except Exception as e:                              # noqa: BLE001
+        log.info("RL stack unavailable (%s) — SAC paths skipped", e)
+        return False
+    torch, gym, SAC, DummyVecEnv, VecNormalize = _torch, _gym, _SAC, _DVE, _VN
 
     class ForgeEnv(gym.Env):
         """Offline single-step bandit over logged seconds (each step is an
@@ -919,6 +932,10 @@ if HAVE_RL:
         def forward(self, x):
             return self.net(x)
 
+
+
+    HAVE_RL = True
+    return True
 
 def _eval_meta():
     """Load the freshly-trained meta-model exactly as apex_main.load_meta does
@@ -1791,7 +1808,7 @@ def _prepare_cache(days: list[str], report: DailyReport):
 def _score_incumbent_on(con, day, meta, cal, log):
     """Re-score the currently-PROMOTED model on the SAME promotion day the
     candidate is graded on (apples-to-apples). Returns ₹ or None."""
-    if not (HAVE_RL and config.MODEL_MANIFEST.exists()):
+    if not (config.MODEL_MANIFEST.exists() and _load_rl()):
         return None
     try:
         man = json.loads(config.MODEL_MANIFEST.read_text())
@@ -1867,7 +1884,7 @@ def main():
         log.error("regime refit failed: %s", e)
 
     # 2) RL forge (torch stack)
-    if not HAVE_RL:
+    if config.FORGE_TRAIN_SAC and not _load_rl():
         log.warning("torch / stable-baselines3 / gymnasium not installed — "
                     "RL forge skipped (meta-labeler above still ran). "
                     "On the RTX 4060: pip install -r requirements.txt")
@@ -1898,6 +1915,7 @@ def main():
         io, it, ip = inner
         log.info("%s: %d train rows (%s) | inner %s (%d rows)", tag, len(obs),
                  ",".join(fit_days), inner_day, len(io))
+        assert _load_rl(), "FORGE_TRAIN_SAC=True but RL stack absent"
         env = DummyVecEnv([lambda: ForgeEnv(obs, ts, prem)])
         vec = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
         vec.obs_rms.mean = obs.mean(axis=0).astype(np.float64)
@@ -2074,7 +2092,7 @@ def main():
                      "(%d tr)", fd, len(tr), s_rs, s_st["trades"], h_rs,
                      h_st["trades"])
             del wf_model, wf_vec
-            if torch.cuda.is_available():
+            if torch is not None and torch.cuda.is_available():
                 torch.cuda.empty_cache()
         if K == 0:
             log.info("walk-forward skipped: needs ≥4 harvested days "

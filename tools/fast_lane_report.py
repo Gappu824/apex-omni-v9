@@ -183,7 +183,7 @@ def main():
     if n_fired >= 30:
         rng = np.random.default_rng(20260717)
         boot = rng.choice(diff, (2000, n_fired), replace=True).mean(1)
-        lo, hi = float(np.quantile(boot, 5)), float(np.quantile(boot, 95))
+        lo, hi = float(np.quantile(boot, 0.05)), float(np.quantile(boot, 0.95))  # v9.7.1 fix: quantile takes fractions
         edge = {"mean_diff_rs": round(float(diff.mean()), 2),
                 "ci90_rs": [round(lo, 2), round(hi, 2)],
                 "helps": lo > 0, "hurts": hi < 0}

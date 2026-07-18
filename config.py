@@ -975,6 +975,10 @@ GRAD_MICRO_CAPITAL  = 25000.0 # micro-live stage capital (one-lot)
 GRAD_KELLY_FRAC     = 0.25    # fractional Kelly at scaling stage
 GRAD_DD_MAX_PCT     = 10.0    # Grossman-Zhou drawdown throttle ceiling
 SPREAD_LIVE_TOKEN   = STATE_DIR / "ARM_LIVE_SPREADS"  # operator lock #4
+# serving conviction engine: "meta" (default) = physics heuristic proposes,
+# nightly-retrained GBM meta gates/sizes (the validated learner). "sac" =
+# legacy frozen SB3 pair (kept for rollback; it OVERRIDES the heuristic).
+POLICY_ENGINE       = "meta"
 FORGE_TRAIN_SAC     = False   # v10.2 default: the directional thesis was
                               # FALSIFIED — training it nightly bought hours
                               # and no edge. Exams/counterfactual still run;
@@ -1285,7 +1289,7 @@ _HASH_EXCLUDE = frozenset({
     "LC_WINDOW", "LC_MIN_EVENTS", "MACRO_TERM_STRUCTURE", "TERM_BAND_STEPS",
     "STRESS_SPLIT_HM", "RCT_LIMIT_TIMEOUT_S", "RCT_MIN_FIT",
     "GRAD_MICRO_CAPITAL", "GRAD_KELLY_FRAC", "GRAD_DD_MAX_PCT",
-    "FORGE_TRAIN_SAC",
+    "FORGE_TRAIN_SAC", "POLICY_ENGINE",
     "HARNESS_MAX_DAYS", "META_TRAIN_MAX_DAYS",
     "SV_CERT_MIN_EVENTS", "SV_CERT_MIN_DAYS", "SV_CERT_CI",
     # v9.7.1 peak-capture exits + displacement: trade-management / portfolio

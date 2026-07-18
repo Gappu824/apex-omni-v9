@@ -96,10 +96,16 @@ def main():
              args.hold)
 
     allowed, blocked = [], []
+    day_sums = []          # per-day (sum_al, n_al, sum_bl, n_bl) for the CI
     for day in days:
+        d_al, d_bl = [], []
         for idx in config.TRADABLE:
             for allow, signed in _run_day(con, day, idx, args.hold):
-                (allowed if allow else blocked).append(signed)
+                (d_al if allow else d_bl).append(signed)
+        allowed += d_al
+        blocked += d_bl
+        day_sums.append((float(np.sum(d_al)), len(d_al),
+                         float(np.sum(d_bl)), len(d_bl)))
 
     if not allowed and not blocked:
         log.warning("no data in window — report skipped")
@@ -111,16 +117,28 @@ def main():
     bl_mean = float(bl.mean()) if len(bl) else 0.0
     al_wr = float((al > 0).mean()) if len(al) else 0.0
     bl_wr = float((bl > 0).mean()) if len(bl) else 0.0
-    # bootstrap CI on (allowed − blocked) mean forward return
+    # DAY-CLUSTER bootstrap CI on (allowed − blocked) mean forward return.
+    # v9.7.1 fix for two real bugs: (1) the old tick-level resample tried to
+    # allocate (2000 × n_ticks) int64 — 60 GiB at 4M ticks; (2) np.quantile
+    # was called with 5/95 instead of 0.05/0.95, so the CI had never actually
+    # computed. Resampling DAYS (the cluster unit) is also statistically more
+    # correct: intraday ticks are heavily autocorrelated, so an iid tick
+    # bootstrap understates the interval — the same autocorrelation lesson the
+    # IC study taught. Memory: 2000×D ints, trivial at any vault size.
     edge = None
-    if len(al) > 100 and len(bl) > 100:
+    if len(al) > 100 and len(bl) > 100 and len(day_sums) >= 5:
         rng = np.random.default_rng(20260716)
-        da = rng.choice(al, (2000, len(al)), replace=True).mean(1)
-        db = rng.choice(bl, (2000, len(bl)), replace=True).mean(1)
-        diff = da - db
-        lo, hi = float(np.quantile(diff, 5)), float(np.quantile(diff, 95))
+        S = np.array(day_sums, float)                      # (D, 4)
+        D = len(S)
+        idx = rng.integers(0, D, (2000, D))
+        sa, na = S[idx, 0].sum(1), S[idx, 1].sum(1)
+        sb, nb = S[idx, 2].sum(1), S[idx, 3].sum(1)
+        ok = (na > 0) & (nb > 0)
+        diff = sa[ok] / na[ok] - sb[ok] / nb[ok]
+        lo, hi = float(np.quantile(diff, 0.05)), float(np.quantile(diff, 0.95))
         edge = {"mean": round(float(diff.mean()), 6), "ci90": [round(lo, 6),
-                round(hi, 6)], "filter_helps": lo > 0}
+                round(hi, 6)], "filter_helps": lo > 0,
+                "method": "day-cluster bootstrap (2000 draws)"}
 
     rep = {"horizon_s": args.hold, "days": len(days),
            "allowed": {"n": len(al), "mean_ret": round(al_mean, 6),

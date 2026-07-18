@@ -103,9 +103,29 @@ class PolicyLoader:
         self.model = None
         self.vec = None
         self.manifest_ts = 0.0
+        self._retired_logged = False
         self._try_load()
 
     def _try_load(self):
+        # v9.7.1: the frozen SAC is RETIRED from the conviction slot by
+        # default (POLICY_ENGINE="meta"). Rationale, from this system's own
+        # evidence: the IC study closed the directional thesis (no feature
+        # cleared t≥2 at any horizon), and FORGE_TRAIN_SAC=False froze the
+        # model — yet it still OVERRODE the physics heuristic every tick. A
+        # frozen net trained on a closed thesis is stale noise in the primary
+        # slot. With "meta": the live, calibration-fed physics heuristic
+        # proposes (direction, conviction) and the nightly-RETRAINED GBM meta
+        # gates and sizes via Kelly — the learning component that actually
+        # revalidates itself (purged CV + isotonic + walk-forward) each night.
+        # Set POLICY_ENGINE="sac" to restore the legacy pair unchanged.
+        if getattr(config, "POLICY_ENGINE", "meta") != "sac":
+            if not self._retired_logged:
+                logging.getLogger("brain").info(
+                    "SAC retired (POLICY_ENGINE=%s) — physics heuristic + "
+                    "nightly-retrained meta drive decisions",
+                    getattr(config, "POLICY_ENGINE", "meta"))
+                self._retired_logged = True
+            return
         if not config.MODEL_MANIFEST.exists():
             return
         ts = config.MODEL_MANIFEST.stat().st_mtime
