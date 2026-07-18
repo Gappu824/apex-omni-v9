@@ -40,10 +40,19 @@ class TradePermit:
 
 
 class RiskGovernor:
-    def __init__(self, capital: float | None = None, kite=None):
+    def __init__(self, capital: float | None = None, kite=None,
+                 book: str = "equity", persist: bool = False):
+        # persist=True is passed ONLY by the live entrypoints (apex_main,
+        # apex_commodity_main). Simulation, harnesses and validators construct
+        # governors freely and must NEVER couple to the live day ledger — the
+        # regression gate caught exactly that contamination when persistence
+        # was ambient in the constructor.
         self.start_capital = float(capital if capital is not None
                                    else config.TRADING_CAPITAL)
         self.kite = kite
+        self.book = book
+        self._persist = bool(persist) and \
+            bool(getattr(config, "RISK_STATE_PERSIST", True))
         self.realized_pnl = 0.0
         self.deployed = 0.0
         self.open_positions = 0
@@ -64,6 +73,64 @@ class RiskGovernor:
         # touch this counter.
         self.fast_consec_losses = 0
         self.fast_lane_suspended = False
+        # v9.7.1 AUDIT F1: the daily ledger must SURVIVE a crash-restart. The
+        # supervisor's backoff restart used to hand a book that was 0.3% from
+        # the drawdown halt a FRESH allowance (and cleared halts, lockouts and
+        # the fast-lane streak). Day-scoped state now persists per book and
+        # reloads on construction; positions/warm-up deliberately do NOT (a
+        # fresh process holds no positions and must re-settle physics).
+        self._load_day_state()
+
+    # ---------------------------------------------- day-state persistence
+    def _state_path(self):
+        import datetime as _dt
+        return (config.STATE_DIR /
+                f"risk_day_{self.book}_{_dt.date.today()}.json")
+
+    def _save_day_state(self):
+        if not self._persist:
+            return
+        try:
+            import json as _json
+            p = self._state_path()
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(_json.dumps({
+                "realized_pnl": self.realized_pnl,
+                "fast_consec_losses": self.fast_consec_losses,
+                "fast_lane_suspended": self.fast_lane_suspended,
+                "halted": self.halted, "halt_reason": self.halt_reason,
+                "lockout_until": self.lockout_until,
+                "lockout_direction": self.lockout_direction,
+                "reject_count": self.reject_count}))
+            tmp.replace(p)
+        except Exception as e:                              # noqa: BLE001
+            log.warning("risk day-state save failed: %s", e)
+
+    def _load_day_state(self):
+        if not self._persist:
+            return
+        try:
+            import json as _json
+            p = self._state_path()
+            if not p.exists():
+                return
+            d = _json.loads(p.read_text())
+            self.realized_pnl = float(d.get("realized_pnl", 0.0))
+            self.fast_consec_losses = int(d.get("fast_consec_losses", 0))
+            self.fast_lane_suspended = bool(d.get("fast_lane_suspended", False))
+            self.lockout_until = float(d.get("lockout_until", 0.0))
+            self.lockout_direction = d.get("lockout_direction")
+            self.reject_count = int(d.get("reject_count", 0))
+            if d.get("halted"):
+                self.halted = True
+                self.halt_reason = d.get("halt_reason", "restored halt")
+            if self.realized_pnl or self.halted:
+                log.warning("day risk-state RESTORED (%s): realized ₹%+.0f, "
+                            "halted=%s, fast_streak=%d", self.book,
+                            self.realized_pnl, self.halted,
+                            self.fast_consec_losses)
+        except Exception as e:                              # noqa: BLE001
+            log.warning("risk day-state load failed: %s", e)
 
     # ------------------------------------------------------------ capital
     def available_cash(self) -> float:
@@ -85,6 +152,7 @@ class RiskGovernor:
             log.critical("🛑 TRADING HALTED: %s", reason)
         self.halted = True
         self.halt_reason = reason
+        self._save_day_state()
 
     def register_reject(self):
         self.reject_count += 1
@@ -124,6 +192,7 @@ class RiskGovernor:
                     self.fast_lane_suspended = True
         elif fast_lane:
             self.fast_consec_losses = 0   # a fast-lane win resets the streak
+        self._save_day_state()
         dd = -self.realized_pnl / self.start_capital
         if dd >= config.MAX_DAILY_DRAWDOWN_PCT:
             self.kill(f"daily drawdown {dd:.1%} ≥ "
@@ -136,7 +205,8 @@ class RiskGovernor:
                       ts: float | None = None, symbol: str | None = None,
                       exchange: str | None = None, price: float | None = None,
                       ann_vol: float | None = None,
-                      lockout_bypass: bool = False) -> TradePermit:
+                      lockout_bypass: bool = False,
+                      curfew_hm: str | None = None) -> TradePermit:
         ts = ts or time.time()
         if self.halted:
             return TradePermit(False, f"halted: {self.halt_reason}")
@@ -144,8 +214,11 @@ class RiskGovernor:
             return TradePermit(False, "warm-up: physics not settled yet")
         if data_age_s > config.DATA_STALE_BLOCK_S:
             return TradePermit(False, f"stale feed ({data_age_s:.1f}s)")
-        if now_hm >= config.NO_ENTRY_AFTER:
-            return TradePermit(False, f"entry curfew after {config.NO_ENTRY_AFTER}")
+        _curfew = curfew_hm or config.NO_ENTRY_AFTER   # AUDIT F2: the equity
+        # curfew silently killed every commodity EVENING entry ("20:00" ≥
+        # "14:45"); each book now passes the curfew of ITS OWN session.
+        if now_hm >= _curfew:
+            return TradePermit(False, f"entry curfew after {_curfew}")
         if self.open_positions >= config.MAX_CONCURRENT_POSITIONS:
             return TradePermit(False, "max concurrent positions")
         if ts - self.last_exit_ts < config.COOLDOWN_S:
@@ -176,7 +249,10 @@ class RiskGovernor:
                 f"₹{outlay:,.0f} exceeds Kelly budget ₹{budget:,.0f}", budget=budget)
         cash = self.available_cash()
         buffer = outlay * 0.02                 # heuristic cost buffer …
-        if self.kite is not None and symbol:   # read-only; no order placed
+        if self.kite is not None and symbol and config.live_fire_armed():
+            # AUDIT F4: read-only, but an HTTP call per entry ATTEMPT — the
+            # affordability walker made N of them per decision-second in
+            # PAPER too. Live keeps exact charges; paper uses the 2%% buffer.
             try:                               # … EXACT charges, paper & live
                 om = self.kite.order_margins([{
                     "exchange": exchange, "tradingsymbol": symbol,

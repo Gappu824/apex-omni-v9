@@ -129,11 +129,26 @@ def main():
         return
 
     ring = BinaryRingBuffer()
-    risk = RiskGovernor(kite=kite)
+    # AUDIT F5: two books, two processes, ONE capital — each governor sized
+    # off the full TRADING_CAPITAL let combined deployment reach 2× a single
+    # book's allowance. The commodity book now runs on an explicit partition;
+    # the equity book is untouched (its governor still sees full capital, so
+    # live equity behaviour is byte-identical).
+    _frac = float(getattr(config, "COMMODITY_CAPITAL_FRAC", 0.35))
+    risk = RiskGovernor(capital=config.TRADING_CAPITAL * _frac, kite=kite,
+                        book="commodity", persist=True)
     engine = ExecutionEngine(kite=kite, quote_fn=lambda tok: {})
     brain = CommodityBrain()
     # one PositionManager per commodity (isolated from equity PMs by process)
     pms = {c: PositionManager(c, risk, engine) for c in commodities}
+    # AUDIT F2: each commodity's entry curfew derives from ITS session close
+    # (close − COMMODITY_NO_ENTRY_BEFORE_CLOSE_MIN), not the equity 14:45.
+    _cut = int(getattr(config, "COMMODITY_NO_ENTRY_BEFORE_CLOSE_MIN", 25))
+    for c, pm in pms.items():
+        cl = (config.COMMODITIES.get(c, {}) or {}).get("session_close", "23:30")
+        h, m = (int(x) for x in cl.split(":"))
+        t = h * 60 + m - _cut
+        pm.curfew_hm = f"{t // 60:02d}:{t % 60:02d}" 
 
     tradable = list(getattr(config, "COMMODITY_TRADABLE", []) or [])
     log.info("commodity brain up | capital ₹%.0f | mode %s | commodities %s | "

@@ -230,7 +230,8 @@ class PositionManager:
             sl_pct=config.BASE_SL_PCT, tp_pct=config.BASE_TP_PCT,
             data_age_s=ctx.data_age_s, now_hm=ctx.hm, ts=ctx.ts,
             ann_vol=ctx.atm_iv or None,
-            lockout_bypass=bool(getattr(ctx, "lockout_bypass", False)))
+            lockout_bypass=bool(getattr(ctx, "lockout_bypass", False)),
+            curfew_hm=getattr(self, "curfew_hm", None))
         if leg is None:
             self._log(ts=ctx.ts, event="BLOCKED", index=self.index,
                       direction=direction, reason=permit.reason,

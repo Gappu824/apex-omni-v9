@@ -262,7 +262,7 @@ def main():
         kite = KiteConnect(api_key=config.KITE_API_KEY)
         kite.set_access_token(config.KITE_ACCESS_TOKEN)
     mapper = LiveMapper(kite) if kite else None
-    risk = RiskGovernor(kite=kite)
+    risk = RiskGovernor(kite=kite, persist=True)
     ring = BinaryRingBuffer()
     builder = StateBuilder()
     engine = ExecutionEngine(kite=kite, quote_fn=lambda tok: {})
