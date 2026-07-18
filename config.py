@@ -314,6 +314,7 @@ COMMODITY_SESSION_OPEN  = "09:00"   # MCX open (before equity 09:15)
 RISK_STATE_PERSIST      = True      # day ledger survives crash-restarts (F1)
 COMMODITY_CAPITAL_FRAC  = 0.35      # commodity book's capital partition (F5)
 COMMODITY_NO_ENTRY_BEFORE_CLOSE_MIN = 25   # per-commodity curfew (F2)
+COMMODITY_FLATTEN_BEFORE_CLOSE_MIN  = 30   # per-commodity EOD (S2-F1)
 SUPERVISOR_TABS         = True      # one Windows Terminal viewer tab per child
 #                                     (tabs tail per-process logs; closing a tab
 #                                     kills nothing — supervision stays direct)
@@ -1212,6 +1213,7 @@ _HASH_EXCLUDE = frozenset({
     "COMMODITY_FORGE_COOLDOWN_S", "EVENING_CAPTURE_ENABLED",
     "COMMODITY_SESSION_OPEN", "SUPERVISOR_TABS", "RISK_STATE_PERSIST",
     "COMMODITY_CAPITAL_FRAC", "COMMODITY_NO_ENTRY_BEFORE_CLOSE_MIN",
+    "COMMODITY_FLATTEN_BEFORE_CLOSE_MIN",
     # v9.8 meta-forge engine knobs (trainer choice — model files carry their
     # own provenance; these must not fingerprint the feature world)
     "META_ENGINE", "META_EMBARGO_DAYS", "META_GBM_LEAVES", "META_GBM_LR",

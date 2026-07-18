@@ -148,7 +148,10 @@ def main():
         cl = (config.COMMODITIES.get(c, {}) or {}).get("session_close", "23:30")
         h, m = (int(x) for x in cl.split(":"))
         t = h * 60 + m - _cut
-        pm.curfew_hm = f"{t // 60:02d}:{t % 60:02d}" 
+        pm.curfew_hm = f"{t // 60:02d}:{t % 60:02d}"
+        _fm = int(getattr(config, "COMMODITY_FLATTEN_BEFORE_CLOSE_MIN", 30))
+        tf = h * 60 + m - _fm          # S2-F1: flatten near ITS close, not 15:15
+        pm.flatten_hm = f"{tf // 60:02d}:{tf % 60:02d}" 
 
     tradable = list(getattr(config, "COMMODITY_TRADABLE", []) or [])
     log.info("commodity brain up | capital ₹%.0f | mode %s | commodities %s | "
@@ -193,13 +196,19 @@ def main():
             # a management quote for the held leg (if any)
             quote = {}
             if pm.pos is not None:
-                held = (ctx_m.get("legs") or {}).get(pm.pos.leg_key) \
-                    if hasattr(pm.pos, "leg_key") else None
-                if held and held.get("snap"):
-                    s = held["snap"]
-                    quote = {"bid": float(s.get("bid") or 0),
-                             "ask": float(s.get("ask") or 0),
-                             "ltp": float(s.get("ltp") or 0)}
+                # AUDIT S2-F6: Position has no .leg_key — this lookup NEVER
+                # resolved and commodity manage() always ran on quote={}.
+                # Match the held leg by its TOKEN (which Position does carry).
+                for info in (ctx_m.get("legs") or {}).values():
+                    if int(info.get("token") or 0) == pm.pos.token \
+                            and info.get("snap"):
+                        s = info["snap"]
+                        quote = {"bid": float(s.get("bid") or 0),
+                                 "ask": float(s.get("ask") or 0),
+                                 "ltp": float(s.get("ltp") or 0),
+                                 "bid_qty": float(s.get("bid_qty") or 0),
+                                 "ask_qty": float(s.get("ask_qty") or 0)}
+                        break
             tctx = TickContext(
                 ts=ts, hm=hm, spot=spot, spot_velocity_1s=vel, data_age_s=age,
                 atm_iv=0.6,                       # commodity IV is high; refined

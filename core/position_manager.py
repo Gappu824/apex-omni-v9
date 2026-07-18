@@ -68,7 +68,10 @@ log = logging.getLogger("pm")
 
 LEDGER_FIELDS = ["ts", "event", "index", "symbol", "direction", "qty",
                  "price", "value", "conviction", "win_prob", "pnl",
-                 "costs", "reason", "order_id"]
+                 "costs", "reason", "order_id", "regime",
+                 "fingerprints"]   # v9.7.1 AUDIT S2-F3: _log silently
+                 # DROPPED these kwargs; nightly_forge:1258 reads
+                 # "fingerprints" — the trap labels were never recorded.
 
 
 @dataclass
@@ -189,6 +192,16 @@ class PositionManager:
         self._walkaway_tally = {"runaway": 0, "borderline": 0,
                                 "worst_overshoot": 0.0}
         self.ledger = Path(ledger_path or config.LEDGER_PATH)
+        _hdr = ",".join(LEDGER_FIELDS)
+        if self.ledger.exists():
+            try:                    # schema change → rotate the old ledger so
+                first = self.ledger.open(encoding="utf-8").readline().strip()
+                if first and first != _hdr:      # rows never misalign columns
+                    import time as _t
+                    self.ledger.rename(self.ledger.with_suffix(
+                        f".pre_v971_{int(_t.time())}.csv"))
+            except Exception:                              # noqa: BLE001
+                pass
         if not self.ledger.exists():
             with self.ledger.open("w", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, LEDGER_FIELDS).writeheader()
@@ -474,18 +487,22 @@ class PositionManager:
         trap = ""
         try:
             from core.trap_shield import TrapSignals
-            sig = TrapSignals(
-                spot=ctx.spot, spot_velocity=ctx.spot_velocity_1s,
-                absorption=ctx.absorption,
-                aggressive_sell_ratio=ctx.aggressive_sell_ratio,
-                oi_delta_break=ctx.oi_delta_since,
-                premium_move=abs(mark - p.entry),
-                delta_implied=max(abs(p.delta_at_entry) *
-                                  abs(ctx.spot_velocity_1s), 1e-6),
-                spread_pct=ctx.avg_spread_pct)
+            sig = TrapSignals(          # AUDIT S2-F2: the old kwargs raised
+                spot_velocity_1s=ctx.spot_velocity_1s, spot=ctx.spot,
+                absorption=ctx.absorption,   # TypeError EVERY heartbeat and the
+                aggressive_sell_ratio=ctx.aggressive_sell_ratio,   # blanket
+                oi_delta_break=ctx.oi_delta_since,   # except hid it — the trap
+                premium_move_pct=(mark - p.entry) / max(p.entry, 0.05),
+                delta_implied_move_pct=p.delta_at_entry
+                    * abs(ctx.spot - p.spike_ref_spot) / max(p.entry, 0.5),
+                spread_pct=ctx.avg_spread_pct,   # read was dead since shipping.
+                avg_spread_pct=ctx.avg_spread_pct,
+                gex_put_wall=ctx.gex_put_wall,
+                gex_call_wall=ctx.gex_call_wall)
             sc, _ = p.shield.score(sig)
             trap = f" trap {sc:.2f}"
-        except Exception:                                  # noqa: BLE001
+        except Exception as _e:                            # noqa: BLE001
+            log.debug("live trap read failed: %s", _e)      # never silent again
             trap = ""
         wp = f" P(win) {ctx.live_win_prob:.2f}" if ctx.live_win_prob is not None \
             else ""
@@ -558,8 +575,10 @@ class PositionManager:
         if (config.PROFIT_LOCK_ENABLED and p.trail_armed and not shield_holding
                 and p.profit_lock > 0 and mark <= p.profit_lock):
             return self._exit(ctx, quote, "PROFIT_LOCK", urgent=True)
-        # 2) EOD
-        if ctx.hm >= config.FORCE_FLATTEN_AT:
+        # 2) EOD — AUDIT S2-F1: the equity 15:15 string flattened a commodity
+        # with 8h of MCX session left. Each book passes ITS OWN flatten time.
+        _flat = getattr(self, "flatten_hm", None) or config.FORCE_FLATTEN_AT
+        if ctx.hm >= _flat:
             return self._exit(ctx, quote, "EOD_FLATTEN", urgent=True)
         # 3) stale feed
         if ctx.data_age_s > config.DATA_STALE_FLATTEN_S:
@@ -769,7 +788,23 @@ class PositionManager:
     def _exit(self, ctx: TickContext, quote: dict, reason: str,
               urgent: bool = False) -> str:
         p = self.pos
-        bid = float(quote.get("bid") or 0) or p.entry * 0.9
+        bid = float(quote.get("bid") or 0)
+        ltp = float(quote.get("ltp") or 0)
+        if bid <= 0 and ltp <= 0:
+            # AUDIT S2-F5: the old fallback INVENTED a fill at 0.9×entry — a
+            # fabricated −10%. No quote: non-urgent exits retry next tick;
+            # urgent ones use entry (flat) with a loud record of the fact.
+            if not urgent:
+                self._log(ts=ctx.ts, event="EXIT_NOQUOTE", index=self.index,
+                          symbol=p.symbol, direction=p.direction,
+                          reason=f"{reason} — no quote, retrying")
+                return "RETRY"
+            bid = p.entry
+            reason = f"{reason} (quote-missing: filled at entry, NOT market)"
+            log.warning("URGENT exit %s with NO quote — using entry price; "
+                        "paper PnL for this exit is not market-derived",
+                        p.symbol)
+        bid = bid or ltp
         bq = float(quote.get("bid_qty") or 0)
         aq = float(quote.get("ask_qty") or 0)
         ask = float(quote.get("ask") or bid)
@@ -799,8 +834,14 @@ class PositionManager:
                   conviction=f"{p.conviction:.3f}",
                   win_prob=f"{p.win_prob:.3f}")
         remaining = p.qty - fill.qty
-        self.risk.register_exit(p.entry * p.qty, pnl, p.direction, ctx.ts,
-                                fast_lane=p.fast_lane)
+        # AUDIT S2-F4: the old call released the FULL original outlay on a
+        # PARTIAL fill (deployed hit 0 with units still held) and then released
+        # the remainder AGAIN on the final exit — and fired the lockout/streak
+        # once per portion. Release only what was SOLD; close the position (
+        # open-slot, cooldown, lockout, fast-lane streak) only when it is flat.
+        self.risk.register_exit(p.entry * fill.qty, pnl, p.direction, ctx.ts,
+                                fast_lane=p.fast_lane,
+                                close_position=(remaining <= 0))
         log.info("EXIT %s %s ×%d @ %.2f | %s | PnL ₹%.2f (costs ₹%.2f)",
                  self.index, p.symbol, fill.qty, fill.avg_price, reason,
                  pnl, costs)

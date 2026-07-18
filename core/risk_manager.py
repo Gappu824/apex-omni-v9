@@ -169,11 +169,21 @@ class RiskGovernor:
 
     def register_exit(self, premium_outlay: float, pnl_after_costs: float,
                       direction: str, ts: float | None = None,
-                      fast_lane: bool = False):
+                      fast_lane: bool = False, close_position: bool = True):
+        """close_position=False for a PARTIAL exit (AUDIT S2-F4): the sold
+        portion's capital and PnL are booked, but the open slot stays taken and
+        cooldown / lockout / the fast-lane streak wait for the FINAL fill."""
         ts = ts or time.time()
         self.deployed = max(self.deployed - premium_outlay, 0.0)
-        self.open_positions = max(self.open_positions - 1, 0)
         self.realized_pnl += pnl_after_costs
+        if not close_position:
+            self._save_day_state()
+            dd = -self.realized_pnl / self.start_capital
+            if dd >= config.MAX_DAILY_DRAWDOWN_PCT:
+                self.kill(f"daily drawdown {dd:.1%} ≥ "
+                          f"{config.MAX_DAILY_DRAWDOWN_PCT:.0%} limit")
+            return
+        self.open_positions = max(self.open_positions - 1, 0)
         self.last_exit_ts = ts
         if pnl_after_costs < 0:
             self.lockout_until = ts + config.DIRECTION_LOCKOUT_S
