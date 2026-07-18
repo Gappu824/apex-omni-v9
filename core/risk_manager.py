@@ -54,6 +54,16 @@ class RiskGovernor:
         self.last_exit_ts = 0.0
         self.lockout_until = 0.0
         self.lockout_direction = None
+        # v9.7.1 fast-lane loss-streak breaker: N consecutive FAST-LANE losses
+        # suspends the FAST LANE for the rest of the day — it does NOT halt the
+        # book. The normal 45-min path keeps running on its own risk controls
+        # (drawdown halt, cascade lockout). This is a scoped anti-overtrading
+        # guard: overtrading is a fast-lane risk, so the breaker governs only
+        # the fast lane. Only fast-lane losses count; a fast-lane win (or any
+        # non-losing fast-lane exit) resets the streak. Normal-path trades never
+        # touch this counter.
+        self.fast_consec_losses = 0
+        self.fast_lane_suspended = False
 
     # ------------------------------------------------------------ capital
     def available_cash(self) -> float:
@@ -90,7 +100,8 @@ class RiskGovernor:
         self.open_positions += 1
 
     def register_exit(self, premium_outlay: float, pnl_after_costs: float,
-                      direction: str, ts: float | None = None):
+                      direction: str, ts: float | None = None,
+                      fast_lane: bool = False):
         ts = ts or time.time()
         self.deployed = max(self.deployed - premium_outlay, 0.0)
         self.open_positions = max(self.open_positions - 1, 0)
@@ -99,6 +110,20 @@ class RiskGovernor:
         if pnl_after_costs < 0:
             self.lockout_until = ts + config.DIRECTION_LOCKOUT_S
             self.lockout_direction = direction
+            # fast-lane loss-streak breaker — counts ONLY fast-lane losses and
+            # suspends ONLY the fast lane (the 45-min path keeps trading).
+            if fast_lane:
+                self.fast_consec_losses += 1
+                _streak_max = int(getattr(config, "LOSS_STREAK_HALT", 3))
+                if _streak_max > 0 and self.fast_consec_losses >= _streak_max:
+                    if not self.fast_lane_suspended:
+                        log.warning("⏸ FAST LANE SUSPENDED for the day "
+                                    "(%d consecutive fast-lane losses) — the "
+                                    "normal 45-min path continues",
+                                    self.fast_consec_losses)
+                    self.fast_lane_suspended = True
+        elif fast_lane:
+            self.fast_consec_losses = 0   # a fast-lane win resets the streak
         dd = -self.realized_pnl / self.start_capital
         if dd >= config.MAX_DAILY_DRAWDOWN_PCT:
             self.kill(f"daily drawdown {dd:.1%} ≥ "

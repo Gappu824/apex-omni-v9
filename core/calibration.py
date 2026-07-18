@@ -74,6 +74,40 @@ def index_calib(index: str) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Commodity trade-eligibility gate (v9.7.1) — the single source of truth
+# --------------------------------------------------------------------------
+def commodity_daily_calib(commodity: str) -> dict:
+    """Track-A (daily-futures backfill) calibration for a commodity."""
+    return (calib().get("commodities_daily", {}) or {}).get(commodity, {}) or {}
+
+
+def commodity_trade_eligible(commodity: str) -> tuple[bool, str]:
+    """(eligible, reason). A commodity may be traded ONLY when ALL hold:
+      1. it is EXPLICITLY listed in config.COMMODITY_TRADABLE (operator intent),
+      2. Track-A daily calibration exists (historical futures backfilled),
+      3. Track-B intraday calibration exists AND intraday_calibrated is True
+         (the live vault is deep enough to know its microstructure).
+    This is the gate that keeps a fully-built engine from trading a commodity
+    blind. Equity is unaffected — this function is commodity-only."""
+    tradable = list(_cfg("COMMODITY_TRADABLE", []) or [])
+    if commodity not in tradable:
+        return False, (f"{commodity} not in COMMODITY_TRADABLE "
+                       f"(operator has not enabled it)")
+    da = commodity_daily_calib(commodity)
+    if not da or "atr_proxy_daily" not in da:
+        return False, (f"{commodity} has no Track-A daily calibration — run "
+                       f"tools/commodity_backfill.py")
+    ic = index_calib(commodity)
+    if not ic.get("intraday_calibrated"):
+        n = ic.get("n_ticks", 0)
+        return False, (f"{commodity} has no Track-B intraday calibration "
+                       f"(n_ticks={n}) — harvest more sessions, then run "
+                       f"tools/commodity_calibration.py")
+    return True, (f"{commodity} eligible: Track-A + Track-B calibrated and "
+                  f"operator-enabled")
+
+
+# --------------------------------------------------------------------------
 # Calibrated toxicity thresholds (fall back to config)
 # --------------------------------------------------------------------------
 def tox_thresholds(index: str) -> tuple[float, float]:

@@ -168,6 +168,8 @@ class Position:
     trail: object = None          # PeakCaptureTrail over the executable mark
     reversal_since: float = 0.0   # dwell clock: conviction hard against us
     theta_rides: int = 0          # 0/1 flag: rode past the theta guillotine
+    fast_lane: bool = False       # v9.7.1: high-conviction quick-profit trade
+    entry_conviction: float = 0.0 # |conviction| at entry (fast-lane qualifier)
     _dyn_tp_pct: float = 0.0      # vault-calibrated vol-scaled target fraction
     _dyn_src: str = ""            # provenance of the dynamic stop/target
 
@@ -241,7 +243,10 @@ class PositionManager:
         tick = 0.05
         micro = micro_price(q.bid, q.ask, q.bid_qty, q.ask_qty)
         spread_pct = (q.ask - q.bid) / max((q.ask + q.bid) / 2, 0.05)
-        step = config.INDICES[self.index]["strike_step"]
+        # spec is an INDEX or a COMMODITY (this PM is shared by both brains)
+        _spec = (config.INDICES.get(self.index)
+                 or getattr(config, "COMMODITIES", {}).get(self.index) or {})
+        step = _spec.get("strike_step", 1.0)
         cross = abs(conviction) >= config.ENTRY_CROSS_CONVICTION
 
         if cross:
@@ -355,6 +360,33 @@ class PositionManager:
                      dte=float(q.dte))
         p._dyn_tp_pct = _dyn_tp_pct        # vol-scaled target (0 ⇒ base)
         p._dyn_src = _dyn_src
+        # v9.7.1 fast lane: a genuinely high-conviction entry qualifies for the
+        # quick-profit clock. This ADDS a fast take-profit overlay; it does not
+        # remove the normal 45-min path underneath.
+        p.entry_conviction = abs(conviction)
+        _fl_qualifies = (bool(getattr(config, "FAST_LANE_ENABLED", False))
+                         and p.entry_conviction >= float(
+                             getattr(config, "FAST_LANE_CONVICTION", 0.85)))
+        _fl_suspended = bool(getattr(self.risk, "fast_lane_suspended", False))
+        # a qualifying entry becomes a fast-lane trade UNLESS the lane is
+        # suspended for the day (loss-streak breaker) — in which case it simply
+        # runs as a normal 45-min trade. The entry is never blocked by the
+        # breaker; only the fast clock is withheld.
+        p.fast_lane = _fl_qualifies and not _fl_suspended
+        if p.fast_lane:
+            self._log(ts=ctx.ts, event="FAST_LANE_ARMED", index=self.index,
+                      symbol=q.symbol, direction=direction,
+                      price=f"{fill.avg_price:.2f}",
+                      conviction=f"{conviction:.3f}",
+                      reason=f"conv {p.entry_conviction:.2f} ≥ "
+                             f"{config.FAST_LANE_CONVICTION}")
+        elif _fl_qualifies and _fl_suspended:
+            self._log(ts=ctx.ts, event="FAST_LANE_SUSPENDED", index=self.index,
+                      symbol=q.symbol, direction=direction,
+                      price=f"{fill.avg_price:.2f}",
+                      conviction=f"{conviction:.3f}",
+                      reason="fast lane off for the day (loss streak) — "
+                             "trading as normal 45-min")
         p.stop = fill.avg_price - sl_dist
         p.floor = fill.avg_price - min(sl_dist * config.DISASTER_FLOOR_MULT,
                                        fill.avg_price * config.ABS_DISASTER_PCT)
@@ -531,6 +563,23 @@ class PositionManager:
         # 3) stale feed
         if ctx.data_age_s > config.DATA_STALE_FLATTEN_S:
             return self._exit(ctx, quote, "STALE_FEED_FLATTEN", urgent=True)
+        # 3.5) FAST LANE — quick take-profit overlay for high-conviction trades.
+        # ONLY within the 3-10 min window, ONLY once armed past FAST_LANE_ARM_PCT
+        # in profit, and ONLY on a sharp gain that clears FAST_LANE_TP_PCT. If
+        # the move doesn't come inside the window, control falls through to the
+        # normal 45-min exit logic below (this NEVER cuts a slow winner short —
+        # it only banks a fast one). The armed trail + profit lock still protect
+        # the downside underneath.
+        if p.fast_lane:
+            _hold = ctx.ts - p.entry_ts
+            _fl_min = float(getattr(config, "FAST_LANE_MIN_HOLD_S", 180))
+            _fl_max = float(getattr(config, "FAST_LANE_MAX_HOLD_S", 600))
+            if _fl_min <= _hold <= _fl_max:
+                _fl_gain = (mark - p.entry) / p.entry if p.entry > 0 else 0.0
+                _fl_arm = float(getattr(config, "FAST_LANE_ARM_PCT", 0.12))
+                _fl_tp = float(getattr(config, "FAST_LANE_TP_PCT", 0.22))
+                if _fl_gain >= _fl_arm and mark >= p.entry * (1 + _fl_tp):
+                    return self._exit(ctx, quote, "FAST_LANE_TP", urgent=True)
         # 4) target — EXTENDED, not banked, while the edge is demonstrably on.
         # Two judges, in strict precedence:
         #   a) trained meta P(win) (unchanged v9 semantics) when it exists;
@@ -749,7 +798,8 @@ class PositionManager:
                   conviction=f"{p.conviction:.3f}",
                   win_prob=f"{p.win_prob:.3f}")
         remaining = p.qty - fill.qty
-        self.risk.register_exit(p.entry * p.qty, pnl, p.direction, ctx.ts)
+        self.risk.register_exit(p.entry * p.qty, pnl, p.direction, ctx.ts,
+                                fast_lane=p.fast_lane)
         log.info("EXIT %s %s ×%d @ %.2f | %s | PnL ₹%.2f (costs ₹%.2f)",
                  self.index, p.symbol, fill.qty, fill.avg_price, reason,
                  pnl, costs)

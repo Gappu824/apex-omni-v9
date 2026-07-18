@@ -74,10 +74,13 @@ class HarvestDiag:
     """Pure counters — zero I/O on the tick path; serialized by the report."""
 
     def __init__(self):
+        # equity indices + harvested commodities — both get coverage counters
+        _names = list(config.INDEX_ORDER) + \
+            list(getattr(config, "HARVEST_COMMODITIES", []))
         self.per_idx: dict[str, dict] = {
             i: {"spot_ticks": 0, "leg_ticks": 0, "leg_oi_nonzero": 0,
                 "leg_depth_2sided": 0, "gap_count": 0, "max_gap_s": 0.0}
-            for i in config.INDEX_ORDER}
+            for i in _names}
         self.vix_ticks = 0
         self.ws_connects = 0
         self.ws_closes = 0
@@ -231,6 +234,16 @@ class Harvester:
         self.vix_token = int(v["instrument_token"]) if v else None
         if self.vix_token:
             self.token_role[self.vix_token] = ("VIX", "spot", 0.0)
+        # v9.7.1: commodity "spot" = front-month FUTURE (from the mapper). These
+        # feed the same ATM-tracking + option-leg subscription path as indices.
+        for name, fut in getattr(self.mapper, "commodity_futures", {}).items():
+            tok = fut["token"]
+            self.spot_tokens[name] = tok
+            self.token_role[tok] = (name, "spot", 0.0)
+        if getattr(self.mapper, "commodity_futures", {}):
+            log.info("Commodity spot(=fut) tokens: %s",
+                     {k: self.spot_tokens.get(k)
+                      for k in self.mapper.commodity_futures})
         log.info("Spot tokens: %s | VIX token %s", self.spot_tokens,
                  self.vix_token)
 
@@ -416,8 +429,11 @@ class Harvester:
                     if not sp or not sp["ltp"]:
                         continue
                     ch = self.chains.get(idx)
+                    _spec = (config.INDICES.get(idx)
+                             or getattr(config, "COMMODITIES", {}).get(idx)
+                             or {})
                     step = (ch or {}).get("step") or \
-                        config.INDICES[idx]["strike_step"]
+                        _spec.get("strike_step", 1.0)
                     atm = round(sp["ltp"] / step) * step
                     if last_atm.get(idx) != atm:
                         self._resubscribe(idx, sp["ltp"])

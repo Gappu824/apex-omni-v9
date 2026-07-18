@@ -133,15 +133,20 @@ class SmartLockout:
     def __init__(self):
         self.bypasses_today = 0
         self.last_loss_z: dict[str, float] = {}     # direction → |z| that lost
+        self.last_loss_px: dict[str, float] = {}    # direction → spot at the loss
         self.last_bypass_ts = -1e18
 
-    def note_loss(self, direction: str, cascade_z: float | None) -> None:
-        """Record the strength of the trigger that just lost, so the next
-        re-trigger can be judged 'stronger than the loss'."""
+    def note_loss(self, direction: str, cascade_z: float | None,
+                  spot: float | None = None) -> None:
+        """Record the strength AND the spot level of the trigger that just lost,
+        so the next re-trigger can be judged both 'stronger than the loss' and
+        'price has reclaimed the level' (a genuine trap, not a real reversal)."""
         if cascade_z is not None:
             prev = self.last_loss_z.get(direction, 0.0)
             # keep the STRONGEST recent losing trigger as the bar to beat
             self.last_loss_z[direction] = max(prev, abs(cascade_z))
+        if spot is not None:
+            self.last_loss_px[direction] = float(spot)
 
     def evaluate(self, *, ts: float, direction: str, is_cascade: bool,
                  cascade_z: float | None, spot: float, flip: float | None,
@@ -181,10 +186,30 @@ class SmartLockout:
             return LockoutVerdict(
                 False, f"not aligned (spot {spot:.0f} vs flip {flip:.0f}, "
                        f"gex {net_gex:.1e}) — lockout stands", diag)
+        # v9.7.1 RECLAIM CONFIRMATION (operator's "strongest bar"): price must
+        # have RECLAIMED past the level where the last trade was stopped —
+        # proving that stop-out was a hunt, not a real reversal. For a CE, spot
+        # must now be ABOVE where the CE lost; for a PE, BELOW. Without a
+        # recorded loss level we cannot confirm a reclaim, so the lockout stands.
+        loss_px = self.last_loss_px.get(direction)
+        if bool(_cfg("LOCKOUT_BYPASS_REQUIRE_RECLAIM", True)):
+            if loss_px is None:
+                return LockoutVerdict(
+                    False, "no reclaim reference — lockout stands", diag)
+            reclaimed = ((direction == "CE" and spot > loss_px) or
+                         (direction == "PE" and spot < loss_px))
+            diag["loss_px"] = round(loss_px, 1)
+            diag["reclaimed"] = reclaimed
+            if not reclaimed:
+                return LockoutVerdict(
+                    False, f"no reclaim: spot {spot:.0f} hasn't retaken the "
+                           f"loss level {loss_px:.0f} — not a confirmed trap, "
+                           f"lockout stands", diag)
         return LockoutVerdict(
-            True, f"STRENGTHENING aligned cascade: z {abs(cascade_z):.2f} > "
-                  f"loss {loss_z:.2f}, spot beyond flip, short-gamma — trend "
-                  f"continuation, not revenge; lockout BYPASSED", diag)
+            True, f"STRENGTHENING aligned cascade + RECLAIM: z "
+                  f"{abs(cascade_z):.2f} > loss {loss_z:.2f}, spot beyond flip "
+                  f"AND retook the loss level — confirmed trap, not revenge; "
+                  f"lockout BYPASSED", diag)
 
     def register_bypass(self, ts: float) -> None:
         self.bypasses_today += 1
@@ -213,27 +238,37 @@ if __name__ == "__main__":
 
     print("\n=== Part B: smart lockout (replaying 2026-07-16) ===")
     lk = SmartLockout()
-    # trade 1 lost (z -2.04)
-    lk.note_loss("PE", -2.04)
+    # trade 1 lost (z -2.04) at spot 77450
+    lk.note_loss("PE", -2.04, spot=77450)
     # trade 2 lost (z -2.04) — same strength, this WOULD be revenge if retried
     v_rev = lk.evaluate(ts=100, direction="PE", is_cascade=True,
                         cascade_z=-2.04, spot=77400, flip=77507, net_gex=-20e12)
     print(f"  same-strength re-trigger (z-2.04 after z-2.04 loss):\n"
           f"    bypass={v_rev.bypass} — {v_rev.reason}")
-    lk.note_loss("PE", -2.04)
-    # trade 3: STRONGER trigger (z -2.59), still aligned → should BYPASS
+    lk.note_loss("PE", -2.04, spot=77400)
+    # trade 3: STRONGER trigger (z -2.59), aligned, AND spot 77376 has reclaimed
+    # BELOW the loss level 77400 (confirmed downside trap) → should BYPASS
     v_jack = lk.evaluate(ts=200, direction="PE", is_cascade=True,
                          cascade_z=-2.59, spot=77376, flip=77478,
                          net_gex=-25.5e12)
-    print(f"  STRONGER aligned re-trigger (z-2.59, the jackpot):\n"
+    print(f"  STRONGER aligned re-trigger + reclaim (z-2.59, the jackpot):\n"
           f"    bypass={v_jack.bypass} — {v_jack.reason}")
     # a countertrend CE after PE losses (revenge/flip) → must stay locked
     v_ct = lk.evaluate(ts=300, direction="PE", is_cascade=True,
                        cascade_z=-2.7, spot=77600, flip=77478, net_gex=-25e12)
     print(f"  strong but MIS-ALIGNED (spot back above flip):\n"
           f"    bypass={v_ct.bypass} — {v_ct.reason}")
+    # STRONGER + aligned but NO reclaim (spot above the loss level) → stay locked
+    lk2 = SmartLockout()
+    lk2.note_loss("PE", -2.04, spot=77300)      # lost at 77300
+    v_noreclaim = lk2.evaluate(ts=400, direction="PE", is_cascade=True,
+                               cascade_z=-2.59, spot=77380, flip=77478,
+                               net_gex=-25e12)   # 77380 > 77300: not reclaimed
+    print(f"  stronger+aligned but NO reclaim (spot above loss level):\n"
+          f"    bypass={v_noreclaim.bypass} — {v_noreclaim.reason}")
 
     ok = (v_rev.bypass is False and v_jack.bypass is True
-          and v_ct.bypass is False)
+          and v_ct.bypass is False and v_noreclaim.bypass is False)
     print(f"\n  {'✓ PASS' if ok else '✗ FAIL'}: revenge blocked, "
-          f"strengthening-trend jackpot allowed, misaligned blocked")
+          f"strengthening+reclaim jackpot allowed, misaligned blocked, "
+          f"no-reclaim blocked")

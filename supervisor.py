@@ -28,7 +28,9 @@ from pathlib import Path
 
 import config
 
-PROCS = ["data_harvester_v9.py", "macro_gex_v9.py", "apex_main_v9.py"]
+PROCS = ["data_harvester_v9.py", "macro_gex_v9.py", "apex_main_v9.py",
+         "apex_commodity_main.py"]   # v9.7.1: the live commodity brain (paper;
+#          trades nothing until a commodity is calibrated + in COMMODITY_TRADABLE)
 PRE_OPEN_MIN = 5           # start this many minutes before the session open
 POST_CLOSE_MIN = 5         # stop this many minutes after the close
 MAX_RESTARTS_HOUR = 6

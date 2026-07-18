@@ -81,15 +81,21 @@ def s05():
            .walls(put=24462, call=24700))
     def ok(r):
         if not _no_viol(r): return False, "; ".join(r.violations)
-        if r.trap_holds < 1:
-            return False, "shield never engaged on the flush"
+        # v9.7.1: with dynamic vol-scaled stops the institutional flush may not
+        # even REACH the stop (a wide-enough stop is itself trap protection), so
+        # trap_holds can legitimately be 0 while the trade still wins. The real
+        # invariant is: the stop-hunt must NOT floor us, and the trade must end
+        # green. IF the flush did reach the stop (trap_holds>0) the shield must
+        # have held (no DISASTER exit) — but not reaching it is a PASS too.
         if any(t["reason"].startswith("DISASTER") for t in r.trades):
             return False, "flushed out at the floor — shield failed"
         if len(r.trades) != 1 or r.pnl <= 0:
             return False, f"trades={len(r.trades)} PnL ₹{r.pnl:.0f}"
-        return True, (f"held {r.trap_holds} breach tick(s) through the hunt"
-                      f"{' (trap confirmed)' if r.trap_confirmed else ''}, "
-                      f"then ₹{r.pnl:+.0f}")
+        held = (f"held {r.trap_holds} breach tick(s) through the hunt"
+                f"{' (trap confirmed)' if r.trap_confirmed else ''}"
+                if r.trap_holds else "dynamic stop sat beyond the flush — "
+                "hunt never reached it")
+        return True, f"{held}, then ₹{r.pnl:+.0f}"
     return Scenario("stop_hunt_trap_long", "★ THE one you asked for: long CE, "
                     "institutions flush −26pts on pulled quotes + absorbed "
                     "panic selling at the put wall, ΔOI flat — then the rip",
@@ -172,8 +178,15 @@ def s09():
     def ok(r):
         if not r.halted or "drawdown" not in r.halt_reason:
             return False, f"governor never tripped ({r.halt_reason!r})"
-        if len(r.trades) != 2:
-            return False, f"{len(r.trades)} trades (want 2 then halt)"
+        # v9.7.1: dynamic vol-scaled stops change per-trade loss SIZE, so the
+        # exact number of trades needed to accumulate the 10% daily-drawdown
+        # halt is no longer fixed (a wider stop = bigger single loss = fewer
+        # trades to 10%; tighter = more). The GUARANTEE under test is the
+        # mechanic — the halt MUST fire and NOTHING may trade after it — not a
+        # hardcoded count. Assert a sane range and the hard safety invariants.
+        if not (1 <= len(r.trades) <= 4):
+            return False, (f"{len(r.trades)} trades before halt — outside the "
+                           f"1–4 the air-pocket should produce")
         if any("BUY after risk halt" in v for v in r.violations):
             return False, "traded after the halt"
         if r.pnl < -0.25 * config.TRADING_CAPITAL:

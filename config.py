@@ -225,6 +225,86 @@ INDICES = {
     "BANKEX":     {"exchange": "BFO", "spot_symbol": "BSE:BANKEX",          "weekly": False, "lot_fallback": 30,  "strike_step": 100},
 }
 INDEX_ORDER = list(INDICES.keys())
+
+# ============================================================================
+# MCX COMMODITIES (v9.7.1) — DATA HARVEST ONLY (no trading engine yet).
+# Declares WHICH commodities to capture; lot size and strike step are read
+# from the live Kite instrument dump (authoritative + current), NOT hardcoded,
+# because MCX revises specs and mini/regular differ. The commodity "underlying"
+# is the FRONT-MONTH FUTURE (there is no spot index) — resolved from the dump
+# by name, its token rolling each expiry. `name` is the Kite instrument `name`
+# field on MCX; `fut_segment` is where the future/options live.
+#
+# Commodities differ from equity in ways the FUTURE ENGINE must handle (they
+# are irrelevant to raw tick capture): a much longer session (to 23:30 IST),
+# news-driven gaps (EIA Wed 20:00 IST, OPEC, weather), monthly option expiries
+# that devolve into futures 7 trading days before futures expiry, and far
+# higher IV. HARVESTING needs none of that — the WS delivers MCX ticks whenever
+# the segment is open and the run-loop is session-agnostic, so capture "just
+# works" to 23:30. The trading engine is a SEPARATE, later, evidence-gated build.
+COMMODITIES = {
+    "CRUDEOIL":   {"exchange": "MCX", "fut_segment": "MCX", "lot_fallback": 100,
+                   "strike_step": 50,  "session_close": "23:30"},
+    "NATURALGAS": {"exchange": "MCX", "fut_segment": "MCX", "lot_fallback": 1250,
+                   "strike_step": 5,   "session_close": "23:30"},
+    "GOLD":       {"exchange": "MCX", "fut_segment": "MCX", "lot_fallback": 100,
+                   "strike_step": 100, "session_close": "23:30"},
+    "SILVER":     {"exchange": "MCX", "fut_segment": "MCX", "lot_fallback": 30,
+                   "strike_step": 100, "session_close": "23:55"},
+    "COPPER":     {"exchange": "MCX", "fut_segment": "MCX", "lot_fallback": 2500,
+                   "strike_step": 5,   "session_close": "23:30"},
+}
+COMMODITY_ORDER = list(COMMODITIES.keys())
+# Commodities the harvester CAPTURES. Trading remains OFF for all of them until
+# the vault has enough MCX ticks to calibrate real thresholds (the same
+# evidence gate every other subsystem obeys). HARVEST_COMMODITIES drives the
+# harvester ONLY; it does NOT add anything to the tradable universe.
+HARVEST_COMMODITIES = ["CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"]
+COMMODITY_TRADABLE = []          # ← stays empty until calibrated. Do not edit.
+
+# --- commodity scheduled-event / news-gap guard (core/event_engine.py) ---
+# The honest "news" layer: block/flatten around KNOWN releases (EIA petroleum
+# Wed, EIA natgas Thu, plus dated OPEC/FOMC/CPI/NFP in EVENT_OVERRIDES). Pure
+# calendar math, DST-correct ET→IST. Advisory (blocks entries only). Harvest-
+# only for now; consumed by the future commodity engine + nightly analyst.
+EVENT_GUARD_ENABLED     = True
+EVENT_BLACKOUT_PRE_MIN  = 20     # block new entries N min before a release
+EVENT_SETTLE_POST_MIN   = 30     # volatile settle window N min after
+# EVENT_OVERRIDES: list of core.event_engine.MarketEvent for dated one-offs
+# (OPEC/FOMC/CPI/NFP) and EIA holiday shifts. Empty ⇒ only weekly EIA rules.
+# The nightly analyst (Gemma) can DRAFT additions here for operator review.
+EVENT_OVERRIDES         = None
+
+# --- Gemma nightly analyst (tools/gemma_analyst.py) — OFFLINE reasoning ---
+# Gemma 4 E4B via Ollama (Q4_K_M, fits 8GB). Runs ONCE nightly in run_evening,
+# reasons over the event calendar + the night's reports, writes a digest +
+# brief. FAIL-SAFE: if Ollama is down/absent, the analyst is skipped and the
+# system runs identically. NEVER in the tick/decision path. All hash-excluded.
+GEMMA_ANALYST_ENABLED   = True
+# Ollama tag. gemma4:e4b (~9.6GB) has the better reasoning but exceeds 8GB VRAM,
+# so on an RTX 4060 Ollama offloads part to CPU — SLOWER but fine for a
+# once-nightly analyst that isn't latency-bound. For fully-on-GPU inference on
+# 8GB, use "gemma4:e2b" (~7.2GB, fits with headroom). Verify with `ollama list`.
+GEMMA_MODEL             = "gemma4:e4b"
+OLLAMA_HOST             = "http://127.0.0.1:11434"
+GEMMA_NUM_CTX           = 4096            # keep KV cache small on 8GB
+GEMMA_TIMEOUT_S         = 120            # generous; nightly, not latency-bound
+
+# --- commodity calibration gates (Track-A daily backfill + Track-B intraday) ---
+COMMODITY_CALIB_MIN_DAYS = 250   # Track-A trusts a daily stat only with ≥ this
+COMMODITY_CALIB_MIN_TICKS = 30000  # Track-B trusts an intraday stat only w/ this
+# commodity heuristic policy weights (same physics as equity HEURISTIC_W; can be
+# retuned per commodity microstructure once Track-B data exists). Entry bar can
+# sit higher than equity given commodity IV. All hash-excluded (harvest-side).
+COMMODITY_HEURISTIC_W = (0.45, 0.25, 0.15, 0.15)   # (ofi, dealer, velocity, mom)
+COMMODITY_ENTRY_CONVICTION = 0.72
+# commodity forge (nightly_commodity_forge.py) — trains the commodity meta on
+# harvested ticks with the SAME purged-CV GBM pipeline as equity. Data-gated.
+COMMODITY_META_MIN_TRAIN   = 300   # labeled signals before a model may train
+COMMODITY_FORGE_COOLDOWN_S = 180   # sampler cooldown between signals/commodity
+# a commodity is TRADE-ELIGIBLE only when BOTH tracks are calibrated AND it is
+# explicitly in COMMODITY_TRADABLE (which stays empty until you put it there).
+
 # ★ Indices the brain may actually TRADE (others remain context nodes only).
 # At ₹60k the Kelly walker fits NIFTY across most of the week and SENSEX
 # (lot 20) on cheaper strikes; both stay in. Trim to ["NIFTY"] if SENSEX
@@ -538,6 +618,25 @@ IMOM_AFTER          = "14:00"
 # 0-DTE regime (expiry-day gamma/theta): tighter theta guillotine.
 EXPIRY_DTE_LT          = 1.0
 MAX_HOLD_MINUTES_0DTE  = 25
+
+# ============================================================================
+# FAST LANE (v9.7.1) — conviction-gated quick-profit exit, SEPARATE from the
+# normal 45-min path. A high-conviction entry gets a short profit clock: it
+# takes a sharp gain fast, but FALLS BACK to the normal exit logic if the move
+# doesn't come (so it never cuts a slow winner short — it only ADDS a fast
+# take-profit on top). This does NOT change the meta-labeler's 45-min training
+# barrier; it's a serving-time exit overlay only. Hash-excluded (exit tempo).
+FAST_LANE_ENABLED       = True
+FAST_LANE_CONVICTION    = 0.85   # entry conviction to qualify (well above 0.70)
+FAST_LANE_MIN_HOLD_S    = 180    # 3 min: don't even check fast-TP before this
+FAST_LANE_MAX_HOLD_S    = 600    # 10 min: after this, hand back to normal path
+FAST_LANE_TP_PCT        = 0.22   # quick take-profit target (premium fraction)
+FAST_LANE_ARM_PCT       = 0.12   # only arm the fast-TP once this far in profit
+# loss-streak circuit breaker — the operator's anti-overtrading guard
+LOSS_STREAK_HALT        = 3      # N consecutive losing trades ends the day
+LOCKOUT_BYPASS_REQUIRE_RECLAIM = True  # bypass also needs price to have RECLAIMED
+#                                        the loss level (confirmed trap, not just
+#                                        a stronger signal) — the "strongest bar"
 
 # Provenance: every run logs the exact config it traded on.
 import hashlib as _hl
@@ -1080,6 +1179,18 @@ DISP_FLY_PROGRESS_MAX   = 0.60    # never displace a fly ≥60% of the way to TP
 # updates this list. Operational additions you don't want to force a re-forge
 # must be named with a path suffix or added to _HASH_EXCLUDE.
 _HASH_EXCLUDE = frozenset({
+    # v9.7.1 MCX commodity HARVEST knobs — data capture only, touch NOTHING the
+    # forge trains on (the forge sees TRADABLE = equity indices). Adding a
+    # commodity or changing its step must NOT invalidate the equity model, so
+    # these are operational, not part of the feature-world fingerprint.
+    "COMMODITIES", "COMMODITY_ORDER", "HARVEST_COMMODITIES",
+    "COMMODITY_TRADABLE", "EVENT_GUARD_ENABLED", "EVENT_BLACKOUT_PRE_MIN",
+    "EVENT_SETTLE_POST_MIN", "EVENT_OVERRIDES",
+    "GEMMA_ANALYST_ENABLED", "GEMMA_MODEL", "OLLAMA_HOST", "GEMMA_NUM_CTX",
+    "GEMMA_TIMEOUT_S", "COMMODITY_CALIB_MIN_DAYS",
+    "COMMODITY_CALIB_MIN_TICKS", "COMMODITY_HEURISTIC_W",
+    "COMMODITY_ENTRY_CONVICTION", "COMMODITY_META_MIN_TRAIN",
+    "COMMODITY_FORGE_COOLDOWN_S",
     # v9.8 meta-forge engine knobs (trainer choice — model files carry their
     # own provenance; these must not fingerprint the feature world)
     "META_ENGINE", "META_EMBARGO_DAYS", "META_GBM_LEAVES", "META_GBM_LR",
@@ -1192,6 +1303,10 @@ _HASH_EXCLUDE = frozenset({
     "EXIT_CONFIRM_S", "EXIT_HARD_BREACH_MULT", "EXIT_STAGNATION_S",
     "EXIT_THETA_TIGHTEN_MIN_LEFT", "EXIT_THETA_TIGHTEN_MIN",
     "REVERSAL_CONFIRM_S", "MAX_HOLD_RIDE_MULT",
+    "FAST_LANE_ENABLED", "FAST_LANE_CONVICTION", "FAST_LANE_MIN_HOLD_S",
+    "FAST_LANE_MAX_HOLD_S", "FAST_LANE_TP_PCT", "FAST_LANE_ARM_PCT",
+    "LOSS_STREAK_HALT",
+    "LOCKOUT_BYPASS_REQUIRE_RECLAIM",
     "SV_FLY_SL_HARD_FRAC", "FLY_STOP_CONFIRM_S", "FLY_TRAIL_ARM_FRAC",
     "FLY_GIVE_FRAC", "FLY_GIVE_FLOOR_FRAC", "FLY_K_SIGMA",
     "FLY_MARK_EMA_HL_S", "FLY_SIGMA_PRIOR_FRAC", "FLY_EXIT_CONFIRM_S",

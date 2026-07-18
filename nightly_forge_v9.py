@@ -1009,14 +1009,22 @@ def _shadow_trade(rep, s, t):
 
 
 def _grade_day(con, day: str, decide, meta, cal, funnel=None,
-               attribution=None):
+               attribution=None, on_entry=None):
     """After-cost ₹ a policy would have ACTUALLY realized on `day`, sized
     EXACTLY like live: ONE RiskGovernor across ALL tradable indices (the live
     MAX_CONCURRENT_POSITIONS=1 world — v9.0's per-index governors let phantom
     parallel books inflate scores), every entry through the real
     first_affordable (Kelly budget, ATM→OTM walk, disaster-floor check, entry
     curfew, cooldown, lockout), the SHARED decision path for signals, ASK
-    entry, dte-aware barriers, bid exits. Returns (₹, stats)."""
+    entry, dte-aware barriers, bid exits. Returns (₹, stats).
+
+    v9.7.1: `on_entry(info)` is an OPTIONAL, purely-observational callback fired
+    at the instant a trade is entered, receiving the entry premium, the forward
+    bid segment, conviction, and the normal first-touch outcome. It CANNOT
+    change grading — read-only telemetry for tools/fast_lane_report.py to
+    compute the fast-lane counterfactual on the identical entry+segment the
+    forge graded. When None (training, exams, every existing caller), this
+    function is byte-identical to before."""
     from core.risk_manager import RiskGovernor
     from simulation.scenario_engine import N
     rep = _Replayer(con, day, meta, cal, funnel)
@@ -1152,6 +1160,20 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None,
         pnl = (exitp - e) * lot - round_trip_costs(outlay, exitp * lot)
         risk.register_entry(outlay)
         open_pos = (t + off + 1, outlay, float(pnl), d, idx)
+        if on_entry is not None:
+            # read-only fast-lane telemetry: the identical entry premium (ASK),
+            # the forward BID path the grader just used, conviction, lot, and
+            # the normal first-touch outcome (exit premium, offset, ₹). The
+            # report re-runs ONLY the exit rule on this same segment.
+            try:
+                on_entry({"idx": idx, "t": int(t), "e": float(e),
+                          "lot": int(lot), "seg": seg, "conv": float(s["conv"]),
+                          "wp": float(s["wp"]), "direction": d,
+                          "norm_exitp": float(exitp), "norm_off": int(off),
+                          "norm_pnl": float(pnl), "outlay": float(outlay)})
+            except Exception as e_:                           # noqa: BLE001
+                log.warning("on_entry telemetry failed: %s — grading "
+                            "unaffected", e_)
         if funnel:
             funnel.record(idx, "entered")
     if open_pos is not None:                              # EOD: realize the runner
@@ -1174,7 +1196,7 @@ def evaluate(model, vec, con, day, meta, cal, funnel=None, attribution=None):
 
 
 def evaluate_heuristic(con, day, meta, cal, funnel=None,
-                       attribution=None):
+                       attribution=None, on_entry=None):
     """Heuristic on `day`, identical grading (raw warm frame, no VecNormalize —
     that is the SAC model's input transform, not the heuristic's)."""
     pol = HeuristicPolicy()
@@ -1182,7 +1204,7 @@ def evaluate_heuristic(con, day, meta, cal, funnel=None,
     def decide(obs, frame, iidx):
         return float(pol.predict(frame)[2 * iidx])
     return _grade_day(con, day, decide, meta, cal, funnel,
-                      attribution=attribution)
+                      attribution=attribution, on_entry=on_entry)
 
 
 def train_trap_model(ledger_path=None):
@@ -1925,7 +1947,7 @@ def main():
     fun_heur = D.GateFunnel(config.TRADABLE)
     score, st_s = (
         evaluate(model, vec, con, final_day, meta, cal, fun_sac)
-        if model is not None else (0.0, {"trades": 0}))
+        if model is not None else (0.0, {"trades": 0, "wins": 0}))
     gate_attr: dict = {}
     heur, st_h = evaluate_heuristic(con, final_day, meta, cal, fun_heur,
                                     attribution=gate_attr)
@@ -2086,7 +2108,16 @@ def main():
     margin = float(config.FORGE_PROMOTE_MARGIN_RS)
     baseline = max(heur, incumbent if has_champ else heur)
     min_rate = float(config.FORGE_MIN_TRADE_RATE)
-    abstains = diag["train_trade_rate"] < min_rate
+    # v9.7.1 crash fix (same flow-sensitive family as wf_hits): when SAC is
+    # FROZEN (FORGE_TRAIN_SAC=False), the else-branch above sets diag =
+    # {"frozen": True} with NO "train_trade_rate" key, but this line read it
+    # unconditionally → KeyError that took the whole nightly down AFTER meta
+    # retrain / exams / counterfactual / drift had all succeeded. There is no
+    # SAC candidate when frozen, so the abstainer test is vacuous: default the
+    # rate high (well above min_rate) so `abstains` is False and promotion is
+    # governed by the real gates below (beats_final / wf_ok / suite).
+    _train_rate = diag.get("train_trade_rate")
+    abstains = (_train_rate is not None) and (_train_rate < min_rate)
     wf_ok = (not wf_rows) or (sum(sac_wf) >= sum(heur_wf))
     beats_final = score > baseline + margin
     promote = beats_final and wf_ok and not abstains
@@ -2118,7 +2149,8 @@ def main():
             "ver": ver, "day": final_day, "model_score": round(score, 2),
             "heuristic": round(heur, 2), "heuristic_boot": round(heur_boot, 2),
             "incumbent": round(incumbent, 2) if has_champ else None,
-            "inner_rs": round(diag["inner_rs"], 2),
+            "inner_rs": (round(diag["inner_rs"], 2)
+                         if diag.get("inner_rs") is not None else None),
             "wf_sac": sac_wf, "wf_heur": heur_wf,
             "psr": round(psr["psr"], 3) if psr else None,
             "dsr": round(dsr, 3) if dsr is not None else None,

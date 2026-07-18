@@ -62,16 +62,17 @@ def part_a():
 def part_b():
     print("\n=== B: smart lockout on the 2026-07-16 sequence ===")
     lk = SmartLockout()
-    lk.note_loss("PE", -2.04)                     # trade 1 lost
+    lk.note_loss("PE", -2.04, spot=77450)         # trade 1 lost at 77450
     v2 = lk.evaluate(ts=2000, direction="PE", is_cascade=True, cascade_z=-2.04,
                      spot=77400, flip=77507, net_gex=-20e12)
     check("same-strength re-trigger is NOT bypassed (revenge)", not v2.bypass,
           v2.reason)
-    lk.note_loss("PE", -2.04)
+    lk.note_loss("PE", -2.04, spot=77400)         # trade 2 lost at 77400
+    # STRONGER (z-2.59) + aligned + spot 77376 has reclaimed BELOW 77400
     v3 = lk.evaluate(ts=4900, direction="PE", is_cascade=True, cascade_z=-2.59,
                      spot=77376, flip=77478, net_gex=-25.5e12)
-    check("STRONGER aligned re-trigger IS bypassed (the jackpot)", v3.bypass,
-          v3.reason)
+    check("STRONGER aligned re-trigger + reclaim IS bypassed (the jackpot)",
+          v3.bypass, v3.reason)
     lk.register_bypass(4900)
     # misaligned (spot back above flip) must stay blocked
     v4 = lk.evaluate(ts=6000, direction="PE", is_cascade=True, cascade_z=-2.9,

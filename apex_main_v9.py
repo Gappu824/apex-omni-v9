@@ -1326,7 +1326,8 @@ def main():
                     # be recognised as trend continuation, not revenge.
                     if (pm.pos is None and cascade_pos_z.get(idx) is not None
                             and pm.risk.realized_pnl < _pnl_before):
-                        smart_lock.note_loss(_dir_held, cascade_pos_z[idx])
+                        smart_lock.note_loss(_dir_held, cascade_pos_z[idx],
+                                             spot=_spot_ltp)
                     if pm.pos is None:
                         cascade_pos_z[idx] = None
                 # continuous trade tracking on its own cadence

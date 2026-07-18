@@ -53,8 +53,9 @@ class BaseMapper:
         if exp is None:
             return None
         rows = [r for r in rows if r["expiry"] == exp]
-        step = rows[0]["step"] or config.INDICES[index]["strike_step"]
-        lot = rows[0]["lot"] or config.INDICES[index]["lot_fallback"]
+        _spec = _spec_for(index) or {}
+        step = rows[0]["step"] or _spec.get("strike_step", 1.0)
+        lot = rows[0]["lot"] or _spec.get("lot_fallback", 1)
         atm = round(spot / step) * step
         legs = {}
         want = {"atm_ce": (atm, "CE"), "atm_pe": (atm, "PE"),
@@ -69,7 +70,7 @@ class BaseMapper:
         return {"expiry": str(exp), "dte": dte,
                 "T": max(dte, 0.3) / 365.0, "lot": int(lot),
                 "step": float(step),
-                "is_weekly": config.INDICES[index]["weekly"],
+                "is_weekly": bool(_spec.get("weekly", False)),
                 "atm": atm, "legs": legs}
 
     def hierarchy(self, index: str, spot: float, direction: str,
@@ -82,8 +83,9 @@ class BaseMapper:
             return []
         exp = _pick_expiry(sorted({r["expiry"] for r in rows}), self.today)
         rows = [r for r in rows if r["expiry"] == exp and r["itype"] == direction]
-        step = rows[0]["step"] or config.INDICES[index]["strike_step"]
-        lot = rows[0]["lot"] or config.INDICES[index]["lot_fallback"]
+        _spec = _spec_for(index) or {}
+        step = rows[0]["step"] or _spec.get("strike_step", 1.0)
+        lot = rows[0]["lot"] or _spec.get("lot_fallback", 1)
         atm = round(spot / step) * step
         idx = {r["strike"]: r for r in rows}
         out = []
@@ -97,6 +99,20 @@ class BaseMapper:
         return out
 
 
+def _spec_for(name: str) -> dict | None:
+    """Contract spec (strike_step, lot_fallback) for an index OR a commodity —
+    the harvest universe is INDICES ∪ COMMODITIES. Returns None if unknown."""
+    if name in config.INDICES:
+        return config.INDICES[name]
+    return getattr(config, "COMMODITIES", {}).get(name)
+
+
+def _harvest_universe() -> set:
+    """Every underlying we capture options for: all indices plus the commodities
+    flagged for harvest. Trading universe is separate and unaffected."""
+    return set(config.INDICES) | set(getattr(config, "HARVEST_COMMODITIES", []))
+
+
 class LiveMapper(BaseMapper):
     def __init__(self, kite):
         today = dt.date.today()
@@ -105,9 +121,15 @@ class LiveMapper(BaseMapper):
             rows = pickle.loads(cache.read_bytes())
         else:
             rows = []
-            for exch in ("NFO", "BFO"):
+            universe = _harvest_universe()
+            # equity option exchanges + MCX for commodities (only scanned if any
+            # commodity is flagged for harvest — zero cost otherwise).
+            exchanges = ["NFO", "BFO"]
+            if getattr(config, "HARVEST_COMMODITIES", []):
+                exchanges.append("MCX")
+            for exch in exchanges:
                 for ins in kite.instruments(exch):
-                    if ins.get("name") in config.INDICES and \
+                    if ins.get("name") in universe and \
                        ins.get("instrument_type") in ("CE", "PE"):
                         rows.append({"name": ins["name"],
                                      "expiry": ins["expiry"]
@@ -127,13 +149,49 @@ class LiveMapper(BaseMapper):
             for r in rows:
                 ss = sorted(strikes[(r["name"], r["expiry"])])
                 diffs = [b - a for a, b in zip(ss, ss[1:]) if b > a]
+                _spec = _spec_for(r["name"]) or {}
                 r["step"] = min(diffs) if diffs else \
-                    config.INDICES[r["name"]]["strike_step"]
+                    _spec.get("strike_step", 1.0)
             cache.write_bytes(pickle.dumps(rows, protocol=5))
-            log.info("Instrument dump cached for %s (%d option rows)",
-                     today, len(rows))
+            log.info("Instrument dump cached for %s (%d option rows across %s)",
+                     today, len(rows), "/".join(exchanges))
         super().__init__(rows, today)
         self._rows = rows
+        # v9.7.1: resolve each harvested commodity's FRONT-MONTH FUTURE (its
+        # "spot" — there is no commodity index). Scanned from the same MCX dump;
+        # the nearest non-expired future per name. Empty for equity-only setups.
+        self.commodity_futures: dict[str, dict] = {}
+        if getattr(config, "HARVEST_COMMODITIES", []):
+            try:
+                self._resolve_commodity_futures(kite, today)
+            except Exception as e:                            # noqa: BLE001
+                log.warning("commodity futures resolve failed: %s "
+                            "(options still harvested; spot-track degraded)", e)
+
+    def _resolve_commodity_futures(self, kite, today):
+        names = set(getattr(config, "HARVEST_COMMODITIES", []))
+        if not names:
+            return
+        fcache = config.STATE_DIR / f"commodity_futs_{today}.pkl"
+        if fcache.exists():
+            self.commodity_futures = pickle.loads(fcache.read_bytes())
+            return
+        futs: dict[str, list] = {}
+        for ins in kite.instruments("MCX"):
+            if ins.get("name") in names and ins.get("instrument_type") == "FUT":
+                exp = ins["expiry"] if isinstance(ins["expiry"], dt.date) \
+                    else dt.date.fromisoformat(str(ins["expiry"])[:10])
+                if exp >= today:
+                    futs.setdefault(ins["name"], []).append(
+                        {"token": int(ins["instrument_token"]),
+                         "symbol": ins["tradingsymbol"], "expiry": exp,
+                         "lot": int(ins["lot_size"])})
+        for name, lst in futs.items():
+            lst.sort(key=lambda r: r["expiry"])       # front month first
+            self.commodity_futures[name] = lst[0]
+        fcache.write_bytes(pickle.dumps(self.commodity_futures, protocol=5))
+        log.info("Commodity front-month futures: %s",
+                 {k: v["symbol"] for k, v in self.commodity_futures.items()})
 
     def write_snapshot(self, db_path: Path | None = None):
         """Persist TODAY's chain metadata — the forge's time machine."""
