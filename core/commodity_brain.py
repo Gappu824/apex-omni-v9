@@ -155,7 +155,15 @@ class CommodityBrain:
         try:
             import math as _m
             from core.meta_gbm import score_vec
-            from simulation.scenario_engine import N as _N
+            # commodity session window — SAME derivation as the forge's
+            # _commodity_window (parity by construction, both config-driven)
+            def _sod(hm):
+                h, m = (int(x) for x in hm.split(":"))
+                return h * 3600 + m * 60
+            _t0 = _sod(getattr(config, "COMMODITY_SESSION_OPEN", "09:00"))
+            _closes = [_sod(v.get("session_close", "23:30")) for v in
+                       getattr(config, "COMMODITIES", {}).values()] or [56100]
+            _N = max(_closes) - _t0
             h = list(self._spot_hist.get(name, []))
             er = 0.0
             if len(h) >= 30:
@@ -164,7 +172,7 @@ class CommodityBrain:
                 er = float((a[-1] - a[0]) / churn) if churn > 0 else 0.0
             f30 = (h[-1] / h[-31] - 1.0) if len(h) > 31 and h[-31] else 0.0
             t_sec = (now_ist.hour * 3600 + now_ist.minute * 60
-                     + now_ist.second) - (9 * 3600 + 15 * 60)
+                     + now_ist.second) - _t0
             t_frac = min(max(t_sec, 0), _N) / _N
             x = np.concatenate([nodes[0], nodes[1], nodes[2],
                                 [t_frac, er,

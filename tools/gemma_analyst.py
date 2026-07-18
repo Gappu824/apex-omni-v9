@@ -64,6 +64,34 @@ _IST = ZoneInfo("Asia/Kolkata")
 # --------------------------------------------------------------------------
 # Ollama client — minimal, fail-safe, stdlib only (no new dependency)
 # --------------------------------------------------------------------------
+def _resolve_model(host: str, configured: str) -> str | None:
+    """Ask Ollama what is ACTUALLY installed (/api/tags) instead of trusting a
+    guessed tag. Returns: the configured model if installed; else any installed
+    gemma* model (largest first) with a clear log; else None with the exact
+    remedy. This is what fixes the 404 ('model not found') without tag-guessing."""
+    try:
+        with urllib.request.urlopen(f"{host.rstrip('/')}/api/tags",
+                                    timeout=10) as r:
+            tags = [m.get("name", "") for m in
+                    json.loads(r.read().decode()).get("models", [])]
+    except Exception as e:                                     # noqa: BLE001
+        log.warning("Ollama unreachable for model discovery (%s)", e)
+        return None
+    if configured in tags or f"{configured}:latest" in tags:
+        return configured
+    gemmas = sorted([t for t in tags if "gemma" in t.lower()], reverse=True)
+    if gemmas:
+        log.warning("configured model '%s' is NOT installed; using installed "
+                    "'%s' instead (set GEMMA_MODEL to pin it). Installed: %s",
+                    configured, gemmas[0], ", ".join(tags) or "(none)")
+        return gemmas[0]
+    log.warning("no gemma model installed in Ollama (installed: %s). Remedy: "
+                "run `ollama list`, then `ollama pull <a gemma tag>` and set "
+                "GEMMA_MODEL to that exact tag. Analyst SKIPPED; system "
+                "unaffected.", ", ".join(tags) or "(none)")
+    return None
+
+
 def _ollama_generate(prompt: str, *, model: str, host: str, num_ctx: int,
                      timeout: float) -> str | None:
     """Call Ollama's /api/generate. Returns text, or None on ANY failure —
@@ -184,8 +212,11 @@ def main():
 
     log.info("nightly analyst | model=%s ctx=%d | %d upcoming event(s)",
              model, num_ctx, len(ctx["upcoming_events"]))
-    brief = _ollama_generate(prompt, model=model, host=host,
-                             num_ctx=num_ctx, timeout=timeout)
+    resolved = _resolve_model(host, model)
+    brief = None
+    if resolved is not None:
+        brief = _ollama_generate(prompt, model=resolved, host=host,
+                                 num_ctx=num_ctx, timeout=timeout)
 
     out = {"generated_ist": ctx["as_of_ist"], "model": model,
            "context": ctx, "brief": brief,

@@ -196,7 +196,10 @@ KITE_ACCESS_TOKEN = os.environ.get("KITE_ACCESS_TOKEN", "")   # regenerated dail
 # PATHS (cross-platform; runs from any working directory)
 # ----------------------------------------------------------------------------
 BASE_DIR   = Path(__file__).resolve().parent
-DATA_DIR   = BASE_DIR / "data";    DATA_DIR.mkdir(exist_ok=True)
+# APEX_DATA_DIR moves the tick vault to another drive (disk-full remedy):
+#   PowerShell:  $env:APEX_DATA_DIR = "D:\apex_data"   (then move the .db there)
+DATA_DIR   = Path(os.environ.get("APEX_DATA_DIR", str(BASE_DIR / "data")))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR  = BASE_DIR / "models";  MODEL_DIR.mkdir(exist_ok=True)
 STATE_DIR  = BASE_DIR / "state";   STATE_DIR.mkdir(exist_ok=True)
 LOG_DIR    = BASE_DIR / "logs";    LOG_DIR.mkdir(exist_ok=True)
@@ -302,6 +305,15 @@ COMMODITY_ENTRY_CONVICTION = 0.72
 # harvested ticks with the SAME purged-CV GBM pipeline as equity. Data-gated.
 COMMODITY_META_MIN_TRAIN   = 300   # labeled signals before a model may train
 COMMODITY_FORGE_COOLDOWN_S = 180   # sampler cooldown between signals/commodity
+# --- evening MCX session capture (operator decision 2026-07-18) ---
+# True → the supervisor runs the harvester + commodity brain on the FULL MCX
+# window (COMMODITY_SESSION_OPEN → max COMMODITIES session_close); equity procs
+# keep the equity window. False → everything reverts to the equity window.
+EVENING_CAPTURE_ENABLED = True
+COMMODITY_SESSION_OPEN  = "09:00"   # MCX open (before equity 09:15)
+SUPERVISOR_TABS         = True      # one Windows Terminal viewer tab per child
+#                                     (tabs tail per-process logs; closing a tab
+#                                     kills nothing — supervision stays direct)
 # a commodity is TRADE-ELIGIBLE only when BOTH tracks are calibrated AND it is
 # explicitly in COMMODITY_TRADABLE (which stays empty until you put it there).
 
@@ -1190,7 +1202,8 @@ _HASH_EXCLUDE = frozenset({
     "GEMMA_TIMEOUT_S", "COMMODITY_CALIB_MIN_DAYS",
     "COMMODITY_CALIB_MIN_TICKS", "COMMODITY_HEURISTIC_W",
     "COMMODITY_ENTRY_CONVICTION", "COMMODITY_META_MIN_TRAIN",
-    "COMMODITY_FORGE_COOLDOWN_S",
+    "COMMODITY_FORGE_COOLDOWN_S", "EVENING_CAPTURE_ENABLED",
+    "COMMODITY_SESSION_OPEN", "SUPERVISOR_TABS",
     # v9.8 meta-forge engine knobs (trainer choice — model files carry their
     # own provenance; these must not fingerprint the feature world)
     "META_ENGINE", "META_EMBARGO_DAYS", "META_GBM_LEAVES", "META_GBM_LR",

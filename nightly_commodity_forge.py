@@ -58,8 +58,21 @@ from core.commodity_brain import CommodityHeuristicPolicy  # noqa: E402
 from nightly_forge_v9 import (trading_days, spot_token_for,  # noqa: E402
                               _shaped_barriers, _hold_seconds,
                               round_trip_costs, _kelly_budget)
-from simulation.replay_real_day import load_day            # noqa: E402
-from simulation.scenario_engine import N                   # noqa: E402
+from simulation.replay_real_day import load_day_window    # noqa: E402
+
+def _commodity_window() -> tuple[int, int]:
+    """MCX session in seconds-of-day: COMMODITY_SESSION_OPEN → the latest
+    commodity close. The SAME derivation drives serving t_frac in
+    core.commodity_brain._meta_wp — parity by construction."""
+    def _sod(hm):
+        h, m = (int(x) for x in hm.split(":"))
+        return h * 3600 + m * 60
+    t0 = _sod(getattr(config, "COMMODITY_SESSION_OPEN", "09:00"))
+    closes = [_sod(v.get("session_close", "23:30"))
+              for v in getattr(config, "COMMODITIES", {}).values()] or [_sod("15:30")]
+    return t0, max(closes) - t0
+
+_C_T0, N = _commodity_window()
 
 config.setup_logging("commodity_forge")
 import logging                                            # noqa: E402
@@ -86,7 +99,7 @@ def gen_samples(con, day: str):
                    if spot_token_for(con, day, c)]
     if not commodities:
         return [], [], []
-    loaded = load_day(con, day, commodities[0])
+    loaded = load_day_window(con, day, commodities[0], _C_T0, N)
     if not loaded:
         return [], [], []
     _stok, by_sec, ti, bidA, askA = loaded

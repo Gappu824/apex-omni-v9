@@ -93,6 +93,56 @@ def load_day(con, day: str, index: str):
     return spot_tok, by_sec, ti, bidA, askA
 
 
+def load_day_window(con, day: str, index: str, t0_sod: int, n_len: int):
+    """load_day generalized to an arbitrary intraday window [t0_sod, t0_sod+
+    n_len) seconds-of-day. Built for the commodity session (MCX 09:00→23:55,
+    evening capture) — the equity path keeps load_day byte-identical above.
+    Returns the same (spot_tok, by_sec, ti, bidA, askA) shape with t relative
+    to t0_sod and arrays sized n_len."""
+    r = con.execute("SELECT token FROM spot_tokens WHERE snap_date<=? AND "
+                    "name=? ORDER BY snap_date DESC LIMIT 1",
+                    (day, index)).fetchone()
+    if not r:
+        return None
+    spot_tok = int(r[0])
+    rows = con.execute(
+        "SELECT ts_local_ms/1000, token, ltp, bid, ask, bid_qty, ask_qty, "
+        "vol_delta, oi, iceberg FROM ticks_v9 WHERE "
+        "date(ts_local_ms/1000,'unixepoch','localtime')=? ORDER BY ts_ms",
+        (day,)).fetchall()
+    if len(rows) < 600:
+        return None
+    by_sec: dict[int, dict] = defaultdict(dict)
+    toks = set()
+    for s, tok, ltp, bid, ask, bq, aq, vd, oi, ice in rows:
+        t = int(s) % 86400 - t0_sod
+        if 0 <= t < n_len:
+            by_sec[t][int(tok)] = {"ltp": ltp, "bid": bid, "ask": ask,
+                                   "bid_qty": bq, "ask_qty": aq,
+                                   "vol_delta": vd, "oi": oi, "iceberg": ice}
+            toks.add(int(tok))
+    if not toks:
+        return None
+    ti = {tok: i for i, tok in enumerate(sorted(toks))}
+    bidA = np.full((len(ti), n_len), np.nan, np.float32)
+    askA = np.full_like(bidA, np.nan)
+    for t, snaps in by_sec.items():
+        for tok, sn in snaps.items():
+            if sn["bid"] and sn["ask"]:
+                bidA[ti[tok], t] = sn["bid"]
+                askA[ti[tok], t] = sn["ask"]
+    for arr in (bidA, askA):
+        for k in range(arr.shape[0]):
+            last = np.nan
+            row = arr[k]
+            for t in range(n_len):
+                if np.isnan(row[t]):
+                    row[t] = last
+                else:
+                    last = row[t]
+    return spot_tok, by_sec, ti, bidA, askA
+
+
 def main():
     day = sys.argv[1] if len(sys.argv) > 1 else None
     index = (sys.argv[2] if len(sys.argv) > 2 else "NIFTY").upper()
