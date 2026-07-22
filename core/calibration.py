@@ -48,6 +48,14 @@ def _path() -> str:
 
 def calib() -> dict:
     """The full calibration artifact (hot-reloaded). {} if none yet."""
+    # v9.7.1 (2026-07-19 RED-gate root cause): the regression suite is a
+    # PROMOTION GATE and must be deterministic. The night real calibration
+    # first landed, 3 scenarios flipped — same code, different thresholds,
+    # reproduced to the rupee. Under APEX_HERMETIC_CAL=1 (set ONLY by
+    # simulation/run_simulation around its scenarios) the loader returns
+    # reference defaults; live and forge behaviour untouched.
+    if os.environ.get("APEX_HERMETIC_CAL") == "1":
+        return {}
     if not bool(_cfg("USE_CALIBRATION", True)):
         return {}
     if _CAL_CACHE.get("mtime") == "test":

@@ -36,6 +36,19 @@ def _pick_expiry(expiries: list[dt.date], today: dt.date) -> dt.date | None:
     return fut[0] if fut else None
 
 
+def _sel_today(name: str, today: dt.date) -> dt.date:
+    """Effective 'today' for expiry selection. v9.7.1 AUDIT S5-F2: MCX option
+    chains rolled only when the expiry PASSED — trading/harvesting the dying
+    contract through its own expiry day (ITM MCX options DEVOLVE into futures
+    at expiry; the microstructure of that day is a different animal). Equity
+    0DTE is the game and stays on `e >= today`; commodities roll
+    COMMODITY_OPT_ROLL_DAYS early."""
+    if name in getattr(config, "COMMODITIES", {}):
+        return today + dt.timedelta(
+            days=int(getattr(config, "COMMODITY_OPT_ROLL_DAYS", 2)))
+    return today
+
+
 class BaseMapper:
     """rows: list of dicts with name, expiry(date), strike, itype, token,
     symbol, lot, step, exchange — source differs (dump vs snapshot)."""
@@ -49,7 +62,8 @@ class BaseMapper:
         rows = self.by_index.get(index)
         if not rows or spot <= 0:
             return None
-        exp = _pick_expiry(sorted({r["expiry"] for r in rows}), self.today)
+        exp = _pick_expiry(sorted({r["expiry"] for r in rows}),
+                           _sel_today(index, self.today))
         if exp is None:
             return None
         rows = [r for r in rows if r["expiry"] == exp]
@@ -81,8 +95,11 @@ class BaseMapper:
         rows = self.by_index.get(index)
         if not rows:
             return []
-        exp = _pick_expiry(sorted({r["expiry"] for r in rows}), self.today)
+        exp = _pick_expiry(sorted({r["expiry"] for r in rows}),
+                           _sel_today(index, self.today))
         rows = [r for r in rows if r["expiry"] == exp and r["itype"] == direction]
+        if not rows:      # AUDIT S5-F1: a one-sided dump slice used to
+            return []     # IndexError on rows[0] straight into the live loop
         _spec = _spec_for(index) or {}
         step = rows[0]["step"] or _spec.get("strike_step", 1.0)
         lot = rows[0]["lot"] or _spec.get("lot_fallback", 1)
@@ -181,7 +198,10 @@ class LiveMapper(BaseMapper):
             if ins.get("name") in names and ins.get("instrument_type") == "FUT":
                 exp = ins["expiry"] if isinstance(ins["expiry"], dt.date) \
                     else dt.date.fromisoformat(str(ins["expiry"])[:10])
-                if exp >= today:
+                if exp >= today + dt.timedelta(days=int(getattr(
+                        config, "COMMODITY_FUT_ROLL_DAYS", 2))):
+                    # S5-F2: the front-month "spot" must not be a contract in
+                    # its tender window — liquidity has already migrated.
                     futs.setdefault(ins["name"], []).append(
                         {"token": int(ins["instrument_token"]),
                          "symbol": ins["tradingsymbol"], "expiry": exp,

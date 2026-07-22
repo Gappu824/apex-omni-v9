@@ -22,6 +22,15 @@ logging.basicConfig(level=logging.WARNING, format=config.LOG_FORMAT)
 
 
 def main():
+    import os as _os
+    _os.environ["APEX_HERMETIC_CAL"] = "1"     # deterministic promotion gate
+    try:
+        return _main_hermetic()
+    finally:
+        _os.environ.pop("APEX_HERMETIC_CAL", None)
+
+
+def _main_hermetic():
     t0 = time.time()
     results = []
     from simulation.scenario_miner import load_discovered

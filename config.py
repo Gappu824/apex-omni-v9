@@ -263,7 +263,7 @@ COMMODITY_ORDER = list(COMMODITIES.keys())
 # evidence gate every other subsystem obeys). HARVEST_COMMODITIES drives the
 # harvester ONLY; it does NOT add anything to the tradable universe.
 HARVEST_COMMODITIES = ["CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"]
-COMMODITY_TRADABLE = []          # ← stays empty until calibrated. Do not edit.
+COMMODITY_TRADABLE = ["CRUDEOIL"]       # ← stays empty until calibrated. Do not edit.
 
 # --- commodity scheduled-event / news-gap guard (core/event_engine.py) ---
 # The honest "news" layer: block/flatten around KNOWN releases (EIA petroleum

@@ -389,6 +389,18 @@ class ExecutionEngine:
                 log.info("paper: would arm GTT floor %s ≤ %.2f", symbol,
                          floor_px)
             return None
+        # v9.7.1 AUDIT S4-F1: this engine opens positions PRODUCT_MIS, but a
+        # GTT order is product-NRML — a triggered floor would not close the
+        # MIS long, it would OPEN A NAKED SHORT NRML option (violating the
+        # no-selling constraint) while the MIS leg stays unprotected. The
+        # docstring warned about the pairing; now the code refuses it. Arm
+        # GTT floors only when entries are NRML (LIVE_PRODUCT="NRML").
+        if str(getattr(config, "LIVE_PRODUCT", "MIS")).upper() != "NRML":
+            log.error("GTT floor REFUSED: entries are MIS but GTT sells are "
+                      "NRML — a trigger would open a naked short, not close "
+                      "the long. Set LIVE_PRODUCT='NRML' (and open NRML) to "
+                      "use server-side floors; in-process floor still live.")
+            return None
         try:
             self.order_rl.wait()
             trig = self.kite.place_gtt(

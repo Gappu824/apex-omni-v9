@@ -218,12 +218,19 @@ def main():
         brief = _ollama_generate(prompt, model=resolved, host=host,
                                  num_ctx=num_ctx, timeout=timeout)
 
-    out = {"generated_ist": ctx["as_of_ist"], "model": model,
+    # AUDIT (2026-07-22 logs): the digest recorded the CONFIGURED model, so
+    # gemma_digest.json + the brief header both claimed "gemma4:e4b" on a night
+    # the resolver had substituted the installed "gemma4:e2b". Record what
+    # ACTUALLY wrote the brief (and keep the requested name for provenance).
+    out = {"generated_ist": ctx["as_of_ist"],
+           "model": resolved or model, "model_requested": model,
            "context": ctx, "brief": brief,
            "available": brief is not None}
     # structured digest (always written, even if the model was unavailable)
+    # encoding pinned: these files carry ₹ / — / ✓ and Windows would otherwise
+    # write them in the legacy codepage (the ? seen in nightly_brief .md).
     (config.LOG_DIR / "gemma_digest.json").write_text(
-        json.dumps(out, indent=2, default=str))
+        json.dumps(out, indent=2, default=str), encoding="utf-8")
 
     if brief is None:
         log.info("analyst unavailable — digest written with brief=null; "
@@ -233,7 +240,8 @@ def main():
     brief_path = config.LOG_DIR / f"nightly_brief_{dt.date.today()}.md"
     brief_path.write_text(
         f"# Apex Omni nightly brief — {ctx['as_of_ist']}\n\n"
-        f"*(Gemma {model}, local, advisory — not a trade signal)*\n\n{brief}\n")
+        f"*(Gemma {resolved or model}, local, advisory — not a trade "
+        f"signal)*\n\n{brief}\n", encoding="utf-8")
     log.info("nightly brief → %s", brief_path)
     print(brief)
 

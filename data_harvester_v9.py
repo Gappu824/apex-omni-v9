@@ -418,7 +418,18 @@ class Harvester:
             try:
                 ticks = self.q.get(timeout=1.0)
                 for t in ticks:
-                    self._process(t)
+                    try:
+                        self._process(t)
+                    except Exception as _pe:              # noqa: BLE001
+                        # v9.7.1 AUDIT S4-F4: a single malformed tick used to
+                        # propagate out of run(), kill the process, and — six
+                        # restarts later — take the HARVESTER down for the day
+                        # (the worst possible failure: total data loss).
+                        # Poison ticks are counted, throttled-logged, dropped.
+                        self._bad_ticks = getattr(self, "_bad_ticks", 0) + 1
+                        if self._bad_ticks <= 5 or self._bad_ticks % 500 == 0:
+                            log.warning("malformed tick dropped (#%d): %s %r",
+                                        self._bad_ticks, _pe, str(t)[:120])
             except queue.Empty:
                 pass
             now = time.time()

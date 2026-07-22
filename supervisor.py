@@ -14,12 +14,15 @@ down cleanly at the close, and writes state/supervisor_status.json each
 minute so the morning read shows exactly what happened unattended. It never
 touches the evening ritual (run_evening.py) and it assumes get_token was run
 — an auth-dead brain will hit the restart ceiling and be reported, not
-hidden. Ctrl-C = orderly SIGINT to children, then exit.
+hidden. Ctrl-C = orderly stop of children (CTRL_BREAK on Windows via their
+own process group, SIGINT on POSIX), then exit — with terminate()/taskkill
+fallbacks so a child can never be left holding the ring mmap.
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import signal
 import shutil
 import subprocess
@@ -32,6 +35,7 @@ import config
 PRE_OPEN_MIN = 5           # start this many minutes before a window opens
 POST_CLOSE_MIN = 5         # stop this many minutes after a window closes
 MAX_RESTARTS_HOUR = 6
+RETRY_GIVEUP_S = 900       # re-attempt a given-up child every 15 min
 
 
 def _hm_to_sod(hm: str) -> int:
@@ -111,7 +115,10 @@ class Child:
         self.proc: subprocess.Popen | None = None
         self.restarts: list[float] = []
         self.gave_up = False
+        self.gaveup_at = 0.0
         self.was_active = False
+        self.done = False        # clean self-exit for THIS window (reset next open)
+        self.retry_at = 0.0       # SUP-F4: non-blocking backoff deadline
         self.log_fh = None
         self.tab_opened = False
 
@@ -127,10 +134,18 @@ class Child:
             pass
         self.log_fh = open(log_path, "a", buffering=1, encoding="utf-8",
                            errors="replace")
+        # SUP-F1: on Windows a plain Popen cannot receive SIGINT — stop() used
+        # to raise, leaving the child alive holding the ring mmap (the root of
+        # the weekend "stale process" that crashed the next writer). Launch in
+        # a NEW PROCESS GROUP so we can deliver CTRL_BREAK_EVENT for a graceful
+        # stop, with terminate()/taskkill as escalating fallbacks.
+        _kw = {}
+        if os.name == "nt":
+            _kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         self.proc = subprocess.Popen([sys.executable, "-u", self.script],
                                      cwd=str(Path(__file__).parent),
                                      stdout=self.log_fh,
-                                     stderr=subprocess.STDOUT)
+                                     stderr=subprocess.STDOUT, **_kw)
         print(f"[supervisor] started {self.script} pid={self.proc.pid} "
               f"→ {log_path.name}", flush=True)
         if not self.tab_opened:
@@ -146,12 +161,28 @@ class Child:
             self.tab_opened = True    # one tab per supervisor run, not per restart
 
     def stop(self):
-        if self.alive():
-            self.proc.send_signal(signal.SIGINT)
+        p = self.proc
+        if p is not None and p.poll() is None:
             try:
-                self.proc.wait(timeout=15)
+                if os.name == "nt":
+                    p.send_signal(signal.CTRL_BREAK_EVENT)   # group we created
+                else:
+                    p.send_signal(signal.SIGINT)
+            except (ValueError, OSError, AttributeError):
+                try:
+                    p.terminate()
+                except Exception:                          # noqa: BLE001
+                    pass
+            try:
+                p.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                try:
+                    p.kill()
+                    p.wait(timeout=5)
+                except Exception:                          # noqa: BLE001
+                    if os.name == "nt":                    # last resort
+                        subprocess.run(["taskkill", "/F", "/T", "/PID",
+                                        str(p.pid)], capture_output=True)
         self.proc = None
         if self.log_fh:
             try:
@@ -161,22 +192,49 @@ class Child:
             self.log_fh = None
 
     def tick(self):
-        if self.gave_up or self.alive():
+        if self.gave_up or self.done or self.alive():
             return
         now = time.time()
+        if now < self.retry_at:          # SUP-F4/F5: backoff is a TIMESTAMP the
+            return                        # loop re-checks — never a blocking
+        #                                  sleep that freezes other children or
+        #                                  deafens Ctrl-C.
         self.restarts = [t for t in self.restarts if now - t < 3600]
-        if self.proc is not None:                     # it died
+        if self.proc is not None:                     # it exited
+            rc = self.proc.returncode
+            # SUP restart-storm: a CLEAN exit (rc==0) inside the window means
+            # the child finished its own work — apex_main self-exits at
+            # SESSION_CLOSE while its window runs 5 min longer. A finished
+            # child is not a fault: mark done for THIS window (next window-open
+            # resets it), don't restart, don't count it. Only rc!=0 is a crash.
+            if rc == 0:
+                # SUP-F6: a clean exit near the window END is normal (self-exit
+                # at close). A clean exit with lots of window LEFT is suspicious
+                # — flag it loudly, but still don't hammer-restart (rc==0 means
+                # it chose to stop; a restart loop wouldn't help).
+                secs_left = self.window[1] - (
+                    dt.datetime.now().hour * 3600
+                    + dt.datetime.now().minute * 60)
+                tag = ("(work done for this window)" if secs_left < 600
+                       else f"⚠ {secs_left // 60} min of window REMAIN — "
+                            f"check {_proc_log(self.script).name}")
+                print(f"[supervisor] {self.script} exited cleanly {tag} — "
+                      f"not restarting", flush=True)
+                self.done = True
+                return
             if len(self.restarts) >= MAX_RESTARTS_HOUR:
                 self.gave_up = True
+                self.gaveup_at = now
                 print(f"[supervisor] {self.script} exceeded "
                       f"{MAX_RESTARTS_HOUR} restarts/hour — GIVING UP; "
                       f"this needs a human (token? exchange?)", flush=True)
                 return
             wait = _next_backoff(len(self.restarts) + 1)
-            print(f"[supervisor] {self.script} died (rc="
-                  f"{self.proc.returncode}) — restart in {wait}s", flush=True)
-            time.sleep(wait)
-            self.restarts.append(time.time())
+            self.retry_at = now + wait
+            self.restarts.append(now)
+            print(f"[supervisor] {self.script} CRASHED (rc="
+                  f"{rc}) — restart in {wait}s", flush=True)
+            return                        # come back after retry_at; no sleep
         self.start()
 
 
@@ -197,6 +255,17 @@ def main():
                     print(f"[supervisor] window open for {k.script}",
                           flush=True)
                     k.was_active = True
+                    k.done = False        # new window → a finished child runs again
+                # SUP-F2: a child that hit the restart ceiling is retried once
+                # every RETRY_GIVEUP_S (default 900s) — if a human fixed the
+                # token mid-session it recovers on its own instead of staying
+                # dead until the window closes.
+                if k.gave_up and (now.timestamp() - k.gaveup_at
+                                  >= RETRY_GIVEUP_S):
+                    print(f"[supervisor] retrying {k.script} after give-up "
+                          f"cooldown (a fix may have landed)", flush=True)
+                    k.gave_up = False
+                    k.restarts = []
                 k.tick()
             elif k.was_active:
                 print(f"[supervisor] window over for {k.script} — teardown",
@@ -209,8 +278,9 @@ def main():
                     json.dumps({"ts": time.time(),
                                 "children": [{"script": k.script,
                                               "window": list(k.window),
-                                              "active": k.was_active,
+                                              "in_window": k.was_active,
                                               "alive": k.alive(),
+                                              "done": k.done,
                                               "restarts_1h": len(k.restarts),
                                               "gave_up": k.gave_up}
                                              for k in kids]}))

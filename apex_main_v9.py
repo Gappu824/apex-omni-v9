@@ -179,7 +179,16 @@ class PolicyLoader:
 # ----------------------------------------------------------------- helpers
 _meta_cache = {"ts": 0.0, "m": None}
 def load_meta():
-    """Meta-labeler (size model). Cached on mtime; numpy arrays prepped."""
+    """Meta-labeler (gate + size model). Cached on mtime.
+    v9.7.1 AUDIT S3-F1: the old loader unconditionally prepped j["w"]/["mu"]/
+    ["sd"] — the LOGISTIC schema. The forge's GBM artifact (engine:"gbm", no
+    "w") raised KeyError, the blanket except returned the cached None, and the
+    PROMOTED META NEVER LOADED: entry_gate never went model-driven, the
+    win-prob blend ran calibration-only, and the meta-shaped exit read was
+    dead — silently, since the day META_ENGINE=gbm shipped. Now: GBM artifacts
+    cache as-is (core.decision routes them to meta_gbm.score_vec); logistic
+    artifacts still prep their arrays; a parse failure caches its mtime so a
+    corrupt file logs ONCE instead of re-raising every decision second."""
     try:
         mt = config.META_MODEL_PATH.stat().st_mtime
     except FileNotFoundError:
@@ -187,15 +196,18 @@ def load_meta():
     if mt > _meta_cache["ts"]:
         try:
             j = json.loads(config.META_MODEL_PATH.read_text())
-            j["w"] = np.array(j["w"], np.float32)
-            j["mu"] = np.array(j["mu"], np.float32)
-            j["sd"] = np.array(j["sd"], np.float32)
+            if j.get("engine") != "gbm" and "w" in j:
+                j["w"] = np.array(j["w"], np.float32)
+                j["mu"] = np.array(j["mu"], np.float32)
+                j["sd"] = np.array(j["sd"], np.float32)
             _meta_cache.update(ts=mt, m=j)
             logging.getLogger("brain").info(
-                "meta size-model loaded: n=%s holdout_acc=%s",
-                j.get("n"), j.get("holdout_acc"))
-        except Exception:                                  # noqa: BLE001
-            return _meta_cache["m"]
+                "meta size-model loaded: engine=%s n=%s holdout_acc=%s",
+                j.get("engine", "logistic"), j.get("n"), j.get("holdout_acc"))
+        except Exception as e:                             # noqa: BLE001
+            logging.getLogger("brain").warning(
+                "meta artifact unreadable (%s) — keeping previous", e)
+            _meta_cache["ts"] = mt          # cache the failure; no per-tick retry
     return _meta_cache["m"]
 
 
@@ -925,8 +937,11 @@ def main():
             vix_hist.append((ts, float(vix)))
         vix_bump = 0.0
         if len(vix_hist) > 5:
-            base = next((v for t0_, v in vix_hist if ts - t0_ >= 295),
-                        vix_hist[0][1])
+            # AUDIT S3-F2: iterate newest→oldest so the baseline is the value
+            # CLOSEST to 295 s ago; the old oldest-first scan compared vs the
+            # deque head (~400 s) — a 6.7-minute "5-minute" window.
+            base = next((v for t0_, v in reversed(vix_hist)
+                         if ts - t0_ >= 295), vix_hist[0][1])
             now_v = vix_hist[-1][1]
             if base > 0 and (now_v - base) / base >= config.VIX_SPIKE_5M_PCT:
                 vix_bump = config.VIX_BAR_BUMP

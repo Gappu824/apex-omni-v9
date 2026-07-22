@@ -164,6 +164,10 @@ def main():
     spot_secs: dict[str, deque] = {c: deque(maxlen=1800) for c in commodities}
     spread_ew: dict[str, float] = {c: 0.02 for c in commodities}
     last_decision_sec = -1
+    last_hb = 0.0          # operator heartbeat — a gated-idle brain is healthy,
+    #                        but a silent tab reads as dead. Every
+    #                        COMMODITY_HEARTBEAT_S: ring age, per-commodity
+    #                        spot, and eligibility at a glance.
 
     while True:
         try:
@@ -177,6 +181,16 @@ def main():
         ts = now.timestamp()
         hm = now.strftime("%H:%M")
         ring_sec = int(ts)
+
+        # AUDIT (2026-07-22, live): THE harness never advanced the governor's
+        # tick counter, so RiskGovernor.ticks_seen stayed 0 and EVERY entry
+        # died on "warm-up: physics not settled yet" — 134 blocked signals at
+        # real conviction (+0.72…+0.76) on the first opted-in day. The equity
+        # brain does this in its own loop (apex_main:624); the commodity
+        # harness simply omitted it, so the book could never have traded, ever.
+        # Gated on a non-empty market so a dead feed cannot fake warm-up.
+        if market:
+            risk.on_tick()
 
         # ---- management every loop (full tempo) ----
         for c in commodities:
@@ -218,6 +232,20 @@ def main():
                 pm.manage(tctx, quote)
             except Exception as e:                            # noqa: BLE001
                 log.debug("%s manage: %s", c, e)
+
+        # ---- operator heartbeat ----
+        if ts - last_hb >= float(getattr(config, "COMMODITY_HEARTBEAT_S", 300)):
+            last_hb = ts
+            from core import calibration as _CAL
+            bits = []
+            for c in commodities:
+                sp = float(((market.get(c) or {}).get("spot") or {})
+                           .get("ltp") or 0.0)
+                ok, _why = _CAL.commodity_trade_eligible(c)  # (bool, reason)
+                bits.append(f"{c} {sp:.1f}{'✓' if ok else '·'}")
+            log.info("alive | ring %.1fs | %s | tradable: %s", age,
+                     "  ".join(bits),
+                     ",".join(tradable) or "none (calibration/opt-in pending)")
 
         # ---- decisions once per RING SECOND ----
         if ring_sec != last_decision_sec and market:

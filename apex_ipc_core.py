@@ -21,6 +21,11 @@ import time
 import zlib
 from pathlib import Path
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 _HDR = struct.Struct("<QdII")          # seq, ts, length, crc32
 DEFAULT_SIZE = 8 * 1024 * 1024         # 8 MB slot — plenty for 6-index state
 
@@ -32,10 +37,51 @@ class BinaryRingBuffer:
         self.path = Path(path or config.RING_BUFFER_PATH)
         self.size = size
         total = _HDR.size + size
-        if writer or not self.path.exists() or self.path.stat().st_size < total:
+        self._lockf = None
+        # v9.7.1 (2026-07-20 09:03 open-bell crash): the writer used to
+        # TRUNCATE-recreate the file unconditionally — on Windows that raises
+        # EINVAL (ERROR_USER_MAPPED_FILE) whenever ANY process from a previous
+        # session still maps the ring, killing the harvester at the bell.
+        # Now: (1) a correctly-sized existing file is reused (no truncation —
+        # the normal daily path; the header reset below gives fresh-start
+        # semantics); (2) the writer takes an EXCLUSIVE sidecar lock so a
+        # second writer fails FAST and loudly (single-writer is a protocol
+        # invariant — the old truncate crash was accidentally enforcing it);
+        # (3) when recreation IS needed and a stale mapping blocks it, the
+        # error says exactly what to do.
+        if writer:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "wb") as f:
-                f.truncate(total)
+            self._lockf = open(self.path.with_name(self.path.name + ".lock"),
+                               "a+b")
+            try:
+                if os.name == "nt":
+                    msvcrt.locking(self._lockf.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(self._lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self._lockf.close()
+                raise RuntimeError(
+                    "another ring WRITER is already running (a previous "
+                    "harvester?). Stop it — `Get-CimInstance Win32_Process "
+                    "-Filter \"Name='python.exe'\" | Select ProcessId,"
+                    "CommandLine` then Stop-Process — or start everything "
+                    "through supervisor.py. Refusing a second writer.")
+        need_create = (not self.path.exists()
+                       or self.path.stat().st_size < total)
+        if need_create:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(self.path, "wb") as f:
+                    f.truncate(total)
+            except OSError as e:
+                if self._lockf:
+                    self._lockf.close()
+                raise RuntimeError(
+                    f"cannot (re)create the ring at {self.path}: {e}. A "
+                    "process from a previous session still MAPS the old "
+                    "file (stale brain/harvester). Stop stale python "
+                    "processes and retry — supervisor.py tears children "
+                    "down cleanly.") from e
         self._f = open(self.path, "r+b")
         self._mm = mmap.mmap(self._f.fileno(), total)
         self.writer = writer
@@ -86,3 +132,13 @@ class BinaryRingBuffer:
             self._mm.close(); self._f.close()
         except Exception:                                 # noqa: BLE001
             pass
+        if getattr(self, "_lockf", None):
+            try:
+                if os.name == "nt":
+                    self._lockf.seek(0)
+                    msvcrt.locking(self._lockf.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(self._lockf, fcntl.LOCK_UN)
+                self._lockf.close()
+            except Exception:                             # noqa: BLE001
+                pass

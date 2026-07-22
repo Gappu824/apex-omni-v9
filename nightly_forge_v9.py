@@ -779,6 +779,12 @@ def train_meta(con, days: list[str]):
     # to the proven logistic below if lightgbm is absent or CV is too thin —
     # a missing package can never cost a nightly.
     if getattr(config, "META_ENGINE", "logit") == "gbm":
+        _nsamp = sum(len(x) for _, x, _, _ in perday)
+        try:
+            import lightgbm as _lgb            # explicit: is the package here?
+            _have_lgb = True
+        except Exception:                                 # noqa: BLE001
+            _have_lgb = False
         try:
             from core import meta_gbm as MG
             out = MG.fit_gbm(perday, config.META_MIN_TRAIN)
@@ -812,7 +818,20 @@ def train_meta(con, days: list[str]):
             except Exception as e_:                       # noqa: BLE001
                 log.warning("dist-edge skipped: %s", e_)
             return out, diag
-        log.info("meta-gbm unavailable — using logistic path")
+        if not _have_lgb:
+            log.warning("META-FORGE: engine=gbm requested but lightgbm is NOT "
+                        "importable — using logistic. Fix: pip install "
+                        "lightgbm (in the interpreter that runs the forge).")
+        elif _nsamp < config.META_MIN_TRAIN:
+            log.warning("META-FORGE: engine=gbm, lightgbm present, but only "
+                        "%d labeled equity signals < gate %d — logistic this "
+                        "run. This resolves as the vault deepens (same gate "
+                        "the commodity forge reports).", _nsamp,
+                        config.META_MIN_TRAIN)
+        else:
+            log.warning("META-FORGE: gbm present with %d≥%d samples yet "
+                        "fit_gbm returned None (CV too thin on the day folds) "
+                        "— logistic this run.", _nsamp, config.META_MIN_TRAIN)
     # day-based holdout: last day with samples; fall back to time-ordered 20%
     # only if that day is too thin to judge on.
     ho_day = next((d for d, x, _, _ in reversed(perday) if x), None)
@@ -2051,8 +2070,12 @@ def main():
     wf_hits = wf_new = 0
     sac_wf: list = []
     heur_wf: list = []
+    wf_funnel = D.GateFunnel(config.TRADABLE)   # AUDIT: MUST bind before the
+    # `if trained:` split — line 2211 reads it unconditionally at the merge
+    # point. The 2026-07-19 hoist moved the other four names but left this one
+    # inside the guard, so FORGE_TRAIN_SAC=False (trained=False) still raised
+    # UnboundLocalError here. Now genuinely bound on every path.
     if trained:
-        wf_funnel = D.GateFunnel(config.TRADABLE)
         K = min(int(config.FORGE_WF_FOLDS), max(len(pool) - 2, 0))
         for fd in pool[len(pool) - K:] if K > 0 else []:
             j = pool.index(fd)
