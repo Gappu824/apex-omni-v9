@@ -79,7 +79,21 @@ def _resolve_model(host: str, configured: str) -> str | None:
         return None
     if configured in tags or f"{configured}:latest" in tags:
         return configured
-    gemmas = sorted([t for t in tags if "gemma" in t.lower()], reverse=True)
+    # v9.7.1 (RE-APPLIED 2026-07-23): reverse-alpha picked 'gemma:latest'
+    # (Gemma-1 2B) over the installed 'gemma4:e2b' because ':' > '4' in ASCII —
+    # exactly what happened tonight. Prefer the installed tag sharing the
+    # LONGEST prefix with the configured name, so any gemma4* beats gemma:*.
+    # (This fix was lost once when a later edit was applied to a freshly-reset
+    # file; it is restored here with the digest change intact.)
+    def _pref(t):
+        n = 0
+        for a, b in zip(t.lower(), configured.lower()):
+            if a != b:
+                break
+            n += 1
+        return (n, t)
+    gemmas = sorted([t for t in tags if "gemma" in t.lower()],
+                    key=_pref, reverse=True)
     if gemmas:
         log.warning("configured model '%s' is NOT installed; using installed "
                     "'%s' instead (set GEMMA_MODEL to pin it). Installed: %s",

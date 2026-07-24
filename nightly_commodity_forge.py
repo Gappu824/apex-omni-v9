@@ -263,8 +263,13 @@ def main():
     from core import meta_gbm as MG
     out = MG.fit_gbm(perday, min_train)
     if out is None:
-        log.warning("fit_gbm returned None (lightgbm absent or CV too thin) "
-                    "— NO model written; brain stays heuristic-only")
+        # AUDIT (2026-07-24 log): this line asserted a CAUSE it cannot know and
+        # got it wrong the first night the positives guard fired — it printed
+        # "lightgbm absent or CV too thin" when lightgbm was present and the CV
+        # was fine (only 9 positives). fit_gbm logs the precise reason itself;
+        # the caller must not overwrite it with a guess.
+        log.warning("no commodity meta written this run (see the reason logged "
+                    "above) — the brain stays heuristic-only")
         return
     path = config.MODEL_DIR / "commodity_meta.json"
     tmp = path.with_suffix(".tmp")

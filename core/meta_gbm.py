@@ -35,6 +35,10 @@ import time
 from statistics import NormalDist
 
 import numpy as np
+import logging
+
+log = logging.getLogger("forge")   # AUDIT: the skill report below needs a
+#                                     logger; this module had none.
 
 import config
 
@@ -186,7 +190,80 @@ def fit_gbm(perday: list[tuple], min_train: int) -> dict | None:
     fit_s = time.time() - t0
     acc = float((((np.interp(oof_p[got], iso_x, iso_y)) > 0.5)
                  == (Y[got] > 0.5)).mean())
+    # AUDIT (2026-07-22): a probabilistic gate must be scored against the
+    # trivial CLIMATOLOGY forecast (always predict the base rate), not against
+    # nothing. Brier Skill Score = 1 − Brier_model / Brier_climatology; ≤0 means
+    # the model carries no information the base rate did not already have. The
+    # 720-signal GBM scored BSS −0.038 while silently gating 100% of entries —
+    # exactly the failure rvnet already guards against ("does NOT beat HAR — no
+    # artifact written"). META_MIN_BSS applies that same discipline here.
+    # 2026-07-23 DEGENERACY GUARD: with ~5 winners in 384 samples the commodity
+    # forge promoted a model whose "98.8% holdout accuracy" was purely the class
+    # imbalance (always predict LOSS). Isotonic calibration and a P(win) gate
+    # are meaningless on that few positives, so refuse before reporting skill.
+    _pos = int(Y[got].sum())
+    _neg = int(got.sum() - _pos)
+    _minpos = int(getattr(config, "META_MIN_POSITIVES", 0) or 0)
+    if _minpos and min(_pos, _neg) < _minpos:
+        log.warning("META NOT PROMOTED: only %d positive / %d negative "
+                    "outcomes (base rate %.4f) — below META_MIN_POSITIVES=%d. "
+                    "A calibrated probability gate cannot be fit on that few "
+                    "events; the reported accuracy would be the class "
+                    "imbalance, not information. No artifact written; the "
+                    "brain stays heuristic-only. Keep harvesting.",
+                    _pos, _neg, float(Y[got].mean()), _minpos)
+        return None
+    # AUDIT (2026-07-23): live telemetry showed the promoted meta emitting a
+    # CONSTANT — p50 = p90 = p99 = max = 0.23 across 13,791 evaluations on BOTH
+    # indices, while conviction varied normally. A gate fed a constant cannot
+    # discriminate at all: it blocks 100% or passes 100% forever, whatever the
+    # market. Measure the calibrated OOF spread so this is visible every night.
+    _cal_oof = np.interp(oof_p[got], iso_x, iso_y)
+    _spread = float(np.quantile(_cal_oof, 0.95) - np.quantile(_cal_oof, 0.05))
+    _distinct = int(len(np.unique(np.round(_cal_oof, 4))))
+    _min_spread = getattr(config, "META_MIN_OOF_SPREAD", None)
+    if _spread < 0.02:
+        log.warning("META OUTPUT NEARLY CONSTANT: calibrated OOF p05-p95 "
+                    "spread = %.4f over %d distinct values. A gate model that "
+                    "does not vary cannot separate winners from losers — it is "
+                    "the base rate wearing a model's clothes.", _spread,
+                    _distinct)
+    if _min_spread is not None and _spread < float(_min_spread):
+        # NOTE deliberately NOT the default. Unlike the commodity positives
+        # guard (where refusing left that brain heuristic-only — strictly
+        # safer), refusing the EQUITY meta removes the gate that is currently
+        # blocking a population the counterfactual grades at 0 wins in 400 and
+        # -Rs 631k. Withholding it would UNBLOCK those trades. Report loudly,
+        # act only on an explicit operator decision.
+        log.warning("META NOT PROMOTED: OOF spread %.4f < META_MIN_OOF_SPREAD "
+                    "%.4f — refusing a constant-output gate.", _spread,
+                    float(_min_spread))
+        return None
+    p_clim = float(Y[got].mean())
+    brier_clim = float(np.mean((p_clim - Y[got]) ** 2))
+    bss_cal = (1.0 - brier_cal / brier_clim) if brier_clim > 0 else 0.0
+    bss_raw = (1.0 - brier_raw / brier_clim) if brier_clim > 0 else 0.0
+    _b = config.BASE_TP_PCT / max(config.BASE_SL_PCT, 1e-9)
+    _breakeven = 1.0 / (1.0 + _b)
+    log.info("META SKILL | base_rate %.4f | Brier climatology %.5f vs model "
+             "%.5f (cal) → BSS %+.4f %s | payoff b=%.2f ⇒ break-even p=%.3f, "
+             "serving bar %.2f", p_clim, brier_clim, brier_cal, bss_cal,
+             "NO SKILL" if bss_cal <= 0 else "has skill", _b, _breakeven,
+             getattr(config, "META_ENTRY_P_BAR", float("nan")))
+    _min_bss = getattr(config, "META_MIN_BSS", None)
+    if _min_bss is not None and bss_cal < float(_min_bss):
+        log.warning("META NOT PROMOTED: BSS %+.4f < META_MIN_BSS %.4f — the "
+                    "model does not beat always-predicting the base rate. No "
+                    "artifact written; the gate degrades to the honest "
+                    "conviction bar. The refusal is the system working.",
+                    bss_cal, float(_min_bss))
+        return None
     return {"engine": "gbm", "model_file": mpath.name,
+            "oof_spread_p05_p95": round(_spread, 5),
+            "oof_distinct_values": _distinct,
+            "brier_climatology": round(brier_clim, 5),
+            "bss_cal": round(bss_cal, 4), "bss_raw": round(bss_raw, 4),
+            "breakeven_p": round(_breakeven, 4),
             "iso_x": np.round(iso_x, 6).tolist(),
             "iso_y": np.round(iso_y, 6).tolist(),
             "bins": bins, "n": n,
@@ -205,7 +282,8 @@ def fit_gbm(perday: list[tuple], min_train: int) -> dict | None:
 _BOOSTERS: dict = {}
 
 
-def score_vec(meta: dict, x: np.ndarray) -> float | None:
+def score_vec(meta: dict, x: np.ndarray,
+              clamp: bool = True) -> float | None:
     """Serve-time scorer for engine:'gbm' artifacts — lazy-cached booster,
     isotonic map, floor/cap clamp. Returns None if the booster is missing so
     the caller can degrade exactly as with no meta at all."""
@@ -232,4 +310,11 @@ def score_vec(meta: dict, x: np.ndarray) -> float | None:
                                                         else 0)):
                 p_cal = float(bn["p_lo"])   # serve the Wilson LOWER bound
                 break
+    if not clamp:
+        # AUDIT: META_P_FLOOR (0.5) clamps every sub-floor probability UP to
+        # exactly 0.50 — which is why 4,656 block reasons read an identical
+        # "meta P(win) 0.50<0.55" and the model's real distribution was
+        # invisible. The floor belongs to the SIZING path; telemetry and
+        # diagnosis must see the true calibrated value.
+        return float(p_cal)
     return float(min(max(p_cal, config.META_P_FLOOR), config.META_P_CAP))

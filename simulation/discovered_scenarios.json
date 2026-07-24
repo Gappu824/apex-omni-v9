@@ -95,6 +95,38 @@
    "date": "2026-07-21",
    "index": "NIFTY",
    "name": "mined_stale_2026-07-21_1205"
+  },
+  {
+   "kind": "stale",
+   "hm": "12:05",
+   "dur_s": 9954,
+   "date": "2026-07-22",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-07-22_1205"
+  },
+  {
+   "kind": "stale",
+   "hm": "14:51",
+   "dur_s": 63,
+   "date": "2026-07-22",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-07-22_1451"
+  },
+  {
+   "kind": "stale",
+   "hm": "09:50",
+   "dur_s": 38,
+   "date": "2026-07-23",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-07-23_0950"
+  },
+  {
+   "kind": "stale",
+   "hm": "12:05",
+   "dur_s": 5321,
+   "date": "2026-07-23",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-07-23_1205"
   }
  ]
 }

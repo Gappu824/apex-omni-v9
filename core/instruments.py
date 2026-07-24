@@ -116,6 +116,34 @@ class BaseMapper:
         return out
 
 
+_LOT_WARNED: set = set()
+
+
+def _check_lot(name: str, dump_lot, spec: dict):
+    """AUDIT (2026-07-23): `lot = rows[0]["lot"] or lot_fallback` means a dump
+    value of 1 (TRUTHY) shadows the config's known contract size — MCX crude
+    booked at lot=1 costs Rs 647 where a 100-barrel lot costs Rs 64,775. That
+    is a 100x sizing error in whichever direction the dump is wrong, and it
+    decides whether a book can afford a contract at all. We do NOT silently
+    override (if the dump is right, forcing the fallback would block every
+    trade); we make the disagreement impossible to miss, once per contract."""
+    try:
+        fb = spec.get("lot_fallback")
+        if not fb or not dump_lot or int(dump_lot) == int(fb):
+            return
+        if name in _LOT_WARNED:
+            return
+        _LOT_WARNED.add(name)
+        log.warning("%s CONTRACT SIZE DISAGREEMENT: instrument dump says "
+                    "lot=%s, config lot_fallback says %s. Sizing uses the DUMP "
+                    "(%s). If the dump is wrong every %s position is %.0fx "
+                    "mis-sized — verify the contract size on Kite before this "
+                    "book ever trades real money.", name, dump_lot, fb,
+                    dump_lot, name, int(fb) / max(int(dump_lot), 1))
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
 def _spec_for(name: str) -> dict | None:
     """Contract spec (strike_step, lot_fallback) for an index OR a commodity —
     the harvest universe is INDICES ∪ COMMODITIES. Returns None if unknown."""
@@ -184,6 +212,60 @@ class LiveMapper(BaseMapper):
             except Exception as e:                            # noqa: BLE001
                 log.warning("commodity futures resolve failed: %s "
                             "(options still harvested; spot-track degraded)", e)
+            try:
+                self._reconcile_commodity_lots()
+            except Exception as e:                            # noqa: BLE001
+                log.warning("commodity lot reconcile failed: %s", e)
+
+    def _reconcile_commodity_lots(self):
+        """DYNAMIC contract multiplier, straight from the Kite dump.
+
+        An MCX option is an option ON A FUTURES CONTRACT, and its premium is
+        quoted in the futures' price unit — so the economic multiplier of an
+        option position is the UNDERLYING FUTURE's lot_size, not the option
+        row's own lot_size (which Kite reports as 1 for MCX). Booking crude at
+        lot=1 valued a position at Rs 647 where the contract is 100 barrels
+        (Rs 64,775) — a 100x sizing error that decides affordability outright.
+
+        We already resolve each commodity's front-month future from the same
+        live dump, so the multiplier is derived from the API, not hardcoded:
+            option lot  <-  front-month FUTURES lot_size
+        Config's lot_fallback is used only if the dump yields nothing, and any
+        disagreement between the two is logged. Because the corrected lot is
+        written into self._rows BEFORE write_snapshot(), the forge's AsOfMapper
+        replay inherits identical sizing with no extra code."""
+        names = set(getattr(config, "HARVEST_COMMODITIES", []))
+        if not names or not self._rows:
+            return
+        applied: dict[str, tuple] = {}
+        for name in names:
+            fut = (self.commodity_futures or {}).get(name) or {}
+            fut_lot = int(fut.get("lot") or 0)
+            spec = (getattr(config, "COMMODITIES", {}) or {}).get(name, {})
+            cfg_lot = int(spec.get("lot_fallback") or 0)
+            src, mult = ("futures dump", fut_lot) if fut_lot > 1 else \
+                        ("config fallback", cfg_lot) if cfg_lot > 1 else ("", 0)
+            if mult <= 1:
+                continue
+            if fut_lot > 1 and cfg_lot > 1 and fut_lot != cfg_lot:
+                log.warning("%s: LIVE futures lot_size=%d disagrees with "
+                            "config lot_fallback=%d — using the LIVE value "
+                            "(the exchange is authoritative); update config.",
+                            name, fut_lot, cfg_lot)
+            n = 0
+            for r in self._rows:
+                if r.get("name") == name and r.get("itype") in ("CE", "PE") \
+                        and int(r.get("lot") or 1) < mult:
+                    r["lot"] = mult
+                    n += 1
+            if n:
+                applied[name] = (mult, src, n)
+        for name, (mult, src, n) in applied.items():
+            log.warning("%s CONTRACT MULTIPLIER RESOLVED: option rows carried "
+                        "lot=1; using %d from the %s (%d option rows "
+                        "corrected). A position now costs premium x %d — this "
+                        "is what the exchange actually charges.",
+                        name, mult, src, n, mult)
 
     def _resolve_commodity_futures(self, kite, today):
         names = set(getattr(config, "HARVEST_COMMODITIES", []))

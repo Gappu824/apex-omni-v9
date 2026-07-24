@@ -113,7 +113,10 @@ def effective_bar(base_bar: float, vix_bump: float,
 #    so the forge's grader computes P(win) with the same bytes.
 # --------------------------------------------------------------------------
 def meta_win_prob(meta: dict | None, frame: np.ndarray, iidx: int,
-                  tod: float, er: float, f30: float, dirn: int) -> float | None:
+                  tod: float, er: float, f30: float, dirn: int,
+                  clamp: bool = True) -> float | None:
+    """clamp=False returns the TRUE calibrated probability (no META_P_FLOOR
+    lift) — for telemetry/diagnosis. Decisions keep clamp=True."""
     if not meta or int(meta.get("n", 0)) < config.META_MIN_TRAIN:
         return None
     b0 = iidx * config.NODES_PER_INDEX
@@ -124,12 +127,14 @@ def meta_win_prob(meta: dict | None, frame: np.ndarray, iidx: int,
                          1.0 if dirn > 0 else -1.0]]).astype(np.float32)
     if meta.get("engine") == "gbm":
         from core import meta_gbm as MG
-        return MG.score_vec(meta, x)
+        return MG.score_vec(meta, x, clamp=clamp)
     mu = np.asarray(meta["mu"], np.float32)
     sd = np.asarray(meta["sd"], np.float32)
     w = np.asarray(meta["w"], np.float32)
     z = (x - mu) / np.where(sd > 0.0, sd, 1.0)
     pr = 1.0 / (1.0 + math.exp(-float(z @ w) - float(meta["b"])))
+    if not clamp:
+        return float(pr)
     return float(min(max(pr, config.META_P_FLOOR), config.META_P_CAP))
 
 

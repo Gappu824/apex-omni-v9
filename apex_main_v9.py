@@ -623,6 +623,7 @@ def main():
     # paper-blocking reason; the live-only drift de-arm stays in the `drift` field.
     skip_reason: dict[str, str] = {i: "warming up" for i in config.TRADABLE}
     stale_logged = False
+    _flip_warned: dict[str, bool] = {}
     ring_quotes: dict[int, dict] = {}
     engine.quote_fn = lambda tok: ring_quotes.get(tok, {})
 
@@ -1007,6 +1008,29 @@ def main():
                 else:
                     _cf = _cw = _cg = None
                     _src, _cage = "none", 0.0
+                # AUDIT (2026-07-23): on SENSEX EXPIRY DAY (dte 0.3) the radar
+                # returned flip 69,203 against spot 76,386 — a -9.4% gap — with
+                # atm_iv 0.0491 (vs a normal ~0.13). As expiry collapses IV,
+                # gamma explodes and the zero-crossing solve destabilises: that
+                # number is a numerical artifact, not a gamma flip, and the
+                # brain still marked it in_band. A flip_break measured against
+                # it would be meaningless. Reject implausible flips outright.
+                if _cf and spot > 0:
+                    _dist = abs(float(_cf) / spot - 1.0)
+                    _lim = float(getattr(config, "CASCADE_MAX_FLIP_DIST_PCT",
+                                         0.05))
+                    if _dist > _lim:
+                        if not _flip_warned.get(idx):
+                            _flip_warned[idx] = True
+                            log.warning("%s: REJECTING implausible flip %.1f "
+                                        "vs spot %.1f (%.1f%% away > %.0f%% "
+                                        "limit) — degenerate GEX solve "
+                                        "(expiry/thin IV), not a gamma flip; "
+                                        "cascade idles rather than trade a "
+                                        "numerical artifact", idx, float(_cf),
+                                        spot, 100 * _dist, 100 * _lim)
+                        _cf = _cw = _cg = None
+                        _src = "rejected-implausible"
                 cascade_ev = detectors[idx].update(
                     ts=ts, day=report.date, spot=spot, flip=_cf,
                     flip_width=_cw, net_gex=_cg,
@@ -1257,6 +1281,18 @@ def main():
                                           min(mins_open / 375.0, 1.0),
                                           er, f30, 1 if conv > 0 else -1)
                 wp = D.blend_winprob(wp_meta, conv, cal)
+                if wp_meta is not None:
+                    # AUDIT: this reservoir used to be fed only AFTER the gate
+                    # PASSED, so with zero entries it reported n=0 all day and
+                    # the meta's output distribution was unobservable. Record
+                    # the TRUE (unclamped) probability at every evaluation —
+                    # that is the series that reveals whether the model
+                    # discriminates or just sits on the floor.
+                    _wp_true = D.meta_win_prob(
+                        load_meta(), frame, i, min(mins_open / 375.0, 1.0),
+                        er, f30, 1 if conv > 0 else -1, clamp=False)
+                    if _wp_true is not None:
+                        wp_res[idx].add(_wp_true)
                 log.debug("%s spot %.1f | ai %+.2f shock %+.2f → conv %+.2f "
                           "(wp %.2f)", idx, spot, ai, shock, conv, wp)
                 # model's LIVE read of the HELD position (model-shaped exit):
@@ -1597,7 +1633,6 @@ def main():
                 funnel.record(idx, "below_bar", gate.reason)
                 continue
             _gate = gate.reason
-            wp_res[idx].add(wp)
             # SIGNAL-PERSISTENCE GATE — sustained read, wall-clock window,
             # sampled 1/second exactly like the forge grader.
             _ok, _why, _ = persist[idx].check(conv, spot_secs.get(idx, ()),

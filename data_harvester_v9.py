@@ -349,6 +349,7 @@ class Harvester:
     def _process(self, tick: dict):
         tok = int(tick["instrument_token"])
         now = time.time()
+        self.last_tick_ts = now      # tick-flow watchdog (see telemetry)
         now_ms = int(now * 1000)
         ex = tick.get("exchange_timestamp") or tick.get("last_trade_time")
         ts_ms = self._safe_ms(ex, now_ms)
@@ -453,8 +454,25 @@ class Harvester:
                                        "ts": now}, ts=now)
             if now - last_tel >= config.TELEMETRY_S:
                 self.diag.queue_max = max(self.diag.queue_max, self.q.qsize())
-                log.info("telemetry: queue=%d snaps=%d subs=%d",
-                         self.q.qsize(), len(self.snap), len(self.subscribed))
+                # AUDIT (2026-07-22 20:20:56): the Kite WebSocket dropped
+                # (1006, uncleanly) and this line kept printing an identical
+                # healthy-looking telemetry for 58s with ZERO ticks arriving —
+                # a silent data hole right through the EIA release. queue=0
+                # looks the same whether the feed is quiet or DEAD, so the age
+                # of the last tick is now part of the heartbeat, and a silent
+                # feed says so in words.
+                _last = getattr(self, "last_tick_ts", 0.0)
+                _age = (now - _last) if _last else float("inf")
+                log.info("telemetry: queue=%d snaps=%d subs=%d | last tick "
+                         "%s ago", self.q.qsize(), len(self.snap),
+                         len(self.subscribed),
+                         f"{_age:.0f}s" if _last else "never")
+                if _age > float(getattr(config, "FEED_SILENT_WARN_S", 30)):
+                    log.warning("⚠ NO TICKS for %.0fs — the WebSocket is up "
+                                "but silent, or the peer dropped it. The ring "
+                                "is going stale; both brains will hit their "
+                                "stale-feed guards. Check the connection.",
+                                _age)
                 if self.q.qsize() > config.QUEUE_WARN_DEPTH:
                     log.warning("⚠ writer lagging the WebSocket — "
                                 "queue depth %d", self.q.qsize())

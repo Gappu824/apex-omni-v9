@@ -803,7 +803,16 @@ def train_meta(con, days: list[str]):
             diag.update({"base_rate": out["base_rate"],
                          "holdout_acc": out["holdout_acc"],
                          "engine": "gbm",
-                         "oof_brier_cal": out["oof_brier_cal"]})
+                         "oof_brier_cal": out["oof_brier_cal"],
+                         # AUDIT (2026-07-24): the skill verdict was computed
+                         # and logged but never PERSISTED, so nightly skill
+                         # could not be tracked across runs — the one number
+                         # that says whether the gate model beats always
+                         # predicting the base rate. It belongs in the report.
+                         "brier_climatology": out.get("brier_climatology"),
+                         "bss_cal": out.get("bss_cal"),
+                         "bss_raw": out.get("bss_raw"),
+                         "breakeven_p": out.get("breakeven_p")})
             try:                       # v10 DISTRIBUTIONAL EDGE (fail-open)
                 from core import dist_edge as DE
                 dee = DE.fit_dee(dee_rows, config.META_MIN_TRAIN)

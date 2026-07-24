@@ -80,7 +80,18 @@ try:
 except Exception: HAVE=False
 if HAVE and len(X)>=8:
     from core import meta_gbm as MG
-    out = MG.fit_gbm([(ds,X,Y,W)], min_train=8)
+    # AUDIT: this assertion was structurally impossible and had never run
+    # (lightgbm was absent, so the branch was skipped). fit_gbm uses purged
+    # DAY-fold CV and requires >=2 COMPLETED folds — a single harvested day
+    # can never satisfy that. Tile the real x-vectors across 8 synthetic days
+    # to exercise the trainer contract the way the live forge sees it (the
+    # commodity forge accumulates across ~25 days before it reaches its gate).
+    perday = []
+    for _d in range(8):
+        _i = [(k + _d) % len(X) for k in range(len(X))]
+        perday.append((f"2026-07-{_d+1:02d}", [X[k] for k in _i],
+                       [Y[k] for k in _i], [W[k] for k in _i]))
+    out = MG.fit_gbm(perday, min_train=8)
     check("fit_gbm trains on commodity samples", out is not None and out.get("engine")=="gbm",
           f"n={out and out.get('n')}")
     if out:
@@ -89,6 +100,9 @@ if HAVE and len(X)>=8:
         from core.commodity_brain import load_commodity_meta, CommodityBrain
         m = load_commodity_meta()
         check("brain loads the promoted artifact", m is not None and m.get("engine")=="gbm")
+        check("artifact carries Brier Skill Score vs climatology",
+              "bss_cal" in out and "brier_climatology" in out,
+              f"bss_cal={out.get('bss_cal')}")
         b = CommodityBrain()
         b._spot_hist["CRUDEOIL"].extend([6000+i*0.3 for i in range(60)])
         wp = b._meta_wp("CRUDEOIL", np.stack([X[0][:19],X[0][19:38],X[0][38:57],

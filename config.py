@@ -19,6 +19,7 @@ scan is in the audit report.
 """
 
 import logging
+import unicodedata as _ud
 import os
 import sys
 import io
@@ -63,14 +64,61 @@ def _load_dotenv():
 _load_dotenv()
 
 
+# v9.7.1 ENCODING: the log FILES are valid UTF-8 — verified at byte level
+# (`·` = c2 b7, `✓` = e2 9c 93, zero double-encoding). Nothing corrupts them on
+# write. But every reader downstream guesses its own codepage, and a Windows
+# console, a tail viewer or a clipboard hop that guesses cp1252 renders ₹ as
+# "â‚¹" and ✓ as "âœ“". We cannot fix a reader we do not control; the only wire
+# format none of them can mangle is ASCII. Source keeps its Unicode (comments
+# and docstrings are never emitted) — EMITTED log lines are transliterated.
+LOG_ASCII = True          # False keeps the glyphs if your console is UTF-8 clean
+
+_ASCII_MAP = {
+    "₹": "Rs ", "✓": "[y]", "✗": "[x]", "⚠": "!", "·": ".", "—": "-",
+    "–": "-", "→": "->", "←": "<-", "≥": ">=", "≤": "<=", "≈": "~",
+    "×": "x", "±": "+/-", "σ": "sigma", "Δ": "delta", "μ": "mu", "★": "*",
+    # 2026-07-23: these three fell through to "?" in the live logs — the Brier
+    # decomposition printed "unc 0.2500 ? res" (U+2212 MINUS, not a hyphen) and
+    # the skill line printed "b=1.50 ? break-even" (U+21D2). Mapped explicitly.
+    "−": "-", "⇒": "=>", "⇐": "<=", "≠": "!=", "∞": "inf", "√": "sqrt",
+    "≡": "==", "≪": "<<", "≫": ">>", "∑": "sum", "∆": "delta",
+    # 2026-07-23: the live ENTER line printed "vol-scaled (ATR 5.67, 15m, ?0.50)"
+    # — lowercase delta (U+03B4) was unmapped; only capital Delta was.
+    "δ": "d", "α": "alpha", "β": "beta", "γ": "gamma", "θ": "theta",
+    "λ": "lambda", "ρ": "rho", "τ": "tau", "φ": "phi", "ω": "omega",
+    "Σ": "Sum", "Ω": "Omega", "π": "pi",
+    "♥": "hb", "…": "...", "─": "-", "━": "-", "│": "|", "•": "*",
+    "“": '"', "”": '"', "‘": "'", "’": "'", "📊": "", "°": "deg",
+}
+
+
+class _AsciiSafeFormatter(logging.Formatter):
+    """Transliterate emitted log records to ASCII (see LOG_ASCII above)."""
+
+    def format(self, record):
+        s = super().format(record)
+        if s.isascii():
+            return s
+        for k, v in _ASCII_MAP.items():
+            s = s.replace(k, v)
+        if not s.isascii():          # anything unmapped: strip accents, then ?
+            s = (_ud.normalize("NFKD", s)
+                 .encode("ascii", "replace").decode("ascii"))
+        return s
+
+
 def setup_logging(component: str, level=logging.INFO):
     """Console + daily file (logs/<component>_<date>.log) for every process.
     Call once at the top of each entrypoint."""
     LOG_DIR.mkdir(exist_ok=True)
     fh = logging.FileHandler(LOG_DIR / f"{component}_{_dt.date.today()}.log",
                              encoding="utf-8")
-    logging.basicConfig(level=level, format=LOG_FORMAT,
-                        handlers=[logging.StreamHandler(), fh], force=True)
+    sh = logging.StreamHandler()
+    _fmt = (_AsciiSafeFormatter(LOG_FORMAT) if LOG_ASCII
+            else logging.Formatter(LOG_FORMAT))
+    fh.setFormatter(_fmt)
+    sh.setFormatter(_fmt)
+    logging.basicConfig(level=level, handlers=[sh, fh], force=True)
     logging.getLogger(component).info(
         "=== %s start | %s | capital ₹%.0f | LIVE_FIRE=%s (armed=%s) ===",
         component, VERSION, TRADING_CAPITAL, LIVE_FIRE, live_fire_armed())
@@ -313,8 +361,34 @@ EVENING_CAPTURE_ENABLED = True
 COMMODITY_SESSION_OPEN  = "09:00"   # MCX open (before equity 09:15)
 RISK_STATE_PERSIST      = True      # day ledger survives crash-restarts (F1)
 COMMODITY_CAPITAL_FRAC  = 0.35      # commodity book's capital partition (F5)
+# COMMODITY_CAPITAL_RS: absolute rupee capital for the commodity book. When set
+# it OVERRIDES the fraction above — operators think in rupees, not fractions,
+# and a fraction silently rescales if TRADING_CAPITAL ever changes. None = use
+# the fraction. (2026-07-23: operator has Rs 2,000 allocated to commodities.)
+COMMODITY_CAPITAL_RS    = 2000.0
 COMMODITY_NO_ENTRY_BEFORE_CLOSE_MIN = 25   # per-commodity curfew (F2)
 COMMODITY_FLATTEN_BEFORE_CLOSE_MIN  = 30   # per-commodity EOD (S2-F1)
+FEED_SILENT_WARN_S      = 30   # harvester shouts if no tick arrives this long
+# META_MIN_BSS: refuse to promote a meta whose Brier Skill Score against the
+# base-rate climatology falls below this (the discipline rvnet already applies
+# to HAR). None = REPORT ONLY — compute and log the skill, promote regardless.
+# That is the default, so this knob changes nothing until you arm it; set 0.0
+# to require that the model at least beat always-predicting the base rate.
+META_MIN_BSS            = None
+# META_MIN_POSITIVES: a probability gate cannot be calibrated on a handful of
+# winners. Tonight the commodity forge promoted a model fit on ~5 positives out
+# of 384 (base rate 1.25%) and reported "98.8% holdout accuracy" — which is just
+# the class imbalance, i.e. always predicting LOSS. Below this many positive
+# (or negative) outcomes the artifact is refused and the brain stays
+# heuristic-only, which is the strictly safer status quo. Equity is unaffected
+# (759 signals x 30.3% = ~230 positives).
+META_MIN_POSITIVES      = 30
+# META_MIN_OOF_SPREAD: refuse a meta whose calibrated OOF predictions barely
+# vary (a constant cannot discriminate). None = REPORT ONLY, and that default
+# is deliberate: withholding the EQUITY meta re-opens entries the counterfactual
+# grades at 0 wins in 400. Diagnose first; act on evidence, not reflex.
+META_MIN_OOF_SPREAD     = None
+CASCADE_MAX_FLIP_DIST_PCT = 0.05   # reject GEX flips this far from spot
 SUPERVISOR_TABS         = True      # one Windows Terminal viewer tab per child
 #                                     (tabs tail per-process logs; closing a tab
 #                                     kills nothing — supervision stays direct)
@@ -1212,8 +1286,11 @@ _HASH_EXCLUDE = frozenset({
     "COMMODITY_ENTRY_CONVICTION", "COMMODITY_META_MIN_TRAIN",
     "COMMODITY_FORGE_COOLDOWN_S", "EVENING_CAPTURE_ENABLED",
     "COMMODITY_SESSION_OPEN", "SUPERVISOR_TABS", "RISK_STATE_PERSIST",
-    "COMMODITY_CAPITAL_FRAC", "COMMODITY_NO_ENTRY_BEFORE_CLOSE_MIN",
-    "COMMODITY_FLATTEN_BEFORE_CLOSE_MIN",
+    "COMMODITY_CAPITAL_FRAC", "COMMODITY_CAPITAL_RS", "COMMODITY_NO_ENTRY_BEFORE_CLOSE_MIN",
+    "COMMODITY_FLATTEN_BEFORE_CLOSE_MIN", "FEED_SILENT_WARN_S",
+    "LOG_ASCII",
+    "META_MIN_BSS", "META_MIN_POSITIVES", "META_MIN_OOF_SPREAD",
+    "CASCADE_MAX_FLIP_DIST_PCT",
     # v9.8 meta-forge engine knobs (trainer choice — model files carry their
     # own provenance; these must not fingerprint the feature world)
     "META_ENGINE", "META_EMBARGO_DAYS", "META_GBM_LEAVES", "META_GBM_LR",

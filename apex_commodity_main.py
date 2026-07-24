@@ -134,8 +134,10 @@ def main():
     # book's allowance. The commodity book now runs on an explicit partition;
     # the equity book is untouched (its governor still sees full capital, so
     # live equity behaviour is byte-identical).
-    _frac = float(getattr(config, "COMMODITY_CAPITAL_FRAC", 0.35))
-    risk = RiskGovernor(capital=config.TRADING_CAPITAL * _frac, kite=kite,
+    _rs = getattr(config, "COMMODITY_CAPITAL_RS", None)
+    _cap = (float(_rs) if _rs else config.TRADING_CAPITAL
+            * float(getattr(config, "COMMODITY_CAPITAL_FRAC", 0.35)))
+    risk = RiskGovernor(capital=_cap, kite=kite,
                         book="commodity", persist=True)
     engine = ExecutionEngine(kite=kite, quote_fn=lambda tok: {})
     brain = CommodityBrain()
@@ -164,6 +166,18 @@ def main():
     spot_secs: dict[str, deque] = {c: deque(maxlen=1800) for c in commodities}
     spread_ew: dict[str, float] = {c: 0.02 for c in commodities}
     last_decision_sec = -1
+    # AUDIT (2026-07-23, live): 42 entry attempts, 42 "maker unfilled — walked
+    # away", zero fills. Cause: this harness constructed ExecutionEngine with
+    # the placeholder `quote_fn=lambda tok: {}` and — unlike apex_main, which
+    # REBINDS it to the ring at line 627 — never replaced it. With no quote the
+    # paper fill simulator sees bid=ask=0 and returns None on its first line, so
+    # EVERY order was NOFILL by construction, no matter the market. Same class
+    # as the missing risk.on_tick(): the equity brain does this inside its loop
+    # and the commodity copy omitted it.
+    _marks: dict[str, float] = {}       # live mark of each held leg
+    _noquote_warn: dict[str, float] = {}
+    ring_quotes: dict[int, dict] = {}
+    engine.quote_fn = lambda tok: ring_quotes.get(tok, {})
     last_hb = 0.0          # operator heartbeat — a gated-idle brain is healthy,
     #                        but a silent tab reads as dead. Every
     #                        COMMODITY_HEARTBEAT_S: ring age, per-commodity
@@ -191,6 +205,15 @@ def main():
         # Gated on a non-empty market so a dead feed cannot fake warm-up.
         if market:
             risk.on_tick()
+
+        # refresh ring-backed quotes for the paper fill simulator (mirrors
+        # apex_main's "refresh ring-backed quotes" block). Without this the
+        # engine prices nothing and every maker order walks away.
+        ring_quotes.clear()
+        for _c, _ctx in market.items():
+            for _info in (_ctx.get("legs") or {}).values():
+                if _info.get("token") and _info.get("snap"):
+                    ring_quotes[int(_info["token"])] = _info["snap"]
 
         # ---- management every loop (full tempo) ----
         for c in commodities:
@@ -228,6 +251,24 @@ def main():
                 atm_iv=0.6,                       # commodity IV is high; refined
                 minutes_to_close=mins_left,
                 avg_spread_pct=spread_ew[c], conviction=0.0)
+            if pm.pos is not None:
+                # AUDIT (2026-07-23): the first live commodity fill was INVISIBLE
+                # — the heartbeat showed only spot, so an open position could not
+                # be tracked at all. Capture the mark here for the heartbeat, and
+                # say so loudly if the held strike drops out of the ring (then it
+                # is unmarkable AND unmanageable, the same hazard apex_main
+                # solves for non-ATM equity strikes).
+                _b, _a2 = quote.get("bid", 0.0), quote.get("ask", 0.0)
+                _marks[c] = ((_b + _a2) / 2.0 if _b > 0 and _a2 > 0
+                             else float(quote.get("ltp") or 0.0))
+                if not quote and ts - _noquote_warn.get(c, 0.0) > 60:
+                    _noquote_warn[c] = ts
+                    log.warning("%s: held leg %s has NO quote in the ring "
+                                "(strike drifted off the ATM window) — the "
+                                "position cannot be marked or exited on price "
+                                "until it returns", c, pm.pos.symbol)
+            else:
+                _marks.pop(c, None)
             try:
                 pm.manage(tctx, quote)
             except Exception as e:                            # noqa: BLE001
@@ -243,9 +284,25 @@ def main():
                            .get("ltp") or 0.0)
                 ok, _why = _CAL.commodity_trade_eligible(c)  # (bool, reason)
                 bits.append(f"{c} {sp:.1f}{'✓' if ok else '·'}")
-            log.info("alive | ring %.1fs | %s | tradable: %s", age,
+            log.info("alive | ring %.1fs | %s | tradable: %s | %s", age,
                      "  ".join(bits),
-                     ",".join(tradable) or "none (calibration/opt-in pending)")
+                     ",".join(tradable) or "none (calibration/opt-in pending)",
+                     f"realized Rs {risk.realized_pnl:+.2f}")
+            # POSITION TRACKING — one line per open position, every heartbeat.
+            _open = [(c, pms[c].pos) for c in commodities
+                     if pms[c].pos is not None]
+            if not _open:
+                log.info("  book: FLAT")
+            for c, p in _open:
+                mk = _marks.get(c, 0.0)
+                upl = (mk - p.entry) * p.qty if mk > 0 else 0.0
+                pct = ((mk / p.entry - 1.0) * 100.0) if (mk > 0 and p.entry) else 0.0
+                log.info("  POS %s %s x%d | entry %.2f mark %.2f | uPnL Rs "
+                         "%+.2f (%+.2f%%) | stop %.2f tgt %.2f | held %.1fm",
+                         c, p.symbol, p.qty, p.entry, mk, upl, pct,
+                         getattr(p, "stop", 0.0) or 0.0,
+                         getattr(p, "target", 0.0) or 0.0,
+                         max(ts - p.entry_ts, 0) / 60.0)
 
         # ---- decisions once per RING SECOND ----
         if ring_sec != last_decision_sec and market:
