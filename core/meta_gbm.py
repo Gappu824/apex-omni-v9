@@ -135,7 +135,8 @@ def _isotonic(p: np.ndarray, y: np.ndarray, w: np.ndarray):
     return bx, by
 
 
-def fit_gbm(perday: list[tuple], min_train: int) -> dict | None:
+def fit_gbm(perday: list[tuple], min_train: int,
+            oof_out: dict | None = None) -> dict | None:
     """perday: [(day, X_list, y_list, w_list)] exactly as train_meta builds.
     Returns the artifact dict (engine:'gbm') or None → caller falls back."""
     try:
@@ -247,6 +248,14 @@ def fit_gbm(perday: list[tuple], min_train: int) -> dict | None:
     # discriminate at all: it blocks 100% or passes 100% forever, whatever the
     # market. Measure the calibrated OOF spread so this is visible every night.
     _cal_oof = np.interp(oof_p[got], iso_x, iso_y)
+    if oof_out is not None:
+        # Research hook (tools/meta_lift.py): expose the OOF predictions the CV
+        # already computed, WITHOUT bloating the artifact that serving loads.
+        # `mask` maps these back to the caller's sample order.
+        oof_out["mask"] = got.copy()
+        oof_out["oof_raw"] = oof_p[got].copy()
+        oof_out["oof_cal"] = _cal_oof.copy()
+        oof_out["y"] = Y[got].copy()
     _spread = float(np.quantile(_cal_oof, 0.95) - np.quantile(_cal_oof, 0.05))
     _distinct = int(len(np.unique(np.round(_cal_oof, 4))))
     # DISCRIMINATION vs CALIBRATION. auc_raw is the booster's own ordering;
