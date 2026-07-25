@@ -43,6 +43,34 @@ log = logging.getLogger("forge")   # AUDIT: the skill report below needs a
 import config
 
 
+def _auc(y: np.ndarray, p: np.ndarray) -> float:
+    """Rank-based AUC (Mann-Whitney U). 0.5 = no ordering ability at all.
+
+    Brier/BSS conflate DISCRIMINATION (does the model rank winners above
+    losers?) with CALIBRATION (are the numbers the right probabilities?). A
+    model can rank well and still be badly calibrated — in which case a FIXED
+    bar like META_ENTRY_P_BAR never fires while a RELATIVE bar (today's top
+    decile) would. AUC separates the two, so the operator can tell "there is no
+    signal" apart from "there is signal, expressed on the wrong scale".
+    """
+    y = np.asarray(y, float)
+    p = np.asarray(p, float)
+    n_pos = float((y > 0.5).sum())
+    n_neg = float((y <= 0.5).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = np.argsort(p, kind="mergesort")
+    ranks = np.empty(len(p), float)
+    ranks[order] = np.arange(1, len(p) + 1, dtype=float)
+    # average ranks over ties — a constant predictor must score exactly 0.5
+    _, inv, cnt = np.unique(p, return_inverse=True, return_counts=True)
+    sums = np.zeros(len(cnt), float)
+    np.add.at(sums, inv, ranks)
+    ranks = (sums / cnt)[inv]
+    return float((ranks[y > 0.5].sum() - n_pos * (n_pos + 1) / 2.0)
+                 / (n_pos * n_neg))
+
+
 def _wilson_lo(wins: float, n: float, ci: float = 0.90) -> float:
     if n <= 0:
         return 0.0
@@ -221,6 +249,24 @@ def fit_gbm(perday: list[tuple], min_train: int) -> dict | None:
     _cal_oof = np.interp(oof_p[got], iso_x, iso_y)
     _spread = float(np.quantile(_cal_oof, 0.95) - np.quantile(_cal_oof, 0.05))
     _distinct = int(len(np.unique(np.round(_cal_oof, 4))))
+    # DISCRIMINATION vs CALIBRATION. auc_raw is the booster's own ordering;
+    # auc_cal is what serving actually sees after isotonic. Isotonic is
+    # monotone, so the two differ only through TIES — and a calibration that
+    # collapses to a constant destroys ranking that the booster did have. If
+    # auc_raw >> 0.5 while auc_cal == 0.5, the signal exists and the mapping is
+    # eating it; that is a fixable problem and argues for a RELATIVE gate.
+    _auc_raw = _auc(Y[got], oof_p[got])
+    _auc_cal = _auc(Y[got], _cal_oof)
+    log.info("META DISCRIMINATION | AUC raw %.4f | AUC calibrated %.4f "
+             "(0.500 = no ordering ability) -> %s", _auc_raw, _auc_cal,
+             "NO RANKING SIGNAL" if not (_auc_cal > 0.53)
+             else "ranks better than chance")
+    if _auc_raw > 0.55 >= _auc_cal:
+        log.warning("CALIBRATION IS DESTROYING RANKING: the booster orders "
+                    "signals (AUC %.4f) but the calibrated output does not "
+                    "(AUC %.4f). A fixed probability bar cannot exploit this; "
+                    "a relative gate (top-quantile of the day) could.",
+                    _auc_raw, _auc_cal)
     _min_spread = getattr(config, "META_MIN_OOF_SPREAD", None)
     if _spread < 0.02:
         log.warning("META OUTPUT NEARLY CONSTANT: calibrated OOF p05-p95 "
@@ -260,6 +306,10 @@ def fit_gbm(perday: list[tuple], min_train: int) -> dict | None:
         return None
     return {"engine": "gbm", "model_file": mpath.name,
             "oof_spread_p05_p95": round(_spread, 5),
+            "auc_raw": (None if _auc_raw != _auc_raw
+                        else round(_auc_raw, 4)),
+            "auc_cal": (None if _auc_cal != _auc_cal
+                        else round(_auc_cal, 4)),
             "oof_distinct_values": _distinct,
             "brier_climatology": round(brier_clim, 5),
             "bss_cal": round(bss_cal, 4), "bss_raw": round(bss_raw, 4),
@@ -292,12 +342,21 @@ def score_vec(meta: dict, x: np.ndarray,
     except Exception:                                     # noqa: BLE001
         return None
     mpath = config.MODEL_DIR / meta.get("model_file", "meta_gbm.txt")
-    key = str(mpath)
+    # AUDIT (2026-07-24): the cache was keyed on the PATH alone with no
+    # invalidation, so any process that had already loaded meta_gbm.txt kept
+    # serving that booster even after the forge overwrote the file. The nightly
+    # forge does exactly that within a single process — fit, write, then score
+    # the exam — so a stale booster could grade the very model that replaced
+    # it. Key on (path, mtime): a rewritten model is picked up automatically.
+    try:
+        _mt = mpath.stat().st_mtime
+    except FileNotFoundError:
+        return None
+    key = (str(mpath), _mt)
     bst = _BOOSTERS.get(key)
     if bst is None:
-        if not mpath.exists():
-            return None
-        bst = lgb.Booster(model_file=key)
+        bst = lgb.Booster(model_file=str(mpath))
+        _BOOSTERS.clear()          # only ever one live model; don't leak
         _BOOSTERS[key] = bst
     p_raw = float(bst.predict(np.asarray(x, np.float32)[None, :])[0])
     p_cal = float(np.interp(p_raw, np.asarray(meta["iso_x"], float),

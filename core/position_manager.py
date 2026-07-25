@@ -163,6 +163,9 @@ class Position:
     breakeven_px: float = 0.0     # entry + round-trip cost per unit
     extends_used: int = 0         # model-driven target extensions taken so far
     peak: float = 0.0
+    peak_ts: float = 0.0      # when the RAW mark last made a new high
+    #  (p.trail.hwm tracks the EMA, which keeps creeping up during a
+    #   plateau — useless for 'is the move still running')
     trail_armed: bool = False
     shield: TrapShield = field(default=None)            # type: ignore
     spike_ref_spot: float = 0.0
@@ -430,6 +433,7 @@ class PositionManager:
         p.target = fill.avg_price + max(prem_room,
                                         fill.avg_price * _tp_floor)
         p.peak = fill.avg_price
+        p.peak_ts = float(ctx.ts)
         p.shield = TrapShield(direction)
         p.spike_ref_spot = ctx.spot
         # v9.7.1 peak-capture trail — parameters read at construction so the
@@ -531,7 +535,9 @@ class PositionManager:
         ask = float(quote.get("ask") or 0)
         ltp = float(quote.get("ltp") or bid or p.entry)
         mark = bid if bid > 0 else ltp
-        p.peak = max(p.peak, mark)              # raw peak: telemetry only
+        if mark > p.peak:                       # raw peak + WHEN it moved
+            p.peak = mark
+            p.peak_ts = float(ctx.ts)
         # v9.7.1: advance the peak-capture trail on the executable mark. The
         # SMOOTHED high-water mark now feeds the legacy giveback ratchet and
         # the profit lock — a single spiked bid print can no longer inflate
@@ -599,7 +605,37 @@ class PositionManager:
                 _fl_arm = float(getattr(config, "FAST_LANE_ARM_PCT", 0.12))
                 _fl_tp = float(getattr(config, "FAST_LANE_TP_PCT", 0.22))
                 if _fl_gain >= _fl_arm and mark >= p.entry * (1 + _fl_tp):
-                    return self._exit(ctx, quote, "FAST_LANE_TP", urgent=True)
+                    # v9.7.1 AUDIT (2026-07-24): rung 3.5 sits ABOVE rung 4's
+                    # target-EXTENSION judge, so a hard +22% bank preempted the
+                    # very logic built to let a live move run. On 07-23 it
+                    # banked SENSEX at 162.85 while 162.85 WAS a new high (peak
+                    # 159.50 five seconds earlier) — it cut a move that was
+                    # still accelerating. Fire only once the spike has STALLED:
+                    # no new high for FAST_LANE_RUN_GRACE_S. Downside is
+                    # unchanged — the ratcheted trail and profit lock sit
+                    # underneath (that stop had already locked +8%), so
+                    # deferring risks giveback to the ratchet, never the gain.
+                    _running = False
+                    if bool(getattr(config, "FAST_LANE_DEFER_WHILE_RISING",
+                                    True)):
+                        # RAW peak age. p.trail.hwm follows the EMA,
+                        # which keeps creeping up on a plateau and
+                        # would report "still running" forever.
+                        _grace = float(getattr(
+                            config, "FAST_LANE_RUN_GRACE_S", 20.0))
+                        _running = (ctx.ts - float(p.peak_ts or 0.0)) <= _grace
+                    if _running:
+                        if not getattr(p, "_fl_defer_logged", False):
+                            p._fl_defer_logged = True
+                            self._log(ts=ctx.ts, event="FAST_LANE_DEFER",
+                                      index=self.index, symbol=p.symbol,
+                                      direction=p.direction, price=mark,
+                                      reason=(f"+{100*_fl_gain:.1f}% but still "
+                                              f"making new highs - letting it "
+                                              f"run (trail protects)"))
+                    else:
+                        return self._exit(ctx, quote, "FAST_LANE_TP",
+                                          urgent=True)
         # 4) target — EXTENDED, not banked, while the edge is demonstrably on.
         # Two judges, in strict precedence:
         #   a) trained meta P(win) (unchanged v9 semantics) when it exists;

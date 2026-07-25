@@ -38,6 +38,7 @@ the operator's vault — this tool just measures it honestly.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import sqlite3
 import sys
@@ -90,6 +91,53 @@ def _fast_lane_exit(info: dict) -> tuple[float, int] | None:
         return None                       # fast-TP never reached → hand back
     off = int(hit[0]) + (lo - 1)
     return float(tp_px), off              # filled at the fast-TP
+
+
+def _forward_evidence(days: list) -> dict:
+    """REALIZED fast-lane firings from the execution ledger.
+
+    AUDIT (2026-07-24): this report replays the HEURISTIC+meta path only, and
+    the meta currently blocks that path to ~zero entries — so it printed "no
+    firings, cannot assess" for 27 straight days while the fast lane was firing
+    profitably in production. Every live entry comes from the CASCADE, which
+    bypasses the meta, so the replay is structurally blind to the only trades
+    that happen. The ledger is not: it records FAST_LANE_ARMED at entry and a
+    SELL_FILL with reason FAST_LANE_TP when it banks. Blending that forward
+    evidence follows the same pattern cascade_harness already uses.
+    """
+    out = {"armed": 0, "fired": 0, "pnl_rs": 0.0, "costs_rs": 0.0,
+           "wins": 0, "trades": []}
+    path = Path(config.LEDGER_PATH)
+    if not path.exists() or not days:
+        return out
+    try:
+        import datetime as _dt
+        t0 = _dt.datetime.fromisoformat(days[0]).timestamp()
+    except Exception:                                          # noqa: BLE001
+        t0 = 0.0
+    try:
+        with path.open(newline="", encoding="utf-8", errors="replace") as f:
+            for r in csv.DictReader(f):
+                try:
+                    ts_ = float(r.get("ts") or 0)
+                except ValueError:
+                    continue
+                if ts_ < t0:
+                    continue
+                if r.get("event") == "FAST_LANE_ARMED":
+                    out["armed"] += 1
+                elif (r.get("reason") or "").strip() == "FAST_LANE_TP":
+                    pnl_ = float(r.get("pnl") or 0.0)
+                    out["fired"] += 1
+                    out["pnl_rs"] += pnl_
+                    out["costs_rs"] += float(r.get("costs") or 0.0)
+                    out["wins"] += int(pnl_ > 0)
+                    out["trades"].append({"ts": ts_, "index": r.get("index"),
+                                          "symbol": r.get("symbol"),
+                                          "pnl_rs": round(pnl_, 2)})
+    except Exception as e:                                     # noqa: BLE001
+        log.warning("forward-evidence read failed (%s) — replay-only report", e)
+    return out
 
 
 def main():
@@ -163,9 +211,27 @@ def main():
                     config.FAST_LANE_CONVICTION,
                     config.FAST_LANE_TP_PCT * 100,
                     config.FAST_LANE_MIN_HOLD_S, config.FAST_LANE_MAX_HOLD_S)
+        fwd = _forward_evidence(days)
+        if fwd["fired"]:
+            log.info("FORWARD EVIDENCE from the live ledger: %d fast-lane "
+                     "firing(s), %d armed | Σ ₹%+.2f (costs ₹%.2f) | %d win(s). "
+                     "The replay finds none because it only walks the "
+                     "heuristic+meta path, which the meta blocks — live "
+                     "entries come from the CASCADE.", fwd["fired"],
+                     fwd["armed"], fwd["pnl_rs"], fwd["costs_rs"], fwd["wins"])
+            for t_ in fwd["trades"][-5:]:
+                log.info("    %s %s  ₹%+.2f", t_["index"], t_["symbol"],
+                         t_["pnl_rs"])
+            _verdict = (f"replay found no qualifying heuristic entries; "
+                        f"{fwd['fired']} REAL firing(s) in the ledger, "
+                        f"Σ ₹{fwd['pnl_rs']:+.2f} — forward evidence only, "
+                        f"far below any certification floor")
+        else:
+            _verdict = ("no fast-lane firings in window (replay or ledger) "
+                        "— cannot assess")
         rep = {"days": len(days), "qualifying_entries": qualifying,
-               "fast_lane_fired": 0,
-               "verdict": "no fast-lane firings in window — cannot assess",
+               "fast_lane_fired": 0, "forward_evidence": fwd,
+               "verdict": _verdict,
                "config_hash": config.CONFIG_HASH, "ts": time.time()}
         _atomic_write_json(config.LOG_DIR /
                            f"fast_lane_report_{dt.date.today()}.json", rep)

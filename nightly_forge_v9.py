@@ -812,6 +812,10 @@ def train_meta(con, days: list[str]):
                          "brier_climatology": out.get("brier_climatology"),
                          "bss_cal": out.get("bss_cal"),
                          "bss_raw": out.get("bss_raw"),
+                         "auc_raw": out.get("auc_raw"),
+                         "auc_cal": out.get("auc_cal"),
+                         "oof_spread_p05_p95":
+                             out.get("oof_spread_p05_p95"),
                          "breakeven_p": out.get("breakeven_p")})
             try:                       # v10 DISTRIBUTIONAL EDGE (fail-open)
                 from core import dist_edge as DE
@@ -1084,9 +1088,20 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None,
     total = 0.0
     trades = wins = 0
     open_pos = None                    # (exit_t, outlay, pnl, dir, idx)
+    # AUDIT (2026-07-24): the graded sample used to be the FIRST
+    # CF_MAX_PER_GATE blocks in replay order — i.e. the opening minutes of the
+    # session — and the remaining ~17k were merely counted. Any verdict drawn
+    # from it ("0 wins in 400") therefore described the open, not the day, and
+    # the open is its own regime (gap resolution, wide spreads, high vol).
+    # Reservoir sampling (Algorithm R) keeps the same cost and the same 400
+    # gradings, but makes them a UNIFORM RANDOM sample of every block in the
+    # window, so the counterfactual finally describes what it claims to.
+    _cf_pool: dict = {}
+    _cf_rng = np.random.default_rng(20260724)
+
     def _cf(gate_, s_=None, t_=None, count_only=False):
-        """Counterfactual accumulator: n counts every block; graded ₹ only
-        up to CF_MAX_PER_GATE per gate (sampling honesty in the report)."""
+        """Counterfactual accumulator: n counts every block; a uniform random
+        sample of up to CF_MAX_PER_GATE per gate is graded after the replay."""
         if attribution is None:
             return
         a_ = attribution.setdefault(gate_, {"n": 0, "graded": 0, "sum": 0.0,
@@ -1094,20 +1109,37 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None,
         a_["n"] += 1
         if count_only or s_ is None:
             return
-        if a_["graded"] >= config.CF_MAX_PER_GATE:
-            a_["capped"] += 1
-            return
-        try:
-            pnl_ = _shadow_trade(rep, s_, t_)
-        except Exception as e_:                           # noqa: BLE001
-            log.warning("counterfactual shadow failed (%s): %s — telemetry "
-                        "degrades, the exam continues", gate_, e_)
-            return
-        if pnl_ is None:
-            return
-        a_["graded"] += 1
-        a_["sum"] += pnl_
-        a_["wins"] += int(pnl_ > 0)
+        pool = _cf_pool.setdefault(gate_, [])
+        k = int(config.CF_MAX_PER_GATE)
+        seen = a_["n"]
+        if len(pool) < k:
+            pool.append((dict(s_), t_))
+        else:                              # replace with probability k/seen
+            j = int(_cf_rng.integers(0, seen))
+            if j < k:
+                pool[j] = (dict(s_), t_)
+
+    def _cf_grade_pool():
+        """Grade the sampled blocks once the replay has finished."""
+        for gate_, pool in _cf_pool.items():
+            a_ = attribution.setdefault(gate_, {"n": 0, "graded": 0,
+                                                "sum": 0.0, "wins": 0,
+                                                "capped": 0})
+            for s_, t_ in pool:
+                try:
+                    pnl_ = _shadow_trade(rep, s_, t_)
+                except Exception as e_:                   # noqa: BLE001
+                    log.warning("counterfactual shadow failed (%s): %s — "
+                                "telemetry degrades, the exam continues",
+                                gate_, e_)
+                    continue
+                if pnl_ is None:
+                    continue
+                a_["graded"] += 1
+                a_["sum"] += pnl_
+                a_["wins"] += int(pnl_ > 0)
+            a_["capped"] = max(a_["n"] - a_["graded"], 0)
+            a_["sampling"] = "uniform random (reservoir)"
 
     _hook = (lambda i_, g_, d_, c_: _cf(g_, {"idx": i_, **c_}, c_["t"])) \
         if attribution is not None else None
@@ -1227,6 +1259,8 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None,
         total += open_pos[2]
         trades += 1
         wins += int(open_pos[2] > 0)
+    if attribution is not None:      # grade the uniform sample, post-replay
+        _cf_grade_pool()
     return float(total), {"trades": trades, "wins": wins}
 
 

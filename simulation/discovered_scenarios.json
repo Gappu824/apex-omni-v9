@@ -127,6 +127,22 @@
    "date": "2026-07-23",
    "index": "NIFTY",
    "name": "mined_stale_2026-07-23_1205"
+  },
+  {
+   "kind": "stale",
+   "hm": "11:25",
+   "dur_s": 4204,
+   "date": "2026-07-24",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-07-24_1125"
+  },
+  {
+   "kind": "stale",
+   "hm": "12:35",
+   "dur_s": 5258,
+   "date": "2026-07-24",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-07-24_1235"
   }
  ]
 }

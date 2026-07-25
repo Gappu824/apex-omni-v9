@@ -721,6 +721,12 @@ FAST_LANE_CONVICTION    = 0.85   # entry conviction to qualify (well above 0.70)
 FAST_LANE_MIN_HOLD_S    = 180    # 3 min: don't even check fast-TP before this
 FAST_LANE_MAX_HOLD_S    = 600    # 10 min: after this, hand back to normal path
 FAST_LANE_TP_PCT        = 0.22   # quick take-profit target (premium fraction)
+# 2026-07-24: the fast lane used to bank a hard +22% even while the move was
+# still printing new highs, preempting rung 4's target-extension judge. It now
+# waits for the spike to STALL (no new high for RUN_GRACE_S). Set
+# FAST_LANE_DEFER_WHILE_RISING=False to restore the old hard-bank behaviour.
+FAST_LANE_DEFER_WHILE_RISING = True
+FAST_LANE_RUN_GRACE_S        = 20.0
 FAST_LANE_ARM_PCT       = 0.12   # only arm the fast-TP once this far in profit
 # loss-streak circuit breaker — the operator's anti-overtrading guard
 LOSS_STREAK_HALT        = 3      # N consecutive losing trades ends the day
@@ -1290,6 +1296,7 @@ _HASH_EXCLUDE = frozenset({
     "COMMODITY_FLATTEN_BEFORE_CLOSE_MIN", "FEED_SILENT_WARN_S",
     "LOG_ASCII",
     "META_MIN_BSS", "META_MIN_POSITIVES", "META_MIN_OOF_SPREAD",
+    "FAST_LANE_DEFER_WHILE_RISING", "FAST_LANE_RUN_GRACE_S",
     "CASCADE_MAX_FLIP_DIST_PCT",
     # v9.8 meta-forge engine knobs (trainer choice — model files carry their
     # own provenance; these must not fingerprint the feature world)
