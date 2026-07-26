@@ -34,6 +34,8 @@ import math
 import time
 from statistics import NormalDist
 
+from pathlib import Path
+
 import numpy as np
 import logging
 
@@ -136,7 +138,8 @@ def _isotonic(p: np.ndarray, y: np.ndarray, w: np.ndarray):
 
 
 def fit_gbm(perday: list[tuple], min_train: int,
-            oof_out: dict | None = None) -> dict | None:
+            oof_out: dict | None = None,
+            model_path: Path | None = None) -> dict | None:
     """perday: [(day, X_list, y_list, w_list)] exactly as train_meta builds.
     Returns the artifact dict (engine:'gbm') or None → caller falls back."""
     try:
@@ -212,7 +215,14 @@ def fit_gbm(perday: list[tuple], min_train: int,
     rounds = int(np.median(best_iters))
     bst = lgb.train(params, lgb.Dataset(X, label=Y, weight=W),
                     num_boost_round=max(rounds, 25))
-    mpath = config.MODEL_DIR / "meta_gbm.txt"
+    # AUDIT (2026-07-25): this write is UNCONDITIONAL, so any caller that fits
+    # a model replaces the booster the live brain serves. tools/meta_lift.py
+    # did exactly that — a read-only research tool silently clobbered
+    # production, and two probe runs minutes apart scored different models
+    # while reading identical metadata. Research callers now pass model_path
+    # to redirect; the forge passes nothing and behaves exactly as before.
+    mpath = Path(model_path) if model_path else (config.MODEL_DIR /
+                                                 "meta_gbm.txt")
     tmp = mpath.with_suffix(".tmp")
     bst.save_model(str(tmp), num_iteration=rounds)
     tmp.replace(mpath)
@@ -313,7 +323,12 @@ def fit_gbm(perday: list[tuple], min_train: int,
                     "conviction bar. The refusal is the system working.",
                     bss_cal, float(_min_bss))
         return None
+    try:
+        _bst_bytes = mpath.stat().st_size
+    except Exception:                                      # noqa: BLE001
+        _bst_bytes = -1
     return {"engine": "gbm", "model_file": mpath.name,
+            "model_bytes": _bst_bytes,
             "oof_spread_p05_p95": round(_spread, 5),
             "auc_raw": (None if _auc_raw != _auc_raw
                         else round(_auc_raw, 4)),
@@ -364,6 +379,19 @@ def score_vec(meta: dict, x: np.ndarray,
     key = (str(mpath), _mt)
     bst = _BOOSTERS.get(key)
     if bst is None:
+        _want = meta.get("model_bytes")
+        if _want and _want > 0:
+            try:
+                _have = mpath.stat().st_size
+            except Exception:                              # noqa: BLE001
+                _have = -1
+            if _have != _want:
+                log.warning("BOOSTER MISMATCH: %s is %s bytes but the artifact "
+                            "was written against %s. The served model is NOT "
+                            "the one this artifact describes — re-run the "
+                            "forge. (A research tool that fits a model must "
+                            "pass model_path to avoid overwriting this file.)",
+                            mpath.name, _have, _want)
         bst = lgb.Booster(model_file=str(mpath))
         _BOOSTERS.clear()          # only ever one live model; don't leak
         _BOOSTERS[key] = bst

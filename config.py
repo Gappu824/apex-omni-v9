@@ -583,7 +583,16 @@ URGENT_CHASE_TICKS    = 2
 LIVE_POLL_INTERVAL_S  = 0.4
 
 # Harvester
-PRUNE_STEPS       = 6   # harvest ATM±6 strikes per side (was ±3). At low live
+# AUDIT (2026-07-26 weekly): the affordability walker reaches ATM+
+# (HIERARCHY_DEPTH-1) = +7 strikes, but this window only subscribed ATM+/-6 —
+# so the walker routinely asked for legs the harvester never captured. In the
+# cascade spec run that showed up as "unharvested:N" on 11 of 16 skipped
+# triggers: 12 REAL triggers (sane flips) never became fills purely because
+# their strikes were outside the harvest window. Cascade needs 20 certificate
+# events and has 11; those lost fills are the difference. Cost of the fix is
+# +48 websocket tokens (298 -> ~346) against Kite's 3000 limit.
+# INVARIANT: keep PRUNE_STEPS >= HIERARCHY_DEPTH - 1.
+PRUNE_STEPS = 8
 #                         capital the first AFFORDABLE rung sits several
 #                         strikes OTM (₹5k ⇒ premium ≤ ₹14.3 on NIFTY); the
 #                         vault must carry what the account can actually buy,

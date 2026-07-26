@@ -204,9 +204,32 @@ def load_macro_archive(con: sqlite3.Connection, day: str, index: str) -> list[di
                 (index, day)).fetchall()]
         except sqlite3.OperationalError:              # table absent ⇒ no archive
             return []
+    # v9.7.1 AUDIT (2026-07-25): the LIVE brain rejects an implausible gamma
+    # flip (apex_main, CASCADE_MAX_FLIP_DIST_PCT) after 2026-07-23 produced
+    # flip 69,203 vs SENSEX spot 76,386, and 2026-07-24 produced NIFTY flip
+    # 21,689 vs spot 23,767 (-8.8%) — expiry-week IV collapse destabilises the
+    # zero-crossing solve. The ARCHIVE had no such guard, so the forge read
+    # those same corrupt numbers back and used them for the GEX-wall target cap
+    # and replay shocks: the live book refused a flip that the training labels
+    # were still shaped by. That is a train/serve disagreement manufactured by
+    # our own fix, and it is silent because it lives in the vault.
+    # Sanitise on READ (never mutate the archive — the raw record stays honest,
+    # and a threshold change re-sanitises history automatically).
+    _lim = float(getattr(config, "CASCADE_MAX_FLIP_DIST_PCT", 0.05))
     out = []
+    _drop_flip = _drop_wall = 0
     for (ts_ms, spot, expiry, dte, cw, pw, aiv, ivr, pcr, mp, ng,
          flip, flip_w, ndex, sj, ij, gj) in rows:
+        _sp = float(spot or 0.0)
+        if _sp > 0:
+            if flip and abs(float(flip) / _sp - 1.0) > _lim:
+                flip, flip_w, _drop_flip = None, None, _drop_flip + 1
+            # a wall further from spot than the flip limit is the same
+            # degenerate solve; drop it rather than cap a target against it
+            if cw and abs(float(cw) / _sp - 1.0) > _lim:
+                cw, _drop_wall = None, _drop_wall + 1
+            if pw and abs(float(pw) / _sp - 1.0) > _lim:
+                pw, _drop_wall = None, _drop_wall + 1
         out.append({"ts": ts_ms / 1000.0, "spot": spot, "expiry": expiry,
                     "dte": dte, "call_wall": cw, "put_wall": pw, "atm_iv": aiv,
                     "iv_rank": ivr, "pcr": pcr, "max_pain": mp, "net_gex": ng,
@@ -214,6 +237,12 @@ def load_macro_archive(con: sqlite3.Connection, day: str, index: str) -> list[di
                     "strikes": json.loads(sj or "[]"),
                     "iv": json.loads(ij or "[]"),
                     "gex": json.loads(gj) if gj else []})
+    if _drop_flip or _drop_wall:
+        log.warning("%s %s: archive sanitised — %d degenerate flip(s) and %d "
+                    "wall(s) beyond %.0f%% of spot dropped on read (the IV "
+                    "surface is kept). The live brain already refuses these; "
+                    "now the forge does too.", index, day, _drop_flip,
+                    _drop_wall, 100 * _lim)
     return out
 
 
