@@ -128,10 +128,22 @@ class HarvestDiag:
             per[idx]["leg_depth_rate"] = round(d["leg_depth_2sided"] / legs, 3)
             ch = chains.get(idx) or {}
             if ch:
+                # AUDIT (2026-07-28): the report named the expiry and strike
+                # but never the CONTRACT, so answering "which instrument was
+                # this actually trading?" meant cross-referencing the ledger.
+                # These names are not constructed — they are the live Kite
+                # dump's `tradingsymbol`, carried through unchanged, so the
+                # format tracks whatever the exchange publishes (weekly
+                # NIFTY2672124200PE vs monthly NIFTY26JUL23950CE) with no
+                # convention hardcoded anywhere.
+                _legs = ch.get("legs") or {}
+                _names = {k: (v or {}).get("symbol")
+                          for k, v in _legs.items() if (v or {}).get("symbol")}
                 per[idx]["chain"] = {"expiry": str(ch.get("expiry")),
                                      "dte": ch.get("dte"),
                                      "atm": ch.get("atm"),
-                                     "lot": ch.get("lot")}
+                                     "lot": ch.get("lot"),
+                                     "contracts": _names or None}
         return {"per_index": per, "vix_ticks": self.vix_ticks,
                 "ws": {"connects": self.ws_connects, "closes": self.ws_closes},
                 "writer": {"rows_flushed": self.rows_flushed,

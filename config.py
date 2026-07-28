@@ -387,6 +387,13 @@ META_MIN_POSITIVES      = 30
 # vary (a constant cannot discriminate). None = REPORT ONLY, and that default
 # is deliberate: withholding the EQUITY meta re-opens entries the counterfactual
 # grades at 0 wins in 400. Diagnose first; act on evidence, not reflex.
+# META_MIN_AUC: refuse to promote a meta whose calibrated OOF AUC is below
+# this. 0.500 = no ordering ability at all. Unlike the spread and BSS knobs
+# this one is ARMED by default: on 2026-07-28 the commodity forge promoted a
+# model at AUC 0.4915 that the same run had labelled "NO RANKING SIGNAL", and
+# refusing only leaves that brain heuristic-only — strictly safer. Set None to
+# disable (report-only).
+META_MIN_AUC            = 0.52
 META_MIN_OOF_SPREAD     = None
 CASCADE_MAX_FLIP_DIST_PCT = 0.05   # reject GEX flips this far from spot
 SUPERVISOR_TABS         = True      # one Windows Terminal viewer tab per child
@@ -1305,6 +1312,7 @@ _HASH_EXCLUDE = frozenset({
     "COMMODITY_FLATTEN_BEFORE_CLOSE_MIN", "FEED_SILENT_WARN_S",
     "LOG_ASCII",
     "META_MIN_BSS", "META_MIN_POSITIVES", "META_MIN_OOF_SPREAD",
+    "META_MIN_AUC",
     "FAST_LANE_DEFER_WHILE_RISING", "FAST_LANE_RUN_GRACE_S",
     "CASCADE_MAX_FLIP_DIST_PCT",
     # v9.8 meta-forge engine knobs (trainer choice — model files carry their

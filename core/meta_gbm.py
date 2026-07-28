@@ -286,6 +286,24 @@ def fit_gbm(perday: list[tuple], min_train: int,
                     "(AUC %.4f). A fixed probability bar cannot exploit this; "
                     "a relative gate (top-quantile of the day) could.",
                     _auc_raw, _auc_cal)
+    # AUDIT (2026-07-28): the commodity forge promoted a model that this very
+    # block had just described as "NO RANKING SIGNAL" — AUC 0.4915, i.e. worse
+    # than a coin flip at ordering winners above losers, with holdout accuracy
+    # 92.6% that is exactly the 92.8% class imbalance. It cleared
+    # META_MIN_POSITIVES (35 > 30) and META_MIN_BSS is report-only, so nothing
+    # stopped it. I had added the diagnostic that DETECTS this and no guard
+    # that ACTS on it. A gate model that cannot rank cannot gate: served
+    # through Kelly it sizes on noise. Refusing leaves the brain heuristic-only,
+    # which is strictly safer, so this one defaults to ARMED.
+    _min_auc = getattr(config, "META_MIN_AUC", 0.52)
+    if _min_auc is not None and _auc_cal == _auc_cal and _auc_cal < float(_min_auc):
+        log.warning("META NOT PROMOTED: calibrated AUC %.4f < META_MIN_AUC "
+                    "%.4f — the model does not order winners above losers "
+                    "(0.500 = chance). Any headline accuracy here is just the "
+                    "%.1f%% majority class. No artifact written; the brain "
+                    "stays heuristic-only.", _auc_cal, float(_min_auc),
+                    100.0 * (1.0 - float(Y[got].mean())))
+        return None
     _min_spread = getattr(config, "META_MIN_OOF_SPREAD", None)
     if _spread < 0.02:
         log.warning("META OUTPUT NEARLY CONSTANT: calibrated OOF p05-p95 "
