@@ -114,17 +114,37 @@ def effective_bar(base_bar: float, vix_bump: float,
 # --------------------------------------------------------------------------
 def meta_win_prob(meta: dict | None, frame: np.ndarray, iidx: int,
                   tod: float, er: float, f30: float, dirn: int,
-                  clamp: bool = True) -> float | None:
+                  clamp: bool = True,
+                  conv_by_index=None) -> float | None:
     """clamp=False returns the TRUE calibrated probability (no META_P_FLOOR
     lift) — for telemetry/diagnosis. Decisions keep clamp=True."""
     if not meta or int(meta.get("n", 0)) < config.META_MIN_TRAIN:
         return None
     b0 = iidx * config.NODES_PER_INDEX
+    # CROSS-INDEX PEER CONTEXT (config.META_CROSS_INDEX). Appended AFTER the
+    # existing 61 so an old artifact's feature order is untouched; the x_dim
+    # guard in meta_gbm refuses a model trained on the other width.
+    _peer = []
+    if bool(getattr(config, "META_CROSS_INDEX", False)):
+        from core.cross_index import peer_features, N_PEER_FEATURES
+        if conv_by_index is None:
+            _peer = [0.0] * N_PEER_FEATURES
+            if not globals().get("_PEER_WARNED"):
+                globals()["_PEER_WARNED"] = True
+                import logging as _lg
+                _lg.getLogger("decision").warning(
+                    "META_CROSS_INDEX is ON but no conviction vector was "
+                    "passed — serving zeros where the forge trained on real "
+                    "peer context. That is a train/serve SKEW; pass "
+                    "conv_by_index at every call site.")
+        else:
+            _peer = peer_features(conv_by_index, iidx,
+                                  "CE" if dirn > 0 else "PE")
     x = np.concatenate([frame[b0], frame[b0 + 1], frame[b0 + 2],
                         [tod, er,
                          math.copysign(min(abs(f30) * 100, 3), f30)
                          if f30 else 0.0,
-                         1.0 if dirn > 0 else -1.0]]).astype(np.float32)
+                         1.0 if dirn > 0 else -1.0], _peer]).astype(np.float32)
     if meta.get("engine") == "gbm":
         from core import meta_gbm as MG
         return MG.score_vec(meta, x, clamp=clamp)

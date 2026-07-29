@@ -711,11 +711,23 @@ def _gen_meta_samples(con, day: str):
         pnl = (exitp - e) * lot - round_trip_costs(e * lot, exitp * lot)
         b0 = s["iidx"] * config.NODES_PER_INDEX
         frame = s["frame"]
+        # CROSS-INDEX PEER CONTEXT — must match core/decision.meta_win_prob
+        # exactly. Both extract conviction through
+        # cross_index.convictions_from_actions and append the same 3 features
+        # in the same order, AFTER the original 61.
+        _peer = []
+        if bool(getattr(config, "META_CROSS_INDEX", False)):
+            from core.cross_index import (peer_features,
+                                          convictions_from_actions)
+            _cv = convictions_from_actions(pol.predict(frame),
+                                           len(config.INDEX_ORDER))
+            _peer = peer_features(_cv, s["iidx"], d)
         x = np.concatenate([frame[b0], frame[b0 + 1], frame[b0 + 2],
                             [t / N, s["er"],
                              _m.copysign(min(abs(s["f30"]) * 100, 3), s["f30"])
                              if s["f30"] else 0.0,
-                             1.0 if d == "CE" else -1.0]]).astype(np.float32)
+                             1.0 if d == "CE" else -1.0],
+                            _peer]).astype(np.float32)
         X.append(x)
         Y.append(1.0 if pnl > 0 else 0.0)
         RET.append(float(pnl))
@@ -1741,7 +1753,15 @@ def _decision_stamp() -> str:
              config.ENTRY_ATTEMPT_THROTTLE_S, config.MAX_ENTRY_SPREAD_PCT,
              config.META_DECISION_ENABLED, config.META_ENTRY_P_BAR,
              config.META_ENTRY_CONV_FLOOR, config.FORGE_EVAL_CAPITAL,
-             config.uncalibrated_winprob())
+             config.uncalibrated_winprob(),
+             # AUDIT (2026-07-28): META_CROSS_INDEX changes the WIDTH of every
+             # meta sample (61 -> 64). It is hash-excluded, so without this the
+             # cache would stay "valid" after flipping the flag and the forge
+             # would retrain on STALE 61-dim samples while serving builds 64 —
+             # the x_dim guard would then refuse every score and the brain would
+             # silently fall back to the conviction bar forever. Any knob that
+             # changes the feature WORLD must invalidate the sample cache.
+             bool(getattr(config, "META_CROSS_INDEX", False)))
     return _h.sha1(repr(knobs).encode()).hexdigest()[:8]
 
 
@@ -1843,7 +1863,14 @@ def _prepare_cache(days: list[str], report: DailyReport):
         return
     nw = int(config.FORGE_PARALLEL_WORKERS)
     if nw == 0:
-        nw = max(1, min(4, (os.cpu_count() or 2) // 2))
+        # single source of truth with the harnesses (core/parallel_days), so
+        # one knob governs every day-parallel path instead of two disagreeing
+        # caps (this was min(4, cpu//2) while the harnesses used min(6, ...)).
+        try:
+            from core.parallel_days import default_workers as _dw
+            nw = _dw()
+        except Exception:                                 # noqa: BLE001
+            nw = max(1, min(6, (os.cpu_count() or 2) // 2))
     built = {}
     if nw > 1 and len(todo) > 1:
         try:
@@ -1856,7 +1883,10 @@ def _prepare_cache(days: list[str], report: DailyReport):
                     log.info("  built %s in %.0fs (%s)", day, secs,
                              "ok" if ok else "empty")
         except Exception as e:                            # noqa: BLE001
-            log.warning("parallel build failed (%s) — serial fallback", e)
+            log.warning("PARALLEL BUILD FAILED (%s) — falling back to SERIAL. "
+                        "At ~684s/day this turns a %d-day rebuild into ~%.1f "
+                        "hours. Worth fixing rather than waiting.", e,
+                        len(todo), 684.0 * len(todo) / 3600.0)
             built = {}
     if not built:                                         # serial (or fallback)
         for day in todo:

@@ -955,6 +955,15 @@ def main():
             frame = builder.frames[-1]
             drift.observe(frame)
             actions = policy.conviction(obs, frame)
+            # CROSS-INDEX PEER CONTEXT: the per-index conviction vector the
+            # meta needs. Extracted through the SAME helper the forge uses, so
+            # training and serving cannot drift apart. Cheap (a slice), and
+            # computed once per frame rather than per index.
+            _conv_all = None
+            if bool(getattr(config, "META_CROSS_INDEX", False)):
+                from core.cross_index import convictions_from_actions
+                _conv_all = convictions_from_actions(
+                    actions, len(config.INDEX_ORDER))
         if frame is None:
             continue                       # no ring second pushed yet
 
@@ -1279,7 +1288,8 @@ def main():
                 # calibration blend, one copy shared with the forge grader.
                 wp_meta = D.meta_win_prob(load_meta(), frame, i,
                                           min(mins_open / 375.0, 1.0),
-                                          er, f30, 1 if conv > 0 else -1)
+                                          er, f30, 1 if conv > 0 else -1,
+                                          conv_by_index=_conv_all)
                 wp = D.blend_winprob(wp_meta, conv, cal)
                 if wp_meta is not None:
                     # AUDIT: this reservoir used to be fed only AFTER the gate
@@ -1290,7 +1300,8 @@ def main():
                     # discriminates or just sits on the floor.
                     _wp_true = D.meta_win_prob(
                         load_meta(), frame, i, min(mins_open / 375.0, 1.0),
-                        er, f30, 1 if conv > 0 else -1, clamp=False)
+                        er, f30, 1 if conv > 0 else -1, clamp=False,
+                        conv_by_index=_conv_all)
                     if _wp_true is not None:
                         wp_res[idx].add(_wp_true)
                 log.debug("%s spot %.1f | ai %+.2f shock %+.2f → conv %+.2f "
@@ -1302,7 +1313,8 @@ def main():
                 if config.META_DECISION_ENABLED and pm.pos is not None:
                     last_wp_hold[idx] = D.meta_win_prob(
                         load_meta(), frame, i, min(mins_open / 375.0, 1.0),
-                        er, f30, 1 if pm.pos.direction == "CE" else -1)
+                        er, f30, 1 if pm.pos.direction == "CE" else -1,
+                        conv_by_index=_conv_all)
                 else:
                     last_wp_hold[idx] = None
             else:

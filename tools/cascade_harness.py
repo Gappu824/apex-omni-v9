@@ -176,6 +176,31 @@ def _grade_event(ev, mapper, ti, bidA, askA, last_tick, snap, N):
     return base
 
 
+def _cascade_day_worker(args):
+    """One day, in its own process. Module-level and picklable by design.
+
+    SQLite handles cannot cross a process boundary, so each worker opens its
+    own read connection. primary_rows=None suppresses the in-worker EVENT log
+    (line 252 uses it only as a "should I log?" flag) — the parent re-emits
+    those lines in DAY ORDER afterwards, so the visible output is unchanged
+    while the work happens in parallel.
+    """
+    day, stamp, N = args
+    import sqlite3 as _sq
+    con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    try:
+        c, sk, _ = DC.run_cached(
+            "cascade", stamp, day,
+            lambda: (lambda t: (t[0], [t[1]], {}))(
+                _run_day(con, day, N, primary_rows=None)))
+        return (c, sk[0] if sk else 0)
+    finally:
+        try:
+            con.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
 def _run_day(con, day: str, N: int, primary_rows: list | None,
              det_side: str = "below", extra_ok=None):
     """One pass over one day: build spot/flip series, run the shared
@@ -431,12 +456,27 @@ def main():
     all_rows: list[dict] = []
     upside_total = 0
     _stamp = cascade_knob_hash()
-    for day in days:
-        _c, _s, _ = DC.run_cached(
-            "cascade", _stamp, day,
-            lambda d=day: (lambda t: (t[0], [t[1]], {}))(
-                _run_day(con, d, N, primary_rows=all_rows)))
-        rr, up = _c, _s[0]
+    # Days are INDEPENDENT: _run_day's primary_rows argument is only a
+    # "should I log?" flag (line ~252), never a data dependency. Run them
+    # across processes and re-emit the EVENT lines in day order below, so the
+    # aggregate and the visible log are byte-identical to the old loop.
+    from core.parallel_days import map_days
+    _res = map_days(_cascade_day_worker, [(d, _stamp, N) for d in days],
+                    desc="cascade day")
+    for _day, _out in zip(days, _res):
+        if _out is None:
+            log.warning("  %s: no result (worker failed) — day omitted", _day)
+            continue
+        rr, up = _out
+        for row in rr:
+            mark = (f"Rs {row['pnl']:+.2f} via {row.get('exit_how')}"
+                    if "pnl" in row else f"SKIP {row.get('skip')}")
+            log.info("EVENT %s %s %s %-4s %-11s z=%+.2f flip %.0f spot %.0f "
+                     "[%s %.0fs] -> %s", row.get("day", _day), row.get("hm"),
+                     row.get("index"), row.get("direction"), row.get("kind"),
+                     float(row.get("z") or 0.0), float(row.get("flip") or 0.0),
+                     float(row.get("spot") or 0.0), row.get("flip_source"),
+                     float(row.get("flip_age_s") or 0.0), mark)
         all_rows += rr
         upside_total += up
 

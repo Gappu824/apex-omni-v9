@@ -97,6 +97,33 @@ def _gex_at(nc: GammaNowcast, snap: dict | None, spot: float, ts: float):
     return snap.get("net_gex"), snap.get("flip"), snap.get("flip_width")
 
 
+def _shortvol_day_worker(args):
+    """One day, own process, own read-only SQLite handle.
+
+    Unlike cascade_harness this loop had NO sequential dependency to unpick —
+    _run_day(con, day, N, verbose) already returns (closes, skips, blockers)
+    exactly matching DC.run_cached's contract, so parallelising is a straight
+    swap.
+
+    verbose stays True: both log sites (CLOSE at ~168, OPEN at ~211) embed the
+    day in every line, and POSIX O_APPEND writes below PIPE_BUF are atomic, so
+    concurrent workers interleave lines without corrupting them. Ordering
+    across days is no longer chronological during a rebuild — but nothing is
+    lost, and cached days never re-log at all.
+    """
+    day, stamp, N = args
+    import sqlite3 as _sq
+    con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    try:
+        return DC.run_cached("shortvol", stamp, day,
+                             lambda: _run_day(con, day, N, verbose=True))
+    finally:
+        try:
+            con.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
 def _run_day(con, day: str, N: int, verbose: bool,
              extra_gate=None):
     """Returns (close_rows, skip_rows, gate_blockers dict)."""
@@ -350,12 +377,20 @@ def main():
              config.FORGE_EVAL_CAPITAL)
     bt, skips, blockers = [], [], {}
     _stamp = SV.sv_knob_hash()
-    for day in days:
-        c, s, b = DC.run_cached("shortvol", _stamp, day,
-                                lambda d=day: _run_day(con, d, N,
-                                                       verbose=True))
+    # Days are independent — _run_day takes only (con, day, N, verbose) and
+    # returns this day's rows. Aggregation below is order-insensitive (list
+    # concat + counter merge), and map_days returns results in DAY ORDER, so
+    # the aggregate is byte-identical to the sequential loop.
+    from core.parallel_days import map_days
+    _res = map_days(_shortvol_day_worker, [(d, _stamp, N) for d in days],
+                    desc="shortvol day")
+    for _day, _out in zip(days, _res):
+        if _out is None:
+            log.warning("  %s: no result (worker failed) — day omitted", _day)
+            continue
+        c, sk, b = _out
         bt += c
-        skips += s
+        skips += sk
         for k, v in b.items():
             blockers[k] = blockers.get(k, 0) + v
     for r in bt:

@@ -393,6 +393,24 @@ META_MIN_POSITIVES      = 30
 # model at AUC 0.4915 that the same run had labelled "NO RANKING SIGNAL", and
 # refusing only leaves that brain heuristic-only — strictly safer. Set None to
 # disable (report-only).
+# META_CROSS_INDEX: append the 3 cross-index peer-context features
+# (peer_agree, peer_max_agree, peer_dispersion — see core/cross_index.py) to
+# the meta x-vector, taking it from 61 to 64 dims. Measured motivation:
+# tools/cross_index_overlap reported co-fire 0.56, outcome agreement 0.85 vs
+# 0.62 by chance, rho 0.61 — real structure the models could not see.
+# DEFAULT OFF: turning it on changes the feature world, so the forge must
+# retrain before serving can use it. The x_dim guard in meta_gbm refuses any
+# model/vector width mismatch, so a half-migrated state cannot score silently.
+META_CROSS_INDEX        = False
+
+# PARALLEL_DAY_WORKERS: worker processes for independent per-day replays
+# (core/parallel_days.py). 0 = auto = min(6, cpu//2). Measured motivation:
+# the 2026-07-28 cascade_harness rebuild ran ~57 min/day and was 11 of 30 days
+# in after 10.5 hours, on one core, while 13 others sat idle. Each worker holds
+# a day of tick arrays so this is memory-bound before CPU-bound — raise it only
+# if RAM allows. NOT a GPU workload: the cost is a Python loop over 22,500
+# seconds plus SQLite reads, not matrix math.
+PARALLEL_DAY_WORKERS    = 0
 META_MIN_AUC            = 0.52
 META_MIN_OOF_SPREAD     = None
 CASCADE_MAX_FLIP_DIST_PCT = 0.05   # reject GEX flips this far from spot
@@ -406,7 +424,12 @@ SUPERVISOR_TABS         = True      # one Windows Terminal viewer tab per child
 # At ₹60k the Kelly walker fits NIFTY across most of the week and SENSEX
 # (lot 20) on cheaper strikes; both stay in. Trim to ["NIFTY"] if SENSEX
 # BLOCKED lines get noisy at lower capital.
-TRADABLE = ["NIFTY", "SENSEX"]
+TRADABLE = ["NIFTY", "BANKNIFTY", "SENSEX"]   # 2026-07-28: BANKNIFTY added by
+# operator. It was already harvested (787k leg-ticks/day, depth rate 1.0) and
+# already in INDEX_ORDER, so the frame needs no change — this only makes it
+# tradable. NOTE: TRADABLE is hash-INCLUDED, so CONFIG_HASH moves and the
+# forge cache/meta/certificates all rebuild against the new world. That is the
+# hash doing its job: what the system trades genuinely changed.
 
 # ----------------------------------------------------------------------------
 # MODEL GEOMETRY (v9: 17 → 19 features; adds dte_norm + is_weekly so the net
@@ -437,7 +460,12 @@ MAX_ORDER_REJECTS        = 3      # then halt the day (reject-storm kill switch)
 DATA_STALE_BLOCK_S       = 5.0    # no NEW entries if feed older than this
 DATA_STALE_FLATTEN_S     = 60.0   # emergency-flatten open positions beyond this
 MACRO_STALE_S            = 420.0  # GEX json older than this = advisory dead
-NO_ENTRY_AFTER           = "14:45"
+NO_ENTRY_AFTER = "15:05"   # 2026-07-28: was 14:45. Five of seven cascade
+# triggers on 07-27 fired at/after 14:45 and one was blocked outright — the
+# cascade's natural window is the late session. CAUTION: FORCE_FLATTEN_AT is
+# 15:15, so an entry at 15:05 has only 10 minutes before a FORCED exit, and
+# forced exits fill worse than chosen ones. Watch the EOD_FLATTEN share of
+# exits; if late entries mostly die on the flatten, this window is too tight.
 FORCE_FLATTEN_AT         = "15:15"   # safely before broker MIS auto square-off (~15:20)
 SESSION_OPEN             = "09:15"
 SESSION_CLOSE            = "15:30"
@@ -910,7 +938,13 @@ FORGE_PROMOTE_MARGIN_RS = 500.0  # ★ additive ₹ a candidate must clear ABOVE
 #                                max(heuristic, incumbent) on the untouched
 #                                promotion day. v9.0 read a name that was never
 #                                defined and silently ran with ₹0.
-FORGE_PARALLEL_WORKERS = 0     # per-day dataset builds in parallel processes;
+# AUDIT (2026-07-29): the auto default was min(4, cpu//2) — a cap chosen when
+# a rebuild was rare and small. On a 14-core box facing a full 30-day rebuild
+# (which the 2026-07-28 hash move forced) that leaves ~10 cores idle while each
+# day costs ~684s. Aligned with core/parallel_days.default_workers() so the
+# forge and the harnesses use ONE policy: min(6, cpu//2), memory-bound because
+# each worker holds a day of tick arrays. 0 = auto; raise only if RAM allows.
+FORGE_PARALLEL_WORKERS = 0
 #                                0 = auto (cpu_count//2, i7-13650HX ⇒ ~7),
 #                                1 = serial (debug).
 FORGE_EVAL_CAPITAL    = 100000.0  # ★ the REFERENCE account every forge label,
@@ -1312,6 +1346,7 @@ _HASH_EXCLUDE = frozenset({
     "COMMODITY_FLATTEN_BEFORE_CLOSE_MIN", "FEED_SILENT_WARN_S",
     "LOG_ASCII",
     "META_MIN_BSS", "META_MIN_POSITIVES", "META_MIN_OOF_SPREAD",
+    "META_CROSS_INDEX", "PARALLEL_DAY_WORKERS",
     "META_MIN_AUC",
     "FAST_LANE_DEFER_WHILE_RISING", "FAST_LANE_RUN_GRACE_S",
     "CASCADE_MAX_FLIP_DIST_PCT",

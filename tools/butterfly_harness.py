@@ -92,6 +92,27 @@ def _gex_at(nc: GammaNowcast, snap: dict | None, spot: float, ts: float):
     return None, None, 0.0
 
 
+def _butterfly_day_worker(args):
+    """One day, own process, own read-only SQLite handle.
+
+    Structurally identical to the shortvol worker: _run_day returns
+    (closes, skips, blockers) matching DC.run_cached's contract, with no
+    cross-day state. verbose stays True — every log line embeds its day and
+    short-line appends are atomic, so workers interleave without loss.
+    """
+    day, stamp, N = args
+    import sqlite3 as _sq
+    con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    try:
+        return DC.run_cached("butterfly", stamp, day,
+                             lambda: _run_day(con, day, N, verbose=True))
+    finally:
+        try:
+            con.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
 def _run_day(con, day: str, N: int, verbose: bool, extra_gate=None):
     """Returns (close_rows, skip_rows, gate_blockers dict) for the fly."""
     from simulation.replay_real_day import load_day
@@ -356,12 +377,18 @@ def main():
              config.FORGE_EVAL_CAPITAL)
     bt, skips, blockers = [], [], {}
     _stamp = BF.fly_knob_hash()
-    for day in days:
-        c, s, b = DC.run_cached("butterfly", _stamp, day,
-                                lambda d=day: _run_day(con, d, N,
-                                                       verbose=True))
+    # Independent days; aggregation is concat + counter-merge, both
+    # order-insensitive, and map_days returns in DAY ORDER.
+    from core.parallel_days import map_days
+    _res = map_days(_butterfly_day_worker, [(d, _stamp, N) for d in days],
+                    desc="butterfly day")
+    for _day, _out in zip(days, _res):
+        if _out is None:
+            log.warning("  %s: no result (worker failed) — day omitted", _day)
+            continue
+        c, sk, b = _out
         bt += c
-        skips += s
+        skips += sk
         for k, v in b.items():
             blockers[k] = blockers.get(k, 0) + v
     for r in bt:

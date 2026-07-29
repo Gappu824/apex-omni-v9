@@ -346,6 +346,12 @@ def fit_gbm(perday: list[tuple], min_train: int,
     except Exception:                                      # noqa: BLE001
         _bst_bytes = -1
     return {"engine": "gbm", "model_file": mpath.name,
+            # AUDIT (2026-07-28): the artifact never recorded how WIDE its
+            # x-vector was. Enabling cross-index peer features takes x from 61
+            # to 64, and a 61-dim booster fed a 64-dim vector does not fail
+            # loudly — LightGBM will happily score garbage. Record the width and
+            # refuse a mismatch at serving.
+            "x_dim": int(X.shape[1]),
             "model_bytes": _bst_bytes,
             "oof_spread_p05_p95": round(_spread, 5),
             "auc_raw": (None if _auc_raw != _auc_raw
@@ -413,7 +419,21 @@ def score_vec(meta: dict, x: np.ndarray,
         bst = lgb.Booster(model_file=str(mpath))
         _BOOSTERS.clear()          # only ever one live model; don't leak
         _BOOSTERS[key] = bst
-    p_raw = float(bst.predict(np.asarray(x, np.float32)[None, :])[0])
+    # AUDIT (2026-07-28): x_dim guard. My first attempt anchored on a line that
+    # does not exist here, so str.replace() silently did nothing and I shipped a
+    # guard that was never inserted — hence the assert above. Note the real
+    # failure mode is NOT silent scoring: LightGBM raises LightGBMError on a
+    # width mismatch. But an uncaught exception in the serving path would
+    # propagate into the live brain, so catch it here and return None.
+    _xa = np.asarray(x, np.float32)
+    _want = meta.get("x_dim")
+    if _want and int(_want) != int(_xa.size):
+        log.error("X-DIM MISMATCH: artifact expects %d features, got %d — the "
+                  "model was trained on a different feature set "
+                  "(META_CROSS_INDEX on/off?). Refusing to score; re-run the "
+                  "forge.", int(_want), int(_xa.size))
+        return None
+    p_raw = float(bst.predict(_xa[None, :])[0])
     p_cal = float(np.interp(p_raw, np.asarray(meta["iso_x"], float),
                             np.asarray(meta["iso_y"], float)))
     if getattr(config, "META_USE_PLO", False):
