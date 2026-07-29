@@ -92,6 +92,78 @@ def _kaufman_er(path: deque) -> float:
     return float(net / churn) if churn > 0 else 0.0
 
 
+def _commodity_stamp() -> str:
+    """Fingerprint of EVERYTHING that changes gen_samples' output.
+
+    A cache with a wrong stamp is worse than no cache: it serves stale results
+    silently. So this covers the config hash AND every knob gen_samples reads —
+    the conviction bar, the sampler cooldown, the session window (which sets
+    _C_T0/N), the commodity universe, the reference budget, and the barrier
+    geometry. If any of them moves, every cached day is invalidated.
+    """
+    import hashlib as _h
+    knobs = (config.CONFIG_HASH,
+             getattr(config, "COMMODITY_ENTRY_CONVICTION", 0.72),
+             getattr(config, "COMMODITY_FORGE_COOLDOWN_S", 180),
+             getattr(config, "COMMODITY_SESSION_OPEN", "09:00"),
+             tuple(sorted(getattr(config, "HARVEST_COMMODITIES", []))),
+             tuple(sorted((k, v.get("session_close"))
+                          for k, v in (getattr(config, "COMMODITIES", {})
+                                       or {}).items())),
+             config.FORGE_EVAL_CAPITAL,
+             config.BASE_TP_PCT, config.BASE_SL_PCT,
+             _C_T0, N)
+    return _h.md5(repr(knobs).encode()).hexdigest()[:10]
+
+
+def _cache_path(day: str):
+    d = config.DATA_DIR / "commodity_forge_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{day}.npz"
+
+
+def gen_samples_cached(con, day: str):
+    """gen_samples with an npz day-cache, mirroring the equity forge's
+    _gen_meta_samples_cached. Until now this tool replayed EVERY day on EVERY
+    run — the full commodity window is 09:00-23:55 (N=53,700s), more than twice
+    the equity session, across ~29 days, nightly, with nothing memoised."""
+    p = _cache_path(day)
+    stamp = _commodity_stamp()
+    if p.exists():
+        try:
+            z = np.load(p, allow_pickle=False)
+            if str(z["stamp"]) == stamp:
+                return list(z["X"]), list(z["Y"]), list(z["W"])
+        except Exception:                                  # noqa: BLE001
+            pass                                           # corrupt -> rebuild
+    X, Y, W = gen_samples(con, day)
+    try:
+        np.savez(p, stamp=np.str_(stamp),
+                 X=np.asarray(X, np.float32).reshape(len(X), -1)
+                 if X else np.zeros((0, 0), np.float32),
+                 Y=np.asarray(Y, np.float32),
+                 W=np.asarray(W, np.float32))
+    except Exception as e:                                 # noqa: BLE001
+        log.debug("commodity sample cache write failed (%s)", e)
+    return X, Y, W
+
+
+def _commodity_day_worker(day: str):
+    """One day, own process, own read-only handle (see the harnesses)."""
+    import sqlite3 as _sq
+    con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    try:
+        return gen_samples_cached(con, day)
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("  %s: sample gen failed (%s) — skipped", day, e)
+        return [], [], []
+    finally:
+        try:
+            con.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
 def gen_samples(con, day: str):
     """One day, ALL harvested commodities, brain-identical signal generation.
     Returns perday-entry (X, Y, W) exactly as meta_gbm.fit_gbm expects."""
@@ -243,12 +315,13 @@ def main():
         days = days[-args.days:]
     min_train = int(getattr(config, "COMMODITY_META_MIN_TRAIN", 300))
     perday, n = [], 0
-    for day in days:
-        try:
-            x, y, w = gen_samples(con, day)
-        except Exception as e:                                 # noqa: BLE001
-            log.warning("  %s: sample gen failed (%s) — skipped", day, e)
-            x, y, w = [], [], []
+    # Days are independent; each now memoised (npz, stamp-keyed) and replayed
+    # across processes. Aggregation is an ordered append, and map_days returns
+    # in DAY ORDER, so perday is byte-identical to the sequential build.
+    from core.parallel_days import map_days
+    _res = map_days(_commodity_day_worker, list(days), desc="commodity day")
+    for day, out in zip(days, _res):
+        x, y, w = out if out is not None else ([], [], [])
         perday.append((day, x, y, w))
         n += len(x)
         if x:

@@ -36,7 +36,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import config                                             # noqa: E402
+import config
+from core import day_cache as DC                                             # noqa: E402
 from core import shortvol as SV                            # noqa: E402
 from core import fly_intel as FI                           # noqa: E402
 from core.gamma_nowcast import GammaNowcast                # noqa: E402
@@ -75,6 +76,57 @@ def _fwd_spot_ret(spots, t0, hold):
     if np.isnan(a) or np.isnan(b) or a <= 0:
         return None
     return (b - a) / a
+
+
+def _fly_stamp(hold_s: int) -> str:
+    """Everything that changes _run_day's rows. A cache keyed on too little is
+    worse than no cache — it serves stale numbers silently. `hold_s` is a CLI
+    argument, not config, so it must be in the key too: two runs at different
+    --hold produce different rows for the same day."""
+    import hashlib as _h
+    knobs = (config.CONFIG_HASH, int(hold_s),
+             tuple(config.TRADABLE), config.SESSION_OPEN,
+             getattr(config, "RIDE_ER_WINDOW_S", None),
+             getattr(config, "FLY_INTEL_MIN_SECONDS", None))
+    return _h.md5(repr(knobs).encode()).hexdigest()[:10]
+
+
+def _jsonable(rows):
+    """day_cache stores JSON, and these rows carry numpy scalars — coerce so a
+    cache write cannot fail (or worse, half-write) on a numpy type."""
+    out = []
+    for r in rows:
+        d = {}
+        for k, v in r.items():
+            try:
+                d[k] = (v if isinstance(v, (str, bool, type(None)))
+                        else float(v))
+            except (TypeError, ValueError):
+                d[k] = str(v)
+        out.append(d)
+    return out
+
+
+def _fly_day_worker(args):
+    """One day, own process, own read-only handle (same shape as the
+    harnesses). This tool previously replayed every day on every run with no
+    cache at all."""
+    day, stamp, N, hold_s = args
+    import sqlite3 as _sq
+    con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    try:
+        rows, _, _ = DC.run_cached(
+            "fly_intel", stamp, day,
+            lambda: (_jsonable(_run_day(con, day, N, hold_s)), [], {}))
+        return rows
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("  %s: fly-intel day failed (%s) — skipped", day, e)
+        return []
+    finally:
+        try:
+            con.close()
+        except Exception:                                  # noqa: BLE001
+            pass
 
 
 def _run_day(con, day, N, hold_s):
@@ -149,8 +201,20 @@ def main():
              len(days), days[0] if days else "-", days[-1] if days else "-",
              args.hold)
     allrows = []
-    for day in days:
-        allrows += _run_day(con, day, N, args.hold)
+    # Independent days: _run_day takes (con, day, N, hold) and returns this
+    # day's rows only. Now cached per day AND replayed across processes;
+    # map_days returns in DAY ORDER so allrows is byte-identical to the
+    # sequential build.
+    from core.parallel_days import map_days
+    _stamp = _fly_stamp(args.hold)
+    _res = map_days(_fly_day_worker,
+                    [(d, _stamp, N, args.hold) for d in days],
+                    desc="fly-intel day")
+    for _day, _rows in zip(days, _res):
+        if _rows is None:
+            log.warning("  %s: no result (worker failed) — day omitted", _day)
+            continue
+        allrows += _rows
 
     if not allrows:
         log.warning("no granted-regime seconds in the vault window — nothing "
