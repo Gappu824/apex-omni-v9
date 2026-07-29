@@ -949,6 +949,11 @@ def main():
                 log.debug("VIX spike %.1f→%.1f — entry bar +%.2f",
                           base, now_v, vix_bump)
 
+        # AUDIT (2026-07-29): _conv_all was assigned INSIDE this block but
+        # read at the meta_win_prob sites below, which run on ticks where
+        # decide_now is False -> unbound NameError. Bind merge-point names
+        # BEFORE the split (same rule as the forge's wf_funnel fix).
+        _conv_all = None
         if decide_now:
             last_decision_sec = int(ts)
             obs = builder.push(market, ts)
@@ -959,7 +964,6 @@ def main():
             # meta needs. Extracted through the SAME helper the forge uses, so
             # training and serving cannot drift apart. Cheap (a slice), and
             # computed once per frame rather than per index.
-            _conv_all = None
             if bool(getattr(config, "META_CROSS_INDEX", False)):
                 from core.cross_index import convictions_from_actions
                 _conv_all = convictions_from_actions(

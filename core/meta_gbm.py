@@ -378,6 +378,7 @@ def fit_gbm(perday: list[tuple], min_train: int,
 
 
 _BOOSTERS: dict = {}
+_XDIM_WARNED: dict = {}   # (expected, got) -> last-logged ts (throttle)
 
 
 def score_vec(meta: dict, x: np.ndarray,
@@ -426,14 +427,45 @@ def score_vec(meta: dict, x: np.ndarray,
     # width mismatch. But an uncaught exception in the serving path would
     # propagate into the live brain, so catch it here and return None.
     _xa = np.asarray(x, np.float32)
-    _want = meta.get("x_dim")
+    # AUDIT (2026-07-29 LIVE CRASH): this checked meta["x_dim"] only, so it was
+    # a NO-OP for any artifact trained BEFORE that field existed — which is
+    # exactly the model in production during a migration. The brain died on
+    # LightGBMError instead of degrading. Ask the BOOSTER how wide it is: it is
+    # authoritative, present for every artifact old or new, and cannot drift
+    # from the model it describes.
+    try:
+        _bwidth = int(bst.num_feature())
+    except Exception:                                      # noqa: BLE001
+        _bwidth = 0
+    _want = int(meta.get("x_dim") or 0) or _bwidth
     if _want and int(_want) != int(_xa.size):
-        log.error("X-DIM MISMATCH: artifact expects %d features, got %d — the "
-                  "model was trained on a different feature set "
-                  "(META_CROSS_INDEX on/off?). Refusing to score; re-run the "
-                  "forge.", int(_want), int(_xa.size))
+        # THROTTLED. This fires on EVERY evaluation — several per second, per
+        # index — so an un-throttled ERROR buried the 2026-07-29 session log in
+        # thousands of identical lines and drowned the brain's real output. The
+        # condition is static until the forge re-runs, so say it once per
+        # (expected, got) pair, then repeat only every X-DIM REMIND_S so it can
+        # never be silently forgotten either.
+        _k = (int(_want), int(_xa.size))
+        _now = time.time()
+        _last = _XDIM_WARNED.get(_k, 0.0)
+        if _now - _last > float(getattr(config, "XDIM_REMIND_S", 900)):
+            _XDIM_WARNED[_k] = _now
+            log.error("X-DIM MISMATCH: artifact expects %d features, got %d — "
+                      "the model was trained on a different feature set "
+                      "(META_CROSS_INDEX on/off?). Refusing to score; the gate "
+                      "falls back to the conviction bar until the forge "
+                      "re-runs. (Repeating at most every %.0f min.)",
+                      int(_want), int(_xa.size),
+                      float(getattr(config, "XDIM_REMIND_S", 900)) / 60.0)
         return None
-    p_raw = float(bst.predict(_xa[None, :])[0])
+    try:
+        p_raw = float(bst.predict(_xa[None, :])[0])
+    except Exception as e:                                 # noqa: BLE001
+        # Belt to the guard's braces. Nothing in the serving path may take the
+        # brain down; a scoring failure degrades to "no meta opinion".
+        log.error("meta scoring failed (%s) — returning None so the gate "
+                  "falls back to the conviction bar", e)
+        return None
     p_cal = float(np.interp(p_raw, np.asarray(meta["iso_x"], float),
                             np.asarray(meta["iso_y"], float)))
     if getattr(config, "META_USE_PLO", False):

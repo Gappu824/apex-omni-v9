@@ -73,7 +73,7 @@ _REPORT_EVERY_S = 60.0  # diagnostics JSON refresh cadence
 class HarvestDiag:
     """Pure counters — zero I/O on the tick path; serialized by the report."""
 
-    def __init__(self):
+    def __init__(self, seed: dict | None = None):
         # equity indices + harvested commodities — both get coverage counters
         _names = list(config.INDEX_ORDER) + \
             list(getattr(config, "HARVEST_COMMODITIES", []))
@@ -81,6 +81,33 @@ class HarvestDiag:
             i: {"spot_ticks": 0, "leg_ticks": 0, "leg_oi_nonzero": 0,
                 "leg_depth_2sided": 0, "gap_count": 0, "max_gap_s": 0.0}
             for i in _names}
+        # AUDIT (2026-07-27): these counters RESET on every restart while
+        # DailyReport(resume=True) resumed only the envelope. On 2026-07-24 the
+        # harvester restarted at 19:32 IST — four hours after the equity close —
+        # so the day's report showed every equity index with leg_ticks = 26
+        # (exactly the subscribed-leg count: the initial snapshot callbacks) and
+        # SENSEX leg_depth_2sided = 0. That number was read as "BFO never
+        # delivers depth" and chased for days; tools/feed_probe then measured
+        # BFO at 100% two-sided, and 2026-07-27 recorded 630,101 SENSEX leg
+        # ticks at 99.9% depth. It was an artifact of measuring a closed market.
+        # Seeding from the prior same-day report makes coverage a TRUE daily
+        # total again.
+        if seed:
+            for name, prev in (seed or {}).items():
+                cur = self.per_idx.get(name)
+                if not cur or not isinstance(prev, dict):
+                    continue
+                for k in ("spot_ticks", "leg_ticks", "leg_oi_nonzero",
+                          "leg_depth_2sided", "gap_count"):
+                    try:
+                        cur[k] += int(prev.get(k) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    cur["max_gap_s"] = max(float(cur["max_gap_s"]),
+                                           float(prev.get("max_gap_s") or 0.0))
+                except (TypeError, ValueError):
+                    pass
         self.vix_ticks = 0
         self.ws_connects = 0
         self.ws_closes = 0
@@ -202,8 +229,14 @@ class Harvester:
         self.kite.set_access_token(config.KITE_ACCESS_TOKEN)
         self.mapper = LiveMapper(self.kite)
         self.mapper.write_snapshot()                      # time-machine entry ★
-        self.diag = HarvestDiag()
-        self.report = DailyReport("harvester", resume=True)   # v9.6.1: restart-safe forensics (parity with brain)
+        # v9.6.1: restart-safe forensics (parity with brain). The report MUST
+        # be constructed BEFORE the diag — it carries the prior segment's
+        # coverage, which seeds the counters (see HarvestDiag.__init__).
+        self.report = DailyReport("harvester", resume=True)
+        _seed = ((self.report.d.get("coverage") or {}).get("per_index")
+                 if isinstance(getattr(self.report, "d", None), dict)
+                 else None)
+        self.diag = HarvestDiag(seed=_seed)
         self.vault = VaultKeeper(self.diag)
         self.ring = BinaryRingBuffer(writer=True)
         self.q: queue.Queue = queue.Queue()

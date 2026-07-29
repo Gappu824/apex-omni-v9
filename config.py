@@ -401,7 +401,7 @@ META_MIN_POSITIVES      = 30
 # DEFAULT OFF: turning it on changes the feature world, so the forge must
 # retrain before serving can use it. The x_dim guard in meta_gbm refuses any
 # model/vector width mismatch, so a half-migrated state cannot score silently.
-META_CROSS_INDEX        = False
+META_CROSS_INDEX        = True
 
 # PARALLEL_DAY_WORKERS: worker processes for independent per-day replays
 # (core/parallel_days.py). 0 = auto = min(6, cpu//2). Measured motivation:
@@ -411,6 +411,10 @@ META_CROSS_INDEX        = False
 # if RAM allows. NOT a GPU workload: the cost is a Python loop over 22,500
 # seconds plus SQLite reads, not matrix math.
 PARALLEL_DAY_WORKERS    = 0
+# XDIM_REMIND_S: how often to repeat the x-dim mismatch error. It fires on
+# every evaluation (several/second/index), so on 2026-07-29 an un-throttled
+# ERROR buried the session log. Static condition -> say it once, then remind.
+XDIM_REMIND_S           = 900
 META_MIN_AUC            = 0.52
 META_MIN_OOF_SPREAD     = None
 CASCADE_MAX_FLIP_DIST_PCT = 0.05   # reject GEX flips this far from spot
@@ -1346,6 +1350,7 @@ _HASH_EXCLUDE = frozenset({
     "COMMODITY_FLATTEN_BEFORE_CLOSE_MIN", "FEED_SILENT_WARN_S",
     "LOG_ASCII",
     "META_MIN_BSS", "META_MIN_POSITIVES", "META_MIN_OOF_SPREAD",
+    "XDIM_REMIND_S",
     "META_CROSS_INDEX", "PARALLEL_DAY_WORKERS",
     "META_MIN_AUC",
     "FAST_LANE_DEFER_WHILE_RISING", "FAST_LANE_RUN_GRACE_S",
