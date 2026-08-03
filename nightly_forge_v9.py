@@ -73,6 +73,7 @@ v9.1.1 (first-live-day fixes, 2026-07-04):
 """
 from __future__ import annotations
 import datetime as dt
+import ast
 import json
 import logging
 import math
@@ -312,50 +313,39 @@ def _session_minutes_left(ts):
     return np.maximum((close_sod - ist_sod) / 60.0, 1.0)
 
 
+_HOLD_OVERRIDE_S: int | None = None      # set ONLY by tools/horizon_sweep
+
+
+def set_hold_override(seconds: int | None) -> None:
+    """v9.9.4: relabel the vault at a DIFFERENT hold horizon without
+    touching config.MAX_HOLD_MINUTES (which is a live exit rule and a
+    hash-bearing constant). The sweep sets this, generates samples,
+    clears it. Sample caches key on it, so an override can never
+    contaminate the production cache — see _meta_cache_path."""
+    global _HOLD_OVERRIDE_S
+    _HOLD_OVERRIDE_S = int(seconds) if seconds else None
+
+
 def _hold_seconds(dte: float) -> int:
     """0-DTE-aware theta guillotine: the label horizon the live PositionManager
     actually enforces. v9.0 always used MAX_HOLD_MINUTES (45), grading expiry-day
     entries on a hold the live 25-minute guillotine never permits."""
+    if _HOLD_OVERRIDE_S:
+        # expiry-day guillotine is a separate physical constraint and is
+        # never swept: 0-DTE gamma does not care what the research asks.
+        if float(dte or 9.0) < config.EXPIRY_DTE_LT:
+            return int(config.MAX_HOLD_MINUTES_0DTE * 60)
+        return int(_HOLD_OVERRIDE_S)
     m = (config.MAX_HOLD_MINUTES_0DTE
          if float(dte or 9.0) < config.EXPIRY_DTE_LT
          else config.MAX_HOLD_MINUTES)
     return int(m * 60)
 
 
-def _shaped_barriers(e, spot, K, T, mins, is_call, call_wall=None, put_wall=None):
-    """The live PositionManager.try_enter exit target, reproduced for the reward.
-
-        em        = spot · atm_iv · √(minutes_to_close / (252·375))   # 1σ move
-        spot_room = min(em, runway)                                   # GEX cap
-        prem_room = delta_at_entry · spot_room                        # → premium
-        target    = entry + max(prem_room, entry · BASE_TP_PCT)       # floored
-        stop      = entry · (1 − BASE_SL_PCT)                         # NOT widened
-
-    atm_iv is the REAL implied vol Newton-inverted from the leg's OWN entry
-    price `e`; delta is Black-76 on that same iv, `abs(delta) or 0.4` exactly as
-    live. v9.1: `e` is the ASK (the price live actually pays on a momentum
-    cross), so the barriers arm around the true fill. `runway` is the distance
-    to the blocking GEX wall when one sits inside the move; otherwise the full
-    `em` — exactly live's no-wall behaviour. Vectorized or scalar."""
-    r = config.RISK_FREE_RATE
-    e = np.asarray(e, float); spot = np.asarray(spot, float)
-    K = np.asarray(K, float); T = np.maximum(np.asarray(T, float), 1e-6)
-    F = spot * np.exp(r * T)
-    iv = implied_vol_newton(e, F, K, T, is_call, r)
-    delta = np.abs(np.asarray(black76_greeks(F, K, T, iv, is_call, r)["delta"], float))
-    delta = np.where(delta > 1e-9, delta, 0.4)             # live: abs(q.delta) or 0.4
-    em = spot * iv * np.sqrt(np.maximum(mins, 1.0) / (252.0 * 375.0))
-    spot_room = em
-    if is_call and call_wall is not None and call_wall > 0:
-        runway = call_wall - spot                          # wall above ⇒ caps a call
-        spot_room = np.where(runway > 0, np.minimum(em, runway), em)
-    elif (not is_call) and put_wall is not None and put_wall > 0:
-        runway = spot - put_wall                            # wall below ⇒ caps a put
-        spot_room = np.where(runway > 0, np.minimum(em, runway), em)
-    prem_room = delta * spot_room
-    tp = e + np.maximum(prem_room, e * config.BASE_TP_PCT)
-    sl = e * (1.0 - config.BASE_SL_PCT)
-    return tp, sl
+# v9.9: the shaped-barrier physics moved to core/meta_gate.py — ONE copy
+# now feeds the label generator (here), the live gate's per-trade breakeven
+# and the grader below. The alias keeps every existing call site intact.
+from core.meta_gate import shaped_barriers as _shaped_barriers
 
 
 def build_dataset(con, day: str):
@@ -484,7 +474,7 @@ class _Replayer:
         # (its intraday state files are live-only) ⇒ no VOL_CRUSH label;
         # ann_vol for the governor's vol-target scaling = archive ATM IV.
 
-    def run(self, decide, on_block=None):
+    def run(self, decide, on_block=None, actions_fn=None):
         """decide(obs, frame, iidx) -> raw policy conviction (pre-shock).
         v9.4: on_block(idx, gate, detail, ctx) — the counterfactual hook —
         fires where the replayer itself kills a signal (meta-veto near-miss,
@@ -500,6 +490,23 @@ class _Replayer:
                 self.last_tick[tok] = t
             hm = _eval_hm(t)
             yield ("sec", t, ts)
+            # v9.9.1 CROSS-INDEX PARITY: live builds _conv_all from ONE
+            # policy action vector per frame; the sample generator does the
+            # same (fresh deterministic predict). The grader used to serve
+            # peer ZEROS here — scoring the model off the manifold it was
+            # trained on (the exact skew decision._meta_x warns about).
+            # Now: one full-vector predict per tick, same extraction
+            # function, zero intra-tick staleness. Skipped when no meta is
+            # loaded (nothing scores) or the flag is off.
+            _cv_all = None
+            if (actions_fn is not None and self.meta is not None
+                    and bool(getattr(config, "META_CROSS_INDEX", False))):
+                try:
+                    from core.cross_index import convictions_from_actions
+                    _cv_all = convictions_from_actions(
+                        actions_fn(obs, frame), len(config.INDEX_ORDER))
+                except Exception as _e:                    # noqa: BLE001
+                    _cv_all = None
             for idx in config.TRADABLE:
                 ctx = market.get(idx)
                 spot = float(((ctx or {}).get("spot") or {}).get("ltp") or 0)
@@ -551,11 +558,46 @@ class _Replayer:
                 self.persist[idx].push(float(ts), conv)
                 wp_meta = D.meta_win_prob(self.meta, frame, iidx,
                                           min(t / N, 1.0), er, f30,
-                                          1 if conv > 0 else -1)
+                                          1 if conv > 0 else -1,
+                                          conv_by_index=_cv_all)
                 wp = D.blend_winprob(wp_meta, conv, self.cal)
                 eff_bar = D.effective_bar(self.entry_bar, 0.0,
                                           (mac or {}).get("iv_rank"))
-                gate = D.entry_gate(conv, wp, wp_meta, eff_bar)
+                # ---- v9.9: grade with the SAME v3 gate the brain runs.
+                # Interval from the same artifact; p* from the same shaped
+                # barriers on the ATM ask at t. ACI margin is 0 here — the
+                # margin is a LIVE-serving adaptation; the exam measures
+                # the model+EV core. Missing pieces ⇒ legacy bytes.
+                _ivl = _econ = None
+                if getattr(config, "META_GATE_MODE", "bar") == "ev":
+                    _ivl = D.meta_win_interval(self.meta, frame, iidx,
+                                               min(t / N, 1.0), er, f30,
+                                               1 if conv > 0 else -1,
+                                               conv_by_index=_cv_all)
+                    if _ivl is not None:
+                        try:
+                            from core.meta_gate import candidate_economics
+                            _d_g = "CE" if conv > 0 else "PE"
+                            for _r in self.mapper.hierarchy(idx, spot, _d_g):
+                                _k = self.ti.get(_r["token"])
+                                if (_k is None or t - self.last_tick.get(
+                                        _r["token"], -99) > 5):
+                                    continue
+                                _a_g = self.askA[_k, t]
+                                if np.isnan(_a_g) or _a_g <= 0:
+                                    continue
+                                _econ = candidate_economics(
+                                    float(_a_g), spot, float(_r["strike"]),
+                                    float(ctx.get("T") or 0.0),
+                                    max((N - t) / 60.0, 1.0),
+                                    _d_g == "CE", int(_r["lot"]),
+                                    (mac or {}).get("call_wall"),
+                                    (mac or {}).get("put_wall"))
+                                break
+                        except Exception:                  # noqa: BLE001
+                            _econ = None
+                gate = D.entry_gate_v3(conv, wp, wp_meta, eff_bar, _ivl,
+                                       _econ[0] if _econ else None)
                 if not gate.ok:
                     if self.funnel:
                         self.funnel.record(idx, "below_bar", gate.reason)
@@ -650,12 +692,15 @@ def _gen_meta_samples(con, day: str):
     Affordability uses the static Kelly budget on the ASK we would pay (the
     label-time sizer, as before; the GRADER uses the dynamic governor)."""
     RET = []   # v10: barrier P&L per sample
+    ECON = []  # v9.9: (entry_ask, tp, sl, lot) per sample — the payoff
+    #            geometry the label was graded on; meta_gate_replay prices
+    #            each sample's OWN breakeven p* from exactly this.
     from simulation.scenario_engine import N
     import math as _m
     R: list = []
     rep = _Replayer(con, day, meta=None, cal={}, funnel=None, collect_ref=R)
     if not rep.ok:
-        return [], [], [], [], []
+        return [], [], [], [], [], []
     pol = HeuristicPolicy()
 
     def decide(obs, frame, iidx):
@@ -665,7 +710,8 @@ def _gen_meta_samples(con, day: str):
     # edge, never live account size. TRADING_CAPITAL is a live-only knob now.
     budget = _kelly_budget(config.FORGE_EVAL_CAPITAL)
     X, Y, spans = [], [], []                    # spans: (idx, t_in, t_out)
-    for ev in rep.run(decide):
+    for ev in rep.run(decide,
+                      actions_fn=lambda _o, _f: pol.predict(_f)):
         if ev[0] != "signal":
             continue
         s = ev[1]
@@ -731,6 +777,7 @@ def _gen_meta_samples(con, day: str):
         X.append(x)
         Y.append(1.0 if pnl > 0 else 0.0)
         RET.append(float(pnl))
+        ECON.append((float(e), float(tp), float(sl), int(lot)))
         spans.append((idx, t, t + off + 1))
     # ---- AFML uniqueness: w_i = mean over the label span of 1/concurrency ----
     W = np.ones(len(X), np.float32)
@@ -747,7 +794,7 @@ def _gen_meta_samples(con, day: str):
             seg = c[a:min(b, N)]
             if seg.size:
                 W[j] = float(np.mean(1.0 / np.maximum(seg, 1)))
-    return X, Y, list(W), R, RET
+    return X, Y, list(W), R, RET, ECON
 
 
 def train_meta(con, days: list[str]):
@@ -759,8 +806,19 @@ def train_meta(con, days: list[str]):
     perday = []
     dee_rows = []
     R_all: list = []
+    # v9.9.2: fill stale sample caches IN PARALLEL first (atomic writes,
+    # own sqlite per worker), then the serial loop below is pure cache
+    # reads. Same bytes, same order, fraction of the wall time.
+    try:
+        from core.parallel_days import map_days as _mapd
+        _stale = [d for d in days if not _meta_cache_fresh(d)]
+        if len(_stale) > 1:
+            _mapd(_prime_meta_samples_worker, _stale,
+                  desc="meta sample prime")
+    except Exception as _e:                                # noqa: BLE001
+        log.warning("sample prime skipped (%s) — serial path continues", _e)
     for day in days:
-        x, y, w, r, ret = _gen_meta_samples_cached(con, day)
+        x, y, w, r, ret, _ec = _gen_meta_samples_cached(con, day)
         perday.append((day, x, y, w))
         dee_rows += [(day, xi, ri, wi) for xi, ri, wi in zip(x, ret, w)]
         R_all += r
@@ -843,6 +901,20 @@ def train_meta(con, days: list[str]):
             except Exception as e_:                       # noqa: BLE001
                 log.warning("dist-edge skipped: %s", e_)
             return out, diag
+        if _have_lgb:
+            # v9.9.3: lightgbm is INSTALLED and fit_gbm still returned None —
+            # the guard refused (AUC/positives/CV): THESE SAMPLES CARRY NO
+            # SIGNAL. On 2026-08-01 this fell through and trained the pre-v2
+            # logistic on the very samples the guard had just rejected,
+            # wrote it stamped with the CURRENT hash, and the promotion-day
+            # grader served its floored 0.50 for 18k index-seconds — the
+            # exact disease Meta-Forge v2 was built to end. A refusal now
+            # means NO artifact of ANY engine: conviction bar governs, the
+            # v3 gate stays dormant until real ordering ability exists.
+            log.warning("META refusal honored: lightgbm present, guard said "
+                        "no signal — logistic fallback SKIPPED, no artifact "
+                        "written, conviction bar governs.")
+            return None, diag
         if not _have_lgb:
             log.warning("META-FORGE: engine=gbm requested but lightgbm is NOT "
                         "importable — using logistic. Fix: pip install "
@@ -1070,7 +1142,7 @@ def _shadow_trade(rep, s, t):
 
 
 def _grade_day(con, day: str, decide, meta, cal, funnel=None,
-               attribution=None, on_entry=None):
+               attribution=None, on_entry=None, actions_fn=None):
     """After-cost ₹ a policy would have ACTUALLY realized on `day`, sized
     EXACTLY like live: ONE RiskGovernor across ALL tradable indices (the live
     MAX_CONCURRENT_POSITIONS=1 world — v9.0's per-index governors let phantom
@@ -1155,7 +1227,7 @@ def _grade_day(con, day: str, decide, meta, cal, funnel=None,
 
     _hook = (lambda i_, g_, d_, c_: _cf(g_, {"idx": i_, **c_}, c_["t"])) \
         if attribution is not None else None
-    for ev in rep.run(decide, on_block=_hook):
+    for ev in rep.run(decide, on_block=_hook, actions_fn=actions_fn):
         if ev[0] == "sec":
             t = ev[1]
             if open_pos is not None and t >= open_pos[0]:
@@ -1282,8 +1354,13 @@ def evaluate(model, vec, con, day, meta, cal, funnel=None, attribution=None):
         o = vec.normalize_obs(obs[None]) if vec else obs[None]
         a, _ = model.predict(o, deterministic=True)
         return float(a[0][2 * iidx])
+
+    def _acts(obs, frame):        # v9.9.1: same transform, full vector
+        o = vec.normalize_obs(obs[None]) if vec else obs[None]
+        a, _ = model.predict(o, deterministic=True)
+        return a[0]
     return _grade_day(con, day, decide, meta, cal, funnel,
-                      attribution=attribution)
+                      attribution=attribution, actions_fn=_acts)
 
 
 def evaluate_heuristic(con, day, meta, cal, funnel=None,
@@ -1295,7 +1372,8 @@ def evaluate_heuristic(con, day, meta, cal, funnel=None,
     def decide(obs, frame, iidx):
         return float(pol.predict(frame)[2 * iidx])
     return _grade_day(con, day, decide, meta, cal, funnel,
-                      attribution=attribution, on_entry=on_entry)
+                      attribution=attribution, on_entry=on_entry,
+                      actions_fn=lambda _o, _f: pol.predict(_f))
 
 
 def train_trap_model(ledger_path=None):
@@ -1765,8 +1843,69 @@ def _decision_stamp() -> str:
     return _h.sha1(repr(knobs).encode()).hexdigest()[:8]
 
 
+def _replace_retry(src, dst, tries: int = 4) -> None:
+    """os.replace with brief retries: Windows denies replacement while ANY
+    process (an AV scan, a straggling reader) holds the destination open.
+    The handle leak is fixed at the source (v9.9.3); this absorbs external
+    transients only."""
+    for k in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError:
+            if k == tries - 1:
+                raise
+            time.sleep(0.25 * (k + 1))
+
+
+def _build_path_config_names() -> list[str]:
+    """v9.9.2: the set of config.* names the DAY-CACHE BUILD PATH actually
+    reads, extracted by AST from the functions in that closure. The cache
+    fingerprint hashes exactly these values — nothing else. Consequences,
+    both by construction: (a) tuning any decision knob the build never
+    touches (gate bars, Kelly, meta/probe/cascade/toxicity knobs, DYN
+    rails …) can NEVER again invalidate 31 days of raw replay — the
+    2026-07-29 evening spent ~12 h rebuilding tick arrays because a HOLD
+    knob rotated the global CONFIG_HASH; (b) any constant the build DOES
+    read stays load-bearing: change MAX_HOLD (baked into the prem table's
+    grading windows) and the stamp rotates, correctly. Adding a new
+    config reference to the build path changes the name set itself ⇒ one
+    rebuild ⇒ still fail-closed."""
+    import inspect
+    from core import meta_gate as _MGT
+    fns = [build_dataset, replay_day, _hold_seconds, _session_minutes_left,
+           _MGT.shaped_barriers]
+    names: set[str] = set()
+    for fn in fns:
+        try:
+            tree = ast.parse(inspect.getsource(fn))
+        except (OSError, TypeError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "config"):
+                names.add(node.attr)
+            if (isinstance(node, ast.Call) and len(node.args) >= 2
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "getattr"
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == "config"
+                    and isinstance(node.args[1], ast.Constant)):
+                names.add(str(node.args[1].value))
+    return sorted(names)
+
+
 def _data_stamp() -> str:
-    return f"{config.CONFIG_HASH}:v{_CACHE_VER}"
+    import hashlib
+    parts = []
+    for n in _build_path_config_names():
+        v = getattr(config, n, None)
+        if callable(v):
+            continue
+        parts.append(f"{n}={v!r}")
+    fp = hashlib.sha1("|".join(parts).encode()).hexdigest()[:10]
+    return f"{fp}:v{_CACHE_VER}"
 
 
 def _cache_paths(day: str):
@@ -1788,11 +1927,33 @@ def _build_and_cache(dbpath: str, day: str) -> tuple[str, bool, float]:
     if o is None:
         emptyf.write_text(_data_stamp())
         return day, False, time.time() - t0
-    np.savez(npz, obs=o.astype(np.float32), ts=t)
-    with open(pkl, "wb") as f:
-        pickle.dump(p, f)
-    metaf.write_text(json.dumps({"stamp": _data_stamp(),
-                                 "rows": int(len(o)), "ts": time.time()}))
+    # v9.9.2: atomic publication — tmp → os.replace per artifact, stamp file
+    # LAST (it is the freshness gate), so no reader or racing builder can
+    # observe a torn cache.
+    # BUGFIX 2026-07-30: np.savez APPENDS ".npz" unless the path already
+    # ends in it, so a ".npz.tmp" temp silently became ".npz.tmp.npz" and
+    # every os.replace raised WinError/FileNotFoundError — 32/32 days
+    # "skipped" on the first parallel prime. Temp names now END in .npz
+    # (savez leaves them alone) and carry the pid so two concurrent runs
+    # can never collide. try/finally guarantees no debris is left behind.
+    _tn = npz.with_name(f"{npz.stem}.{os.getpid()}.tmp.npz")
+    _tp = pkl.with_name(f"{pkl.stem}.{os.getpid()}.tmp.pkl")
+    _tm = metaf.with_name(f"{metaf.stem}.{os.getpid()}.tmp.json")
+    try:
+        np.savez(_tn, obs=o.astype(np.float32), ts=t)
+        _replace_retry(_tn, npz)
+        with open(_tp, "wb") as f:
+            pickle.dump(p, f)
+        _replace_retry(_tp, pkl)
+        _tm.write_text(json.dumps({"stamp": _data_stamp(),
+                                   "rows": int(len(o)), "ts": time.time()}))
+        _replace_retry(_tm, metaf)
+    finally:
+        for _junk in (_tn, _tp, _tm):
+            try:
+                _junk.unlink(missing_ok=True)
+            except OSError:
+                pass
     return day, True, time.time() - t0
 
 
@@ -1812,46 +1973,91 @@ def _load_cached(day: str):
     npz, pkl, metaf, emptyf = _cache_paths(day)
     if emptyf.exists():
         return None
-    z = np.load(npz)
+    # v9.9.3: np.load keeps its handle OPEN until closed; on Windows any open
+    # handle on a cache file makes a later os.replace fail with WinError 5.
+    # On 2026-08-01 handles held by this module denied all 32 parallel
+    # sample-cache publishes and the vault was replayed THREE times (prime,
+    # train, verdict — ~12 h of redundant compute). Materialise, close.
+    with np.load(npz) as z:
+        obs, ts = z["obs"], z["ts"]
     with open(pkl, "rb") as f:
         p = pickle.load(f)
-    return z["obs"], z["ts"], p
+    return obs, ts, p
 
 
 # ---- META-SAMPLE cache: one live-path replay per day, EVER (was: every
 #      pool day re-replayed nightly — 41 min and +3.5 min/day, forever) ------
 def _meta_cache_path(day: str):
+    if _HOLD_OVERRIDE_S:
+        return _CACHE_DIR / (f"{day}.meta_samples.h"
+                             f"{int(_HOLD_OVERRIDE_S)}.npz")
     return _CACHE_DIR / f"{day}.meta_samples.npz"
 
 
 def _meta_samples_stamp() -> str:
-    return (f"{_data_stamp()}:{_decision_stamp()}") + "|ret1"
+    h = f"|h{int(_HOLD_OVERRIDE_S)}" if _HOLD_OVERRIDE_S else ""
+    return (f"{_data_stamp()}:{_decision_stamp()}") + "|ret1" + h
+
+
+def _meta_cache_fresh(day: str) -> bool:
+    p = _meta_cache_path(day)
+    if not p.exists():
+        return False
+    try:
+        with np.load(p, allow_pickle=False) as z:
+            return (str(z["stamp"]) == _meta_samples_stamp()
+                    and "E" in z.files)
+    except Exception:                                     # noqa: BLE001
+        return False
+
+
+def _prime_meta_samples_worker(day: str) -> tuple[str, int]:
+    """Windows-spawn-safe: own sqlite, returns a count, never the arrays."""
+    con = sqlite3.connect(str(config.DB_PATH))
+    try:
+        x, *_ = _gen_meta_samples_cached(con, day)
+        return day, len(x)
+    finally:
+        con.close()
 
 
 def _gen_meta_samples_cached(con, day: str):
     p = _meta_cache_path(day)
     if p.exists():
         try:
-            z = np.load(p, allow_pickle=False)
-            if str(z["stamp"]) == _meta_samples_stamp():
-                return (list(z["X"]), list(z["Y"]), list(z["W"]),
-                        list(z["R"]), list(z["RET"]))
+            with np.load(p, allow_pickle=False) as z:
+                if (str(z["stamp"]) == _meta_samples_stamp()
+                        and "E" in z.files):
+                    return (list(z["X"]), list(z["Y"]), list(z["W"]),
+                            list(z["R"]), list(z["RET"]),
+                            [tuple(e) for e in z["E"]])
         except Exception:                                 # noqa: BLE001
             pass                                          # torn/old ⇒ rebuild
-    X, Y, W, R, RET = _gen_meta_samples(con, day)
+    X, Y, W, R, RET, ECON = _gen_meta_samples(con, day)
     try:
         _CACHE_DIR.mkdir(exist_ok=True)
         dim = 3 * config.FEATURES_PER_NODE + 4
-        np.savez(p, stamp=np.str_(_meta_samples_stamp()),
+        _ts_p = p.with_name(f"{p.stem}.{os.getpid()}.tmp.npz")   # see
+        #        BUGFIX 2026-07-30 in _build_and_cache: must end in .npz
+        np.savez(_ts_p, stamp=np.str_(_meta_samples_stamp()),
                  X=(np.stack(X) if X else np.zeros((0, dim), np.float32)),
                  Y=np.asarray(Y, np.float32),
                  W=np.asarray(W, np.float32),
                  R=(np.stack(R) if R else
                     np.zeros((0, config.FEATURES_PER_NODE), np.float32)),
-                 RET=np.asarray(RET, np.float32))
+                 RET=np.asarray(RET, np.float32),
+                 E=(np.asarray(ECON, np.float32) if ECON
+                    else np.zeros((0, 4), np.float32)))
+        _replace_retry(_ts_p, p)
     except Exception as e:                                # noqa: BLE001
+        # a cache write is an optimisation, never a correctness
+        # dependency — warn, drop any debris, return the real arrays.
         log.warning("meta-sample cache write failed for %s: %s", day, e)
-    return X, Y, W, R, RET
+        try:
+            _ts_p.unlink(missing_ok=True)
+        except (OSError, NameError):
+            pass
+    return X, Y, W, R, RET, ECON
 
 
 def _prepare_cache(days: list[str], report: DailyReport):
@@ -2235,6 +2441,14 @@ def main():
     wf_ok = (not wf_rows) or (sum(sac_wf) >= sum(heur_wf))
     beats_final = score > baseline + margin
     promote = beats_final and wf_ok and not abstains
+    # v9.9.3: on 2026-08-01 a promotion fired with FORGE_TRAIN_SAC=False and
+    # ZERO candidate trades — "did nothing" out-scored a losing baseline and
+    # a ghost champion landed in the manifest. A candidate must exist and
+    # must have actually traded on the promotion day.
+    _min_tr = int(getattr(config, "PROMOTION_MIN_TRADES", 5))
+    _no_cand = not bool(getattr(config, "FORGE_TRAIN_SAC", False))
+    _thin = int(st_s.get("trades", 0)) < _min_tr
+    promote = promote and not _no_cand and not _thin
 
     g = {}
     gate = config.STATE_DIR / "sim_gate.json"
@@ -2245,6 +2459,13 @@ def main():
                      time.time() - g.get("ts", 0) < 36 * 3600)
 
     reasons = []
+    if _no_cand:
+        reasons.append("SAC frozen (FORGE_TRAIN_SAC=False) — no candidate "
+                       "exists; nothing to promote")
+    if _thin:
+        reasons.append(f"candidate traded {int(st_s.get('trades', 0))} < "
+                       f"{_min_tr} on promotion day — a do-nothing policy "
+                       f"cannot be promoted")
     if abstains:
         reasons.append(f"abstainer: train trade-rate "
                        f"{diag['train_trade_rate']:.4%} < {min_rate:.4%}")

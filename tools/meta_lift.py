@@ -100,7 +100,7 @@ def main():
     perday, rets, sample_day = [], [], []
     for d in days:
         try:
-            X, Y, W, _R, RET = _gen_meta_samples_cached(con, d)
+            X, Y, W, _R, RET, _E = _gen_meta_samples_cached(con, d)
         except Exception as e:                             # noqa: BLE001
             log.warning("  %s: sample generation failed (%s) — skipped", d, e)
             continue

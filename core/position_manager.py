@@ -66,6 +66,27 @@ from core.quant_core import expected_move, micro_price
 
 log = logging.getLogger("pm")
 
+
+def _sane_delta(d, symbol: str = "") -> float:
+    """AUDIT 2026-07-29: four live targets landed at entry + 1.0×(wall−spot)
+    — the leg quote served |delta|≈1.0 for near-ATM options and the old
+    `abs(d) or 0.4` only caught zero/None, so the broken value flowed
+    straight into the runway target (+547% on one trade, unreachable ⇒
+    every exit degraded to time-stops). A long option's delta lives in
+    (0, 1); anything outside [0.05, 0.95] is a data fault, not a Greek.
+    Clamp, and say so once per symbol."""
+    try:
+        v = abs(float(d))
+    except (TypeError, ValueError):
+        return 0.4
+    if not v:
+        return 0.4
+    if v > 0.95 or v < 0.05:
+        log.warning("quote delta %.3f for %s is not a sane long-option "
+                    "delta — clamped; fix the greeks feed", v, symbol)
+        return min(max(v, 0.05), 0.95)
+    return v
+
 LEDGER_FIELDS = ["ts", "event", "index", "symbol", "direction", "qty",
                  "price", "value", "conviction", "win_prob", "pnl",
                  "costs", "reason", "order_id", "regime",
@@ -178,6 +199,8 @@ class Position:
     entry_conviction: float = 0.0 # |conviction| at entry (fast-lane qualifier)
     _dyn_tp_pct: float = 0.0      # vault-calibrated vol-scaled target fraction
     _dyn_src: str = ""            # provenance of the dynamic stop/target
+    meta_gate_zone: str = ""      # v9.9: FULL | PROBE | MONITOR ("" = legacy)
+    pnl_realized: float = 0.0     # v9.9: cumulative net PnL across partials
 
 
 class PositionManager:
@@ -194,6 +217,9 @@ class PositionManager:
         # be too tight on real fills (borderline). Evidence to tune the cap.
         self._walkaway_tally = {"runaway": 0, "borderline": 0,
                                 "worst_overshoot": 0.0}
+        # v9.9 META-GATE v3: fired once per FLAT close of a meta-gated
+        # position with (served_p, won, zone) — feeds the ACI margin.
+        self.on_meta_close = None
         self.ledger = Path(ledger_path or config.LEDGER_PATH)
         _hdr = ",".join(LEDGER_FIELDS)
         if self.ledger.exists():
@@ -219,7 +245,10 @@ class PositionManager:
 
     # ------------------------------------------------------------ entry
     def try_enter(self, ctx: TickContext, direction: str, conviction: float,
-                  win_prob: float, hierarchy: list[LegQuote]) -> bool:
+                  win_prob: float, hierarchy: list[LegQuote],
+                  probe: bool = False, meta_zone: str = "",
+                  tp_pct: float | None = None,
+                  sl_pct: float | None = None) -> bool:
         if self.pos is not None:
             self.last_block_reason = "already in position"
             return False
@@ -243,7 +272,9 @@ class PositionManager:
             return False
         leg, permit = self.risk.first_affordable(
             cands, direction=direction, win_prob=win_prob,
-            sl_pct=config.BASE_SL_PCT, tp_pct=config.BASE_TP_PCT,
+            sl_pct=(sl_pct if sl_pct else config.BASE_SL_PCT),
+            tp_pct=(tp_pct if tp_pct else config.BASE_TP_PCT),
+            probe=probe,
             data_age_s=ctx.data_age_s, now_hm=ctx.hm, ts=ctx.ts,
             ann_vol=ctx.atm_iv or None,
             lockout_bypass=bool(getattr(ctx, "lockout_bypass", False)),
@@ -371,10 +402,11 @@ class PositionManager:
         p = Position(index=self.index, direction=direction, symbol=q.symbol,
                      exchange=q.exchange, token=q.token, strike=q.strike,
                      qty=fill.qty, entry=fill.avg_price, entry_ts=ctx.ts,
-                     delta_at_entry=abs(q.delta) or 0.4,
+                     delta_at_entry=_sane_delta(q.delta, q.symbol),
                      conviction=conviction, win_prob=win_prob,
                      order_id=fill.order_id, n_buy_orders=max(fill.n_orders, 1),
                      dte=float(q.dte))
+        p.meta_gate_zone = meta_zone
         p._dyn_tp_pct = _dyn_tp_pct        # vol-scaled target (0 ⇒ base)
         p._dyn_src = _dyn_src
         # v9.7.1 fast lane: a genuinely high-conviction entry qualifies for the
@@ -430,8 +462,14 @@ class PositionManager:
         spot_room = min(em, runway) if runway else em
         prem_room = p.delta_at_entry * spot_room
         _tp_floor = getattr(p, "_dyn_tp_pct", 0.0) or config.BASE_TP_PCT
-        p.target = fill.avg_price + max(prem_room,
-                                        fill.avg_price * _tp_floor)
+        # AUDIT 2026-07-29: the runway path had NO ceiling — dyn targets are
+        # railed at DYN_TP_MAX but a wall/em target could plant +547%. One
+        # rail for every path: a target the payoff can't plausibly reach is
+        # not a target, it is a disabled exit.
+        _tp_cap = float(getattr(config, "DYN_TP_MAX", 1.20))
+        p.target = fill.avg_price + max(
+            min(prem_room, fill.avg_price * _tp_cap),
+            fill.avg_price * _tp_floor)
         p.peak = fill.avg_price
         p.peak_ts = float(ctx.ts)
         p.shield = TrapShield(direction)
@@ -861,6 +899,7 @@ class PositionManager:
                                  n_buy_orders=p.n_buy_orders,
                                  n_sell_orders=max(fill.n_orders, 1))
         pnl = sold_value - buy_value - costs
+        p.pnl_realized += pnl
         # ★ audit fix: log BEFORE clearing any state — symbol never None again
         self._log(ts=ctx.ts, event="SELL_FILL", index=self.index,
                   symbol=p.symbol, direction=p.direction, qty=fill.qty,
@@ -888,5 +927,12 @@ class PositionManager:
                       reason="sell partially filled — residual still managed")
             return "PARTIAL"
         self.engine.disarm_gtt(p.gtt_id)
+        if self.on_meta_close is not None and p.meta_gate_zone:
+            try:        # telemetry feed — can never take the exit path down
+                self.on_meta_close(float(p.win_prob),
+                                   bool(p.pnl_realized > 0),
+                                   p.meta_gate_zone)
+            except Exception as _e:                        # noqa: BLE001
+                log.warning("meta-close callback failed (%s)", _e)
         self.pos = None
         return reason

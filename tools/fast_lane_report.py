@@ -140,6 +140,36 @@ def _forward_evidence(days: list) -> dict:
     return out
 
 
+_FL_ART = {}          # per-process: {"meta":…, "cal":…} loaded once
+
+
+def _fl_day_worker(day: str):
+    """Grade one day in a pool worker: own sqlite, artifacts loaded once
+    per process, qualifying-entry dicts returned to the parent (small,
+    picklable). None ⇒ this day failed; the parent logs and skips it."""
+    import sqlite3 as _sq
+    try:
+        if not _FL_ART:
+            try:
+                _FL_ART["meta"] = F._eval_meta()
+            except Exception:                              # noqa: BLE001
+                _FL_ART["meta"] = None
+            try:
+                _FL_ART["cal"] = F._eval_cal()
+            except Exception:                              # noqa: BLE001
+                _FL_ART["cal"] = {}
+        rows: list[dict] = []
+        con = _sq.connect(str(config.DB_PATH))
+        try:
+            evaluate_heuristic(con, day, _FL_ART["meta"], _FL_ART["cal"],
+                               on_entry=rows.append)
+        finally:
+            con.close()
+        return rows
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=0)
@@ -197,11 +227,30 @@ def main():
         fast_r.append((f_exitp - e) / e)
         norm_r.append((n_exitp - e) / e)
 
-    for day in days:
-        try:
-            evaluate_heuristic(con, day, meta, cal, on_entry=on_entry)
-        except Exception as e_:                            # noqa: BLE001
-            log.warning("  %s: grading failed (%s) — skipped", day, e_)
+    # v9.9.3: this loop was the LAST serial monster in the evening — 33
+    # full-day gradings x ~9 min = 5.9 h, 58% of the whole 2026-08-01
+    # night, while every other replay tool had collapsed to seconds on
+    # cache hits. Day gradings are independent; they now run through the
+    # repo's map_days pool (own sqlite + artifacts per worker, spawn-
+    # safe), and the qualifying entries come back as rows aggregated
+    # HERE, in day order, through the same on_entry — byte-identical
+    # arithmetic, deterministic order, a fraction of the wall time.
+    try:
+        from core.parallel_days import map_days
+        _res = map_days(_fl_day_worker, list(days), desc="fast-lane day")
+        for _day, _rows in zip(days, _res):
+            if _rows is None:
+                log.warning("  %s: grading failed in worker — skipped", _day)
+                continue
+            for _info in _rows:
+                on_entry(_info)
+    except Exception as _pe:                               # noqa: BLE001
+        log.warning("parallel grading unavailable (%s) — serial path", _pe)
+        for day in days:
+            try:
+                evaluate_heuristic(con, day, meta, cal, on_entry=on_entry)
+            except Exception as e_:                        # noqa: BLE001
+                log.warning("  %s: grading failed (%s) — skipped", day, e_)
 
     n_fired = len(fast_pnl)
     if n_fired == 0:

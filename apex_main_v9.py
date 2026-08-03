@@ -53,6 +53,7 @@ deque had silently shrunk it to ~80 s).
 from __future__ import annotations
 import datetime as dt
 import json
+import os
 import logging
 import math
 import time
@@ -196,14 +197,40 @@ def load_meta():
     if mt > _meta_cache["ts"]:
         try:
             j = json.loads(config.META_MODEL_PATH.read_text())
+            # v9.9.1: the artifact's labels are DEFINED by fingerprinted
+            # constants (MAX_HOLD_MINUTES, barriers, costs). A hash-
+            # mismatched model answers a different question than the one
+            # live trades ask — refuse it (fail-closed to the conviction
+            # bar; the v3 gate already degrades to legacy on meta=None).
+            # Old artifacts without the field pass (nothing to check);
+            # drift_monitor and calibration already enforce the same rule.
+            _ah = j.get("config_hash")
+            if _ah and _ah != config.CONFIG_HASH:
+                logging.getLogger("brain").error(
+                    "META ARTIFACT REJECTED: trained under config %s, "
+                    "running %s — labels (hold horizon / barriers / costs) "
+                    "differ. Conviction bar governs until the forge "
+                    "re-trains under the current config.",
+                    _ah, config.CONFIG_HASH)
+                _meta_cache.update(ts=mt, m=None)   # log once, not per second
+                return None
             if j.get("engine") != "gbm" and "w" in j:
                 j["w"] = np.array(j["w"], np.float32)
                 j["mu"] = np.array(j["mu"], np.float32)
                 j["sd"] = np.array(j["sd"], np.float32)
             _meta_cache.update(ts=mt, m=j)
             logging.getLogger("brain").info(
-                "meta size-model loaded: engine=%s n=%s holdout_acc=%s",
-                j.get("engine", "logistic"), j.get("n"), j.get("holdout_acc"))
+                "meta size-model loaded: engine=%s n=%s holdout_acc=%s "
+                "va=%s", j.get("engine", "logistic"), j.get("n"),
+                j.get("holdout_acc"),
+                "yes" if (j.get("va") or {}).get("s") else "no")
+            try:    # v9.9: a new artifact obsoletes the margin learned
+                    # against the old one — soft-reset (halve), never zero.
+                from core import meta_gate as _MGT
+                _MGT.AdaptiveMargin("equity").on_promotion(
+                    float(j.get("ts") or mt))
+            except Exception:                              # noqa: BLE001
+                pass
         except Exception as e:                             # noqa: BLE001
             logging.getLogger("brain").warning(
                 "meta artifact unreadable (%s) — keeping previous", e)
@@ -285,10 +312,34 @@ def main():
     drift = DriftMonitor()
     drift_grade = "NO_REF"
     pms = {i: PositionManager(i, risk, engine) for i in config.TRADABLE}
+    # v9.9 META-GATE v3: one adaptive margin per book; every FLAT close of
+    # a meta-gated position feeds it (served p vs outcome). ACI-style: an
+    # overstating model tightens its own gate; an understating one unblocks.
+    from core import meta_gate as MGT
+    _aci = MGT.AdaptiveMargin("equity")
+    def _meta_close_feed(p_served: float, won: bool, zone: str) -> None:
+        _aci.update(p_served, won)
+    for _pm_i in pms.values():
+        _pm_i.on_meta_close = _meta_close_feed
     broker_open = engine.reconcile()
     if broker_open:
         risk.kill("broker shows pre-existing open positions — square off "
                   "manually, then restart")
+    # AUDIT 2026-07-29: three MAX_HOLD_THETA exits fired at 45 min while the
+    # report claimed the 60-min config — a partial install / stale __pycache__
+    # can run old bytecode under a new config hash. Print the EFFECTIVE exit
+    # constants and source mtimes at every start so that drift is visible in
+    # the first screen of the log, not in a post-mortem.
+    import core.position_manager as _pmmod
+    log.info("effective exit constants | MAX_HOLD %sm (0DTE %sm, ride x%s, "
+             "dte_lt %s) | BASE_TP/SL %s/%s | DYN_TP_MAX %s | src mtimes "
+             "pm=%s cfg=%s",
+             config.MAX_HOLD_MINUTES, config.MAX_HOLD_MINUTES_0DTE,
+             getattr(config, "MAX_HOLD_RIDE_MULT", 2.0),
+             config.EXPIRY_DTE_LT, config.BASE_TP_PCT, config.BASE_SL_PCT,
+             getattr(config, "DYN_TP_MAX", 1.20),
+             int(os.path.getmtime(_pmmod.__file__)),
+             int(os.path.getmtime(config.__file__)))
     log.info("brain up | capital ₹%.0f | mode %s | policy %s",
              risk.start_capital,
              "LIVE" if config.live_fire_armed() else "PAPER", policy.kind)
@@ -319,6 +370,8 @@ def main():
     actions = np.zeros(config.ACTION_DIM, np.float32)
     last_conv: dict[str, float] = {}       # post-regime conv, ≤1 s old
     last_wp_hold: dict[str, float | None] = {}
+    last_ivl: dict[str, tuple | None] = {}     # v9.9 (p0,p1,p̄,integrity)
+    last_econ: dict[str, tuple | None] = {}    # v9.9 (p*, tp%, sl%)
     # v9.7.1: signed Kaufman ER of the recent spot path, refreshed 1 Hz — the
     # ride gate's tape evidence (None until enough history) + the
     # DisplacementGovernor that weighs an incoming read against a held fly.
@@ -1295,6 +1348,42 @@ def main():
                                           er, f30, 1 if conv > 0 else -1,
                                           conv_by_index=_conv_all)
                 wp = D.blend_winprob(wp_meta, conv, cal)
+                # ---- v9.9 META-GATE v3: Venn-Abers interval + THIS
+                # candidate's shaped-barrier economics (p*, tp%, sl%).
+                # Computed at 1 Hz beside wp; the gate below consumes the
+                # ≤1 s-stale stored values. Any missing piece ⇒ None ⇒ the
+                # gate falls back to legacy bytes for that second.
+                last_ivl[idx] = None
+                last_econ[idx] = None
+                if (getattr(config, "META_GATE_MODE", "bar") == "ev"
+                        and wp_meta is not None):
+                    last_ivl[idx] = D.meta_win_interval(
+                        load_meta(), frame, i, min(mins_open / 375.0, 1.0),
+                        er, f30, 1 if conv > 0 else -1,
+                        conv_by_index=_conv_all)
+                    if last_ivl[idx] is not None:
+                        try:
+                            _d_c = "CE" if conv > 0 else "PE"
+                            _legs_c = ctx_m.get("legs") or {}
+                            _atm_c = (_legs_c.get(
+                                "atm_ce" if _d_c == "CE" else "atm_pe")
+                                or {}).get("snap") or {}
+                            _ask_c = float(_atm_c.get("ask")
+                                           or _atm_c.get("ltp") or 0.0)
+                            _rows_c = (mapper.hierarchy(idx, spot, _d_c)
+                                       if mapper else []) or []
+                            if _ask_c > 0 and _rows_c:
+                                _mins_lf = max(375.0 - mins_open, 1.0)
+                                last_econ[idx] = MGT.candidate_economics(
+                                    _ask_c, spot,
+                                    float(_rows_c[0]["strike"]),
+                                    float(ctx_m.get("T") or 0.0), _mins_lf,
+                                    _d_c == "CE",
+                                    int(_rows_c[0]["lot"]),
+                                    (mac or {}).get("call_wall"),
+                                    (mac or {}).get("put_wall"))
+                        except Exception as _e:            # noqa: BLE001
+                            log.debug("candidate economics failed (%s)", _e)
                 if wp_meta is not None:
                     # AUDIT: this reservoir used to be fed only AFTER the gate
                     # PASSED, so with zero entries it reported n=0 all day and
@@ -1302,12 +1391,16 @@ def main():
                     # the TRUE (unclamped) probability at every evaluation —
                     # that is the series that reveals whether the model
                     # discriminates or just sits on the floor.
-                    _wp_true = D.meta_win_prob(
-                        load_meta(), frame, i, min(mins_open / 375.0, 1.0),
-                        er, f30, 1 if conv > 0 else -1, clamp=False,
-                        conv_by_index=_conv_all)
-                    if _wp_true is not None:
-                        wp_res[idx].add(_wp_true)
+                    if last_ivl.get(idx) is not None:
+                        wp_res[idx].add(float(last_ivl[idx][2]))
+                    else:
+                        _wp_true = D.meta_win_prob(
+                            load_meta(), frame, i,
+                            min(mins_open / 375.0, 1.0),
+                            er, f30, 1 if conv > 0 else -1, clamp=False,
+                            conv_by_index=_conv_all)
+                        if _wp_true is not None:
+                            wp_res[idx].add(_wp_true)
                 log.debug("%s spot %.1f | ai %+.2f shock %+.2f → conv %+.2f "
                           "(wp %.2f)", idx, spot, ai, shock, conv, wp)
                 # model's LIVE read of the HELD position (model-shaped exit):
@@ -1516,7 +1609,10 @@ def main():
                 continue
             # ---- shared attempt tail: ladder → quotes → governor → fill ----
             def _attempt(direction: str, conv_a: float, wp_a: float,
-                         gate_desc: str, tag: str) -> None:
+                         gate_desc: str, tag: str,
+                         probe: bool = False, meta_zone: str = "",
+                         tp_pct: float | None = None,
+                         sl_pct: float | None = None) -> None:
                 if not mapper:
                     funnel.record(idx, "no_chain", "no kite mapper")
                     return
@@ -1569,7 +1665,9 @@ def main():
                         "ltp": _lq.premium}
                 log.info("%s entry signal — gate: %s | P(win) %.2f | %s",
                          idx, gate_desc, wp_a, tag)
-                pm.try_enter(tctx, direction, conv_a, wp_a, hierarchy)
+                pm.try_enter(tctx, direction, conv_a, wp_a, hierarchy,
+                             probe=probe, meta_zone=meta_zone,
+                             tp_pct=tp_pct, sl_pct=sl_pct)
                 if pm.pos:
                     skip_reason[idx] = f"in {pm.pos.symbol}"
                     funnel.record(idx, "entered", tag)
@@ -1643,7 +1741,11 @@ def main():
             # DECISION GATE — model-driven when a trained meta-model exists,
             # else the fixed conviction bar (bootstrap). One shared copy in
             # core/decision.entry_gate — the forge grades with the same bytes.
-            gate = D.entry_gate(conv, wp, wp_meta, eff_bar)
+            _ec = last_econ.get(idx)
+            gate = D.entry_gate_v3(conv, wp, wp_meta, eff_bar,
+                                   last_ivl.get(idx),
+                                   _ec[0] if _ec else None,
+                                   aci_margin=_aci.m)
             if not gate.ok:
                 skip_reason[idx] = gate.reason
                 funnel.record(idx, "below_bar", gate.reason)
@@ -1710,9 +1812,16 @@ def main():
                 funnel.record(idx, "throttled")
                 continue                       # one attempt per 5 s per index
             last_try[idx] = ts
-            _attempt("CE" if conv > 0 else "PE", conv, wp, _gate,
-                     "MODEL-DRIVEN" if gate.model_driven
-                     else "bootstrap (fixed bar)")
+            _v3 = gate.zone not in ("", "LEGACY")
+            _wp_size = (gate.p if (_v3 and gate.p == gate.p) else wp)
+            _attempt("CE" if conv > 0 else "PE", conv, _wp_size, _gate,
+                     (f"META-EV-{gate.zone}" if _v3 else
+                      ("MODEL-DRIVEN" if gate.model_driven
+                       else "bootstrap (fixed bar)")),
+                     probe=bool(gate.probe),
+                     meta_zone=(gate.zone if _v3 else ""),
+                     tp_pct=(_ec[1] if (_v3 and _ec) else None),
+                     sl_pct=(_ec[2] if (_v3 and _ec) else None))
 
     # ---- session end: final diagnostics report ------------------------------
     _write_report(final=True)

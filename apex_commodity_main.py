@@ -143,6 +143,13 @@ def main():
     brain = CommodityBrain()
     # one PositionManager per commodity (isolated from equity PMs by process)
     pms = {c: PositionManager(c, risk, engine) for c in commodities}
+    # v9.9: commodity ACI feed (only meta-gated closes report)
+    from core import meta_gate as MGT
+    _aci_c = MGT.AdaptiveMargin("commodity")
+    def _meta_close_feed_c(p_served: float, won: bool, zone: str) -> None:
+        _aci_c.update(p_served, won)
+    for _pm_c in pms.values():
+        _pm_c.on_meta_close = _meta_close_feed_c
     # AUDIT F2: each commodity's entry curfew derives from ITS session close
     # (close − COMMODITY_NO_ENTRY_BEFORE_CLOSE_MIN), not the equity 14:45.
     _cut = int(getattr(config, "COMMODITY_NO_ENTRY_BEFORE_CLOSE_MIN", 25))
@@ -330,6 +337,10 @@ def main():
                 try:
                     entered = pm.try_enter(tctx, d.direction, d.conviction,
                                            win_prob=d.win_prob or d.conviction,
+                                           probe=bool(getattr(d, "probe",
+                                                              False)),
+                                           meta_zone=str(getattr(
+                                               d, "meta_zone", "")),
                                            hierarchy=hierarchy)
                     if entered:
                         log.info("COMMODITY ENTER %s %s conv=%.2f (%s)",

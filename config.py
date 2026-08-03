@@ -411,6 +411,34 @@ META_CROSS_INDEX        = True
 # if RAM allows. NOT a GPU workload: the cost is a Python loop over 22,500
 # seconds plus SQLite reads, not matrix math.
 PARALLEL_DAY_WORKERS    = 0
+# v9.9.3 MEMORY-AWARE POOL SIZING (16 GB-laptop safety).
+# A day-replay worker holds tick arrays + the prem table; on this vault a
+# built day cache is a direct proxy for that working set, so the pool sizer
+# MEASURES the median cache size on disk and multiplies by
+# PARALLEL_RAM_WORKSET_MULT to estimate live RSS, instead of guessing. When
+# no cache exists yet (first-ever prime), PARALLEL_RAM_PER_WORKER_GB is the
+# fallback. RESERVE is left for Windows, the browser, and any live process.
+PARALLEL_RAM_RESERVE_GB    = 2.5   # v9.9.3: 4.0 zeroed the pool on a busy 16 GB box
+PARALLEL_RAM_PER_WORKER_GB = 1.5
+PARALLEL_RAM_WORKSET_MULT  = 2.0   # v9.9.3: 3x over-charged cache-READ workers
+PARALLEL_RAM_AWARE         = True
+# ── v9.9.4 discovery / capability ladder ──────────────────────────────
+DISCOVERY_ENABLED          = True
+LADDER_POWER               = 0.80    # detect at 80% power…
+LADDER_ALPHA               = 0.05    # …one-sided 5%
+LADDER_SCREEN_MDE          = 0.60    # unlock horizon sweep at this MDE
+LADDER_DISCOVER_MDE        = 0.55    # unlock feature screening here
+DISCOVERY_FDR_Q            = 0.10    # Benjamini-Hochberg false-discovery rate
+HORIZON_CANDIDATES         = [20, 30, 45, 60, 90, 120]
+HORIZON_MIN_DAYS           = 20
+HORIZON_BOOT               = 1500
+HORIZON_AUTO_ADOPT         = False   # recommend by default; operator applies
+HORIZON_ADOPT_MIN_NIGHTS   = 3       # a winner must repeat 3 nights running
+HORIZON_ADOPT_RANGE        = (20, 120)
+FEATURE_MIN_GROUP_TESTS    = 4
+PARALLEL_MIN_WORKERS       = 2     # v9.9.3: grant 2 whenever they physically
+#                                    fit — 1 worker turned 2026-08-01 into a
+#                                    20-hour serial night
 # XDIM_REMIND_S: how often to repeat the x-dim mismatch error. It fires on
 # every evaluation (several/second/index), so on 2026-07-29 an un-throttled
 # ERROR buried the session log. Static condition -> say it once, then remind.
@@ -504,7 +532,33 @@ META_HOLD_PAST_TARGET_P = 0.58   # P(win) bar to ride past the target (real edge
 TARGET_EXTEND_MAX       = 4      # max times the target may be extended per trade
 DISASTER_FLOOR_MULT  = 1.6    # floor = 1.6 × current stop distance …
 ABS_DISASTER_PCT     = 0.45   # … but never worse than -45% of premium. ALWAYS fires.
-MAX_HOLD_MINUTES     = 45     # theta guillotine for 0-2 DTE longs
+# v9.9.4 AUTOMATIC HORIZON RESEARCH. tools/horizon_sweep may adopt a new
+# label/hold horizon by writing state/horizon_override.json — but ONLY after
+# it survives BH-FDR across all candidates AND repeats for
+# HORIZON_ADOPT_MIN_NIGHTS consecutive nights AND HORIZON_AUTO_ADOPT is on.
+# Reading it HERE (not editing source) means the adopted value flows through
+# CONFIG_HASH exactly like a hand edit: caches and artifacts invalidate
+# themselves. Delete the file to revert instantly.
+def _horizon_override(default: int) -> int:
+    try:
+        import json as _j
+        p = STATE_DIR / "horizon_override.json"
+        if p.exists():
+            v = int(_j.loads(p.read_text())["max_hold_minutes"])
+            if 20 <= v <= 120:
+                return v
+    except Exception:                                      # noqa: BLE001
+        pass
+    return default
+
+
+MAX_HOLD_MINUTES     = _horizon_override(60)   # theta guillotine (v9.9.1:
+#                               45→60 by operator request. RIDE_MULT 2.0 ⇒
+#                               hard cap 120 min while theta-riding. 0-DTE
+#                               keeps its own 25-min knob. FINGERPRINTED:
+#                               changing this rotates CONFIG_HASH — labels
+#                               regrade at the 60-min first-touch window and
+#                               every cache/artifact rebuilds, by design.)
 MAX_ENTRY_SPREAD_PCT = 0.03   # refuse entries when (ask-bid)/mid above this
 
 # Conviction → probability. The calibration table (built nightly by the
@@ -700,6 +754,23 @@ META_GBM_LEAVES   = 15
 META_GBM_LR       = 0.05
 META_GBM_ROUNDS   = 600        # ceiling; early stopping picks the real one
 META_GBM_MINCHILD = 25
+
+# --- v9.9 META-GATE v3 (Venn-Abers intervals + per-trade EV zones) -------
+# "ev": three-zone EV gate on VA intervals vs per-trade breakeven p*.
+# "bar": legacy fixed META_ENTRY_P_BAR veto (byte-identical fallback).
+META_GATE_MODE        = "ev"
+META_EV_MARGIN        = 0.02   # static safety margin added to p*
+META_ACI_GAMMA        = 0.02   # online margin learning rate (per outcome)
+META_ACI_MAX          = 0.10   # |adaptive margin| hard clip
+META_VA_MAX_CAL       = 4000   # VA calibration-set cap (stride-thinned)
+META_FEAT_WINDOW      = 240    # live x-vectors watched for train/serve skew
+META_FEAT_FROZEN_MIN  = 8      # trained-alive features frozen live ⇒ MONITOR
+META_PROBE_ENABLED    = True   # ambiguous zone may enter at minimum size
+META_PROBE_MAX_PER_DAY   = 3   # probes per book per day (hard)
+META_PROBE_MAX_DAY_RISK_PCT = 0.02  # Σ probe worst-case loss ≤ 2% equity/day
+COMMODITY_META_GATE   = "size_only"  # "size_only" (today) | "ev" (opt-in)
+META_GATE_STATE = STATE_DIR / "meta_gate_aci.json"
+META_PROBE_STATE = STATE_DIR / "meta_probe_ledger.json"
 # v10.2 SCALE DOCTRINE: evenings must stay O(new days) as the vault grows.
 HARNESS_MAX_DAYS    = 60      # certificates graded on the trailing N vault
                               # days (0 = all history). Recency-relevant
@@ -1352,11 +1423,25 @@ _HASH_EXCLUDE = frozenset({
     "META_MIN_BSS", "META_MIN_POSITIVES", "META_MIN_OOF_SPREAD",
     "XDIM_REMIND_S",
     "META_CROSS_INDEX", "PARALLEL_DAY_WORKERS",
+    "PARALLEL_RAM_RESERVE_GB", "PARALLEL_RAM_PER_WORKER_GB",
+    "PARALLEL_RAM_WORKSET_MULT", "PARALLEL_RAM_AWARE",
+    "PARALLEL_MIN_WORKERS", "PROMOTION_MIN_TRADES",
+    "DISCOVERY_ENABLED", "LADDER_POWER", "LADDER_ALPHA",
+    "LADDER_SCREEN_MDE", "LADDER_DISCOVER_MDE", "DISCOVERY_FDR_Q",
+    "HORIZON_CANDIDATES", "HORIZON_MIN_DAYS", "HORIZON_BOOT",
+    "HORIZON_AUTO_ADOPT", "HORIZON_ADOPT_MIN_NIGHTS",
+    "HORIZON_ADOPT_RANGE", "FEATURE_MIN_GROUP_TESTS",
     "META_MIN_AUC",
     "FAST_LANE_DEFER_WHILE_RISING", "FAST_LANE_RUN_GRACE_S",
     "CASCADE_MAX_FLIP_DIST_PCT",
     # v9.8 meta-forge engine knobs (trainer choice — model files carry their
     # own provenance; these must not fingerprint the feature world)
+    # v9.9 meta-gate v3 knobs (gate policy — model files carry provenance;
+    # these must not fingerprint the feature world)
+    "META_GATE_MODE", "META_EV_MARGIN", "META_ACI_GAMMA", "META_ACI_MAX",
+    "META_VA_MAX_CAL", "META_FEAT_WINDOW", "META_FEAT_FROZEN_MIN",
+    "META_PROBE_ENABLED", "META_PROBE_MAX_PER_DAY",
+    "META_PROBE_MAX_DAY_RISK_PCT", "COMMODITY_META_GATE",
     "META_ENGINE", "META_EMBARGO_DAYS", "META_GBM_LEAVES", "META_GBM_LR",
     "META_USE_PLO", "META_PLO_MIN_N", "FUT_SYMBOLS",
     "VIX_TOKEN",

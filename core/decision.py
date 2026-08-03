@@ -112,14 +112,11 @@ def effective_bar(base_bar: float, vix_bump: float,
 #    verbatim from apex_main (meta_win_prob / win_prob_for / the 50-50 blend)
 #    so the forge's grader computes P(win) with the same bytes.
 # --------------------------------------------------------------------------
-def meta_win_prob(meta: dict | None, frame: np.ndarray, iidx: int,
-                  tod: float, er: float, f30: float, dirn: int,
-                  clamp: bool = True,
-                  conv_by_index=None) -> float | None:
-    """clamp=False returns the TRUE calibrated probability (no META_P_FLOOR
-    lift) — for telemetry/diagnosis. Decisions keep clamp=True."""
-    if not meta or int(meta.get("n", 0)) < config.META_MIN_TRAIN:
-        return None
+def _meta_x(frame: np.ndarray, iidx: int, tod: float, er: float,
+            f30: float, dirn: int, conv_by_index=None) -> np.ndarray:
+    """THE meta feature vector — one copy shared by the point scorer
+    (meta_win_prob) and the v9.9 interval scorer (meta_win_interval),
+    mirroring the forge's identical concat at training time."""
     b0 = iidx * config.NODES_PER_INDEX
     # CROSS-INDEX PEER CONTEXT (config.META_CROSS_INDEX). Appended AFTER the
     # existing 61 so an old artifact's feature order is untouched; the x_dim
@@ -140,11 +137,23 @@ def meta_win_prob(meta: dict | None, frame: np.ndarray, iidx: int,
         else:
             _peer = peer_features(conv_by_index, iidx,
                                   "CE" if dirn > 0 else "PE")
-    x = np.concatenate([frame[b0], frame[b0 + 1], frame[b0 + 2],
-                        [tod, er,
-                         math.copysign(min(abs(f30) * 100, 3), f30)
-                         if f30 else 0.0,
-                         1.0 if dirn > 0 else -1.0], _peer]).astype(np.float32)
+    return np.concatenate([frame[b0], frame[b0 + 1], frame[b0 + 2],
+                           [tod, er,
+                            math.copysign(min(abs(f30) * 100, 3), f30)
+                            if f30 else 0.0,
+                            1.0 if dirn > 0 else -1.0],
+                           _peer]).astype(np.float32)
+
+
+def meta_win_prob(meta: dict | None, frame: np.ndarray, iidx: int,
+                  tod: float, er: float, f30: float, dirn: int,
+                  clamp: bool = True,
+                  conv_by_index=None) -> float | None:
+    """clamp=False returns the TRUE calibrated probability (no META_P_FLOOR
+    lift) — for telemetry/diagnosis. Decisions keep clamp=True."""
+    if not meta or int(meta.get("n", 0)) < config.META_MIN_TRAIN:
+        return None
+    x = _meta_x(frame, iidx, tod, er, f30, dirn, conv_by_index)
     if meta.get("engine") == "gbm":
         from core import meta_gbm as MG
         return MG.score_vec(meta, x, clamp=clamp)
@@ -171,6 +180,22 @@ def blend_winprob(wp_meta: float | None, conv: float, cal: dict) -> float:
     if cal_hit:
         return 0.5 * (wp_meta + float(cal[bkey][0]))   # blend both judges
     return wp_meta
+
+
+def meta_win_interval(meta: dict | None, frame: np.ndarray, iidx: int,
+                      tod: float, er: float, f30: float, dirn: int,
+                      conv_by_index=None
+                      ) -> tuple[float, float, float, str] | None:
+    """v9.9: Venn-Abers interval (p0, p1, p_merged, integrity_status) on
+    the SAME x-vector as meta_win_prob. None ⇒ no VA-capable artifact —
+    callers fall back to the legacy fixed-bar gate, fail-open."""
+    if not meta or int(meta.get("n", 0)) < config.META_MIN_TRAIN:
+        return None
+    if meta.get("engine") != "gbm":
+        return None
+    x = _meta_x(frame, iidx, tod, er, f30, dirn, conv_by_index)
+    from core import meta_gbm as MG
+    return MG.score_interval(meta, x)
 
 
 # --------------------------------------------------------------------------
@@ -241,6 +266,49 @@ def entry_gate(conv: float, wp: float, wp_meta: float | None,
                           False, eff_bar)
     return GateResult(True, f"conv {abs(conv):.2f}≥{eff_bar:.2f}",
                       False, eff_bar)
+
+
+@dataclass
+class GateResultV3:
+    ok: bool
+    reason: str
+    model_driven: bool
+    floor: float
+    zone: str = "LEGACY"     # FULL | PROBE | VETO | MONITOR | LEGACY
+    probe: bool = False
+    p0: float = float("nan")
+    p1: float = float("nan")
+    p: float = float("nan")
+    p_star: float = float("nan")
+
+
+def entry_gate_v3(conv: float, wp: float, wp_meta: float | None,
+                  eff_bar: float,
+                  interval: tuple[float, float, float, str] | None,
+                  p_star: float | None,
+                  aci_margin: float = 0.0) -> GateResultV3:
+    """The v9.9 gate. Three-zone EV decision on Venn-Abers intervals vs
+    THIS candidate trade's breakeven — when everything it needs exists;
+    otherwise byte-identical legacy behavior (fail-open). One copy,
+    shared by the live brain and the forge grader."""
+    if (getattr(config, "META_GATE_MODE", "bar") != "ev"
+            or interval is None or p_star is None):
+        g = entry_gate(conv, wp, wp_meta, eff_bar)
+        return GateResultV3(g.ok, g.reason, g.model_driven, g.floor)
+    if abs(conv) < config.META_ENTRY_CONV_FLOOR:
+        return GateResultV3(False, f"conv {abs(conv):.2f}<"
+                            f"{config.META_ENTRY_CONV_FLOOR:.2f} floor",
+                            True, config.META_ENTRY_CONV_FLOOR, "VETO")
+    from core import meta_gate as MGT
+    p0, p1, pm, integ = interval
+    d = MGT.decide(p0, p1, float(p_star), float(aci_margin), integ)
+    probe_ok = bool(getattr(config, "META_PROBE_ENABLED", True))
+    ok = d.ok and (not d.probe or probe_ok)
+    reason = d.reason if ok or d.zone == "VETO" else (
+        d.reason + " (probes disabled)")
+    return GateResultV3(ok, reason, True, config.META_ENTRY_CONV_FLOOR,
+                        d.zone, bool(d.probe and ok),
+                        d.p0, d.p1, d.p, d.p_star)
 
 
 # --------------------------------------------------------------------------

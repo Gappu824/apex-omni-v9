@@ -102,7 +102,15 @@ def load_commodity_meta():
         import json
         p = config.MODEL_DIR / "commodity_meta.json"
         if p.exists():
-            return json.loads(p.read_text())
+            j = json.loads(p.read_text())
+            _ah = j.get("config_hash")     # v9.9.1: same fail-closed rule
+            if _ah and _ah != config.CONFIG_HASH:   # as the equity loader
+                log.error("commodity meta REJECTED: trained under config "
+                          "%s, running %s — heuristic-only until the "
+                          "commodity forge re-trains.", _ah,
+                          config.CONFIG_HASH)
+                return None
+            return j
     except Exception:                                          # noqa: BLE001
         pass
     return None
@@ -122,6 +130,8 @@ class CommodityDecision:
     tp_pct: float = 0.0
     win_prob: float = 0.0     # meta P(win) when a promoted model exists,
     #                           else conviction — flows into the Kelly gate
+    probe: bool = False       # v9.9: ambiguous EV zone → minimum-size entry
+    meta_zone: str = ""       # v9.9: FULL | PROBE | VETO | MONITOR ("" legacy)
 
 
 class CommodityBrain:
@@ -145,9 +155,9 @@ class CommodityBrain:
                      "meta P(win) feeds the Kelly gate",
                      self.meta.get("engine"), self.meta.get("n"))
 
-    def _meta_wp(self, name: str, nodes: np.ndarray, direction: str,
-                 now_ist) -> float | None:
-        """Score the promoted meta on the FORGE-IDENTICAL x-vector:
+    def _meta_x(self, name: str, nodes: np.ndarray, direction: str,
+                now_ist) -> np.ndarray | None:
+        """Build the FORGE-IDENTICAL x-vector:
         [spot_node, atm_ce_node, atm_pe_node, t/N, kaufman_er, capped_mom30,
         ±1 direction]. Returns P(win) or None (no model / scoring failed)."""
         if self.meta is None:
@@ -180,9 +190,35 @@ class CommodityBrain:
                                  if f30 else 0.0,
                                  1.0 if direction == "CE" else -1.0]]
                                ).astype(np.float32)
+            return x
+        except Exception as e:                                 # noqa: BLE001
+            log.debug("meta x-build failed (%s)", e)
+            return None
+
+    def _meta_wp(self, name: str, nodes: np.ndarray, direction: str,
+                 now_ist) -> float | None:
+        x = self._meta_x(name, nodes, direction, now_ist)
+        if x is None or self.meta is None:
+            return None
+        try:
+            from core.meta_gbm import score_vec
             return score_vec(self.meta, x)
         except Exception as e:                                 # noqa: BLE001
             log.debug("meta scoring failed (%s) — using conviction", e)
+            return None
+
+    def _meta_interval(self, name: str, nodes: np.ndarray, direction: str,
+                       now_ist):
+        """v9.9: (p0, p1, p_merged, integrity) from the commodity artifact's
+        Venn-Abers payload, or None (legacy point path)."""
+        x = self._meta_x(name, nodes, direction, now_ist)
+        if x is None or self.meta is None:
+            return None
+        try:
+            from core.meta_gbm import score_interval
+            return score_interval(self.meta, x)
+        except Exception as e:                                 # noqa: BLE001
+            log.debug("meta interval failed (%s)", e)
             return None
 
     def _nodes_for(self, name: str, ctx: dict, ts: float) -> np.ndarray:
@@ -266,6 +302,37 @@ class CommodityBrain:
             _wp = self._meta_wp(name, self._last_nodes.get(name, np.zeros(
                 (5, config.FEATURES_PER_NODE), np.float32)), direction, now_ist)
             d.win_prob = float(_wp) if _wp is not None else conviction
+            # ---- v9.9 META-GATE v3 (commodities). Default "size_only":
+            # a VA-capable artifact upgrades the SIZING probability to the
+            # merged interval value and never vetoes (today's behavior).
+            # "ev" (operator opt-in) adds the three-zone gate, with p*
+            # from the SAME dynamic stop/target lv just computed. lot=1
+            # here (real lot lives in the mapper, past this point), which
+            # OVERSTATES flat brokerage per unit ⇒ p* conservative — the
+            # safe direction for a gate.
+            _ivl_c = self._meta_interval(
+                name, self._last_nodes.get(name, np.zeros(
+                    (5, config.FEATURES_PER_NODE), np.float32)),
+                direction, now_ist)
+            if _ivl_c is not None:
+                _p0c, _p1c, _pmc, _intc = _ivl_c
+                d.win_prob = float(_pmc)
+                if getattr(config, "COMMODITY_META_GATE",
+                           "size_only") == "ev" and entry_prem > 0:
+                    from core import meta_gate as MGT
+                    _ps_c = MGT.breakeven_p(
+                        entry_prem, entry_prem * (1.0 + lv.tp_pct),
+                        entry_prem * (1.0 - lv.sl_pct), 1)
+                    _dec = MGT.decide(_p0c, _p1c, _ps_c,
+                                      MGT.AdaptiveMargin("commodity").m,
+                                      _intc)
+                    d.meta_zone = _dec.zone
+                    if not _dec.ok:
+                        d.allowed = False
+                        d.reason = _dec.reason
+                        decisions.append(d)
+                        continue
+                    d.probe = bool(_dec.probe)
             d.allowed = True
             d.reason = (f"entered ({lv.source}"
                         + (f", meta wp {d.win_prob:.2f}" if _wp is not None

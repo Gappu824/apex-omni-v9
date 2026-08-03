@@ -266,6 +266,46 @@ def fit_gbm(perday: list[tuple], min_train: int,
         oof_out["oof_raw"] = oof_p[got].copy()
         oof_out["oof_cal"] = _cal_oof.copy()
         oof_out["y"] = Y[got].copy()
+    # ---- v9.9 META-GATE v3: Venn-Abers calibration payload. The OOF
+    # (raw score, label, uniqueness weight) triples ARE the calibration
+    # set (cross-VA: every score here was produced out-of-fold under the
+    # purged day split). Serving builds two isotonic fits per query for a
+    # finite-sample-valid interval [p0,p1] — see core/meta_gate.py.
+    _vs, _vy, _vw = oof_p[got], Y[got], W[got]
+    _cap = int(getattr(config, "META_VA_MAX_CAL", 4000))
+    if len(_vs) > _cap:                     # stride-thin on the score order
+        _o = np.argsort(_vs, kind="stable")
+        _o = _o[np.linspace(0, len(_o) - 1, _cap).astype(int)]
+        _vs, _vy, _vw = _vs[_o], _vy[_o], _vw[_o]
+    va_payload = {"s": np.round(_vs, 6).tolist(),
+                  "y": np.round(_vy, 1).tolist(),
+                  "w": np.round(_vw, 4).tolist()}
+    # per-feature TRAINING liveness — the serve-time skew tripwire's
+    # reference (a feature that never varied in training cannot "freeze")
+    _span = X.max(axis=0) - X.min(axis=0)
+    feat_alive = (_span > 1e-9).tolist()
+    # honest VA diagnostics on a stride of OOF, calibrated on the rest
+    _va_width = _va_brier = float("nan")
+    try:
+        from core.meta_gate import VennAbers as _VA
+        _probe = np.linspace(0, len(_vs) - 1,
+                             min(200, len(_vs))).astype(int)
+        _mask = np.ones(len(_vs), bool); _mask[_probe] = False
+        if _mask.sum() >= 50:
+            _va = _VA(_vs[_mask], _vy[_mask], _vw[_mask])
+            _ws, _bs = [], []
+            for _j in _probe:
+                _p0, _p1 = _va.interval(float(_vs[_j]))
+                _pm = _VA.merge(_p0, _p1)
+                _ws.append(_p1 - _p0)
+                _bs.append((_pm - _vy[_j]) ** 2)
+            _va_width = float(np.mean(_ws))
+            _va_brier = float(np.mean(_bs))
+            log.info("META-GATE v3 | VA mean interval width %.4f | "
+                     "merged-Brier %.5f (isotonic %.5f) over %d probes",
+                     _va_width, _va_brier, brier_cal, len(_probe))
+    except Exception as _e:                                # noqa: BLE001
+        log.warning("VA diagnostics skipped (%s)", _e)
     _spread = float(np.quantile(_cal_oof, 0.95) - np.quantile(_cal_oof, 0.05))
     _distinct = int(len(np.unique(np.round(_cal_oof, 4))))
     # DISCRIMINATION vs CALIBRATION. auc_raw is the booster's own ordering;
@@ -364,6 +404,11 @@ def fit_gbm(perday: list[tuple], min_train: int,
             "breakeven_p": round(_breakeven, 4),
             "iso_x": np.round(iso_x, 6).tolist(),
             "iso_y": np.round(iso_y, 6).tolist(),
+            "va": va_payload, "feat_alive": feat_alive,
+            "va_mean_width": (None if _va_width != _va_width
+                              else round(_va_width, 5)),
+            "va_brier_merged": (None if _va_brier != _va_brier
+                                else round(_va_brier, 5)),
             "bins": bins, "n": n,
             "base_rate": round(float(Y.mean()), 4),
             "oof_brier_raw": round(brier_raw, 5),
@@ -381,11 +426,10 @@ _BOOSTERS: dict = {}
 _XDIM_WARNED: dict = {}   # (expected, got) -> last-logged ts (throttle)
 
 
-def score_vec(meta: dict, x: np.ndarray,
-              clamp: bool = True) -> float | None:
-    """Serve-time scorer for engine:'gbm' artifacts — lazy-cached booster,
-    isotonic map, floor/cap clamp. Returns None if the booster is missing so
-    the caller can degrade exactly as with no meta at all."""
+def _raw_score(meta: dict, x: np.ndarray) -> float | None:
+    """Booster load + integrity guards + raw prediction. Shared by the
+    legacy point scorer (score_vec) and the v3 interval scorer
+    (score_interval) so the guard rails can never drift apart."""
     try:
         import lightgbm as lgb
     except Exception:                                     # noqa: BLE001
@@ -466,6 +510,17 @@ def score_vec(meta: dict, x: np.ndarray,
         log.error("meta scoring failed (%s) — returning None so the gate "
                   "falls back to the conviction bar", e)
         return None
+    return p_raw
+
+
+def score_vec(meta: dict, x: np.ndarray,
+              clamp: bool = True) -> float | None:
+    """Serve-time scorer for engine:'gbm' artifacts — lazy-cached booster,
+    isotonic map, floor/cap clamp. Returns None if the booster is missing so
+    the caller can degrade exactly as with no meta at all."""
+    p_raw = _raw_score(meta, x)
+    if p_raw is None:
+        return None
     p_cal = float(np.interp(p_raw, np.asarray(meta["iso_x"], float),
                             np.asarray(meta["iso_y"], float)))
     if getattr(config, "META_USE_PLO", False):
@@ -484,3 +539,31 @@ def score_vec(meta: dict, x: np.ndarray,
         # diagnosis must see the true calibrated value.
         return float(p_cal)
     return float(min(max(p_cal, config.META_P_FLOOR), config.META_P_CAP))
+
+
+# ---------------------------------------------------------------------------
+# v9.9 META-GATE v3 serving: Venn-Abers interval + feature-skew status.
+# ---------------------------------------------------------------------------
+_INTEGRITY: dict = {}    # artifact ts -> FeatureIntegrity (one live model)
+
+
+def score_interval(meta: dict, x: np.ndarray
+                   ) -> tuple[float, float, float, str] | None:
+    """Returns (p0, p1, p_merged, integrity_status) or None when the
+    artifact has no VA payload / booster is unavailable — the caller
+    falls back to the legacy point gate, fail-open."""
+    from core import meta_gate as MGT
+    va = MGT.va_from_artifact(meta)
+    if va is None:
+        return None
+    p_raw = _raw_score(meta, x)
+    if p_raw is None:
+        return None
+    key = float(meta.get("ts", 0.0))
+    fi = _INTEGRITY.get(key)
+    if fi is None:
+        _INTEGRITY.clear()
+        fi = _INTEGRITY[key] = MGT.FeatureIntegrity()
+    status = fi.observe(np.asarray(x, np.float32), meta.get("feat_alive"))
+    p0, p1 = va.interval(float(p_raw))
+    return p0, p1, MGT.VennAbers.merge(p0, p1), status

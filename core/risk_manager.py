@@ -216,7 +216,8 @@ class RiskGovernor:
                       exchange: str | None = None, price: float | None = None,
                       ann_vol: float | None = None,
                       lockout_bypass: bool = False,
-                      curfew_hm: str | None = None) -> TradePermit:
+                      curfew_hm: str | None = None,
+                      probe: bool = False) -> TradePermit:
         ts = ts or time.time()
         if self.halted:
             return TradePermit(False, f"halted: {self.halt_reason}")
@@ -246,6 +247,21 @@ class RiskGovernor:
         kelly = max(win_prob - (1 - win_prob) / b, 0.0)
         budget = min(self.equity() * config.MAX_KELLY_BUDGET_PCT,
                      self.equity() * kelly * config.KELLY_FRACTION)
+        if probe:
+            # v9.9 META-GATE v3 PROBE: the EV zone is AMBIGUOUS — the model
+            # cannot rule the edge in or out, so Kelly on the point estimate
+            # is meaningless (≈0 by construction). A probe buys INFORMATION
+            # at minimum size instead of asserting ignorance as "no". It
+            # bypasses ONLY the Kelly-zero veto; curfew, cooldown, lockout,
+            # concurrency, disaster floor, cash — every other law still
+            # applies — and it is bounded by its OWN hard daily ledger:
+            # ≤ META_PROBE_MAX_PER_DAY probes, Σ worst-case loss ≤
+            # META_PROBE_MAX_DAY_RISK_PCT of equity. Paper and live alike.
+            _ok, _why = self._probe_ledger_check(
+                premium * lot * max(sl_pct, 1e-3) * 1.02)   # +cost buffer
+            if not _ok:
+                return TradePermit(False, _why)
+            budget = self.equity() * config.MAX_KELLY_BUDGET_PCT
         if ann_vol:        # volatility-managed sizing: hot vol → smaller bets
             budget *= float(min(max(config.VOL_TARGET_ANN / max(ann_vol, 1e-3),
                                     config.VOL_SCALE_MIN), 1.0))
@@ -285,7 +301,54 @@ class RiskGovernor:
             return TradePermit(False,
                 f"disaster-floor loss ₹{worst:,.0f} > "
                 f"{config.MAX_LOSS_PER_TRADE_PCT:.0%} of capital — cannot HOLD this")
+        if probe:
+            self._probe_ledger_commit(premium * lot * max(sl_pct, 1e-3) * 1.02)
         return TradePermit(True, "approved", qty=lot, lots=1, budget=budget)
+
+    # ------------------------------------------- v9.9 probe daily ledger
+    def _probe_ledger(self) -> dict:
+        import json as _json
+        import datetime as _dt
+        path = getattr(config, "META_PROBE_STATE", None)
+        today = _dt.date.today().isoformat()
+        j = {}
+        if path is not None:
+            try:
+                j = _json.loads(path.read_text())
+            except Exception:                              # noqa: BLE001
+                j = {}
+        if j.get("day") != today:
+            j = {"day": today, "count": 0, "risk": 0.0}
+        return j
+
+    def _probe_ledger_check(self, worst_loss: float) -> tuple[bool, str]:
+        j = self._probe_ledger()
+        cap_n = int(getattr(config, "META_PROBE_MAX_PER_DAY", 3))
+        cap_r = (self.equity()
+                 * float(getattr(config, "META_PROBE_MAX_DAY_RISK_PCT", 0.02)))
+        if j["count"] >= cap_n:
+            return False, (f"probe budget exhausted: {j['count']}/{cap_n} "
+                           f"probes today")
+        if j["risk"] + worst_loss > cap_r:
+            return False, (f"probe risk budget exhausted: ₹{j['risk']:,.0f}"
+                           f"+₹{worst_loss:,.0f} > ₹{cap_r:,.0f} daily cap")
+        return True, "probe within budget"
+
+    def _probe_ledger_commit(self, worst_loss: float) -> None:
+        import json as _json
+        path = getattr(config, "META_PROBE_STATE", None)
+        if path is None:
+            return
+        j = self._probe_ledger()
+        j["count"] = int(j["count"]) + 1
+        j["risk"] = float(j["risk"]) + float(worst_loss)
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(_json.dumps(j))
+            import os as _os
+            _os.replace(tmp, path)
+        except Exception as e:                             # noqa: BLE001
+            log.warning("probe ledger write failed (%s)", e)
 
     # --------------------------------------------- affordability walker
     def first_affordable(self, hierarchy: list[dict], **kw) -> tuple[dict | None,

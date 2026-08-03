@@ -161,7 +161,26 @@ def main():
                  {k: entry[k] for k in entry if k != "n_ticks"} or "defaults")
 
     out = config.LOG_DIR / "calibration.json"
-    _atomic_write_json(out, calib)
+    # v9.9.5 BUGFIX: calibration.json is a SHARED artifact — Track-A
+    # (commodity_backfill) and Track-B (commodity_calibration) merge their
+    # sections into it, but this writer rebuilt the file from scratch. While
+    # the chain was serial and commodities ran last, the clobber was
+    # invisible. Under the parallel evidence group this writer finished last
+    # on 2026-08-02 and ERASED every commodity calibration: the 12:17 artifact
+    # carries NIFTY/BANKNIFTY/SENSEX only — no CRUDEOIL, NATURALGAS, GOLD,
+    # SILVER, COPPER, no commodities_daily. The commodity brain hot-reloads
+    # this file, so it lost its ATR proxies and toxicity thresholds silently.
+    # Merge now: own the index entries, preserve everything else.
+    try:
+        existing = json.loads(out.read_text())
+    except Exception:                                          # noqa: BLE001
+        existing = {}
+    merged = dict(existing)
+    merged.update({k: v for k, v in calib.items() if k != "indices"})
+    idx_all = dict(existing.get("indices") or {})
+    idx_all.update(calib.get("indices") or {})
+    merged["indices"] = idx_all
+    _atomic_write_json(out, merged)
     log.info("calibration artifact → %s (brain hot-reloads this)", out)
 
 
