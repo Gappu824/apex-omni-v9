@@ -64,6 +64,8 @@ from core.risk_manager import RiskGovernor, TradePermit
 from core.trap_shield import TrapShield, TrapSignals
 from core.quant_core import expected_move, micro_price
 
+from core import position_store as PS
+
 log = logging.getLogger("pm")
 
 
@@ -200,6 +202,12 @@ class Position:
     _dyn_tp_pct: float = 0.0      # vault-calibrated vol-scaled target fraction
     _dyn_src: str = ""            # provenance of the dynamic stop/target
     meta_gate_zone: str = ""      # v9.9: FULL | PROBE | MONITOR ("" = legacy)
+    post_auction: bool = False    # v9.9.12: 15:35-15:40 regime, own physics
+    last_mark: float = 0.0        # v9.9.16: last price the MARKET produced
+    last_mark_ts: float = 0.0
+    mark_stale: bool = False
+    cas_preprint: bool = False    # v9.9.15: entered 15:15-15:35, carried
+    #                               THROUGH the print — its own ladder
     pnl_realized: float = 0.0     # v9.9: cumulative net PnL across partials
 
 
@@ -278,7 +286,11 @@ class PositionManager:
             data_age_s=ctx.data_age_s, now_hm=ctx.hm, ts=ctx.ts,
             ann_vol=ctx.atm_iv or None,
             lockout_bypass=bool(getattr(ctx, "lockout_bypass", False)),
-            curfew_hm=getattr(self, "curfew_hm", None))
+            # v9.9.12: prefer the per-session curfew the brain computes
+            # from the session calendar (it moved to 15:35 on 2026-08-03);
+            # fall back to any PM-level value, then to the config default.
+            curfew_hm=(getattr(ctx, "curfew_hm", None)
+                       or getattr(self, "curfew_hm", None)))
         if leg is None:
             self._log(ts=ctx.ts, event="BLOCKED", index=self.index,
                       direction=direction, reason=permit.reason,
@@ -407,6 +419,34 @@ class PositionManager:
                      order_id=fill.order_id, n_buy_orders=max(fill.n_orders, 1),
                      dte=float(q.dte))
         p.meta_gate_zone = meta_zone
+        # v9.9.12: a trade opened in the 15:35-15:40 window lives under
+        # POST-AUCTION physics — a 4-minute budget, a spread-aware target
+        # and a no-dwell ratchet. Running it on 60-minute constants would
+        # give it a target it cannot reach and a hard-flat that already
+        # passed. TrapShield and the risk constitution are unchanged.
+        try:
+            from core import session_calendar as _SCP
+            p.post_auction = bool(_SCP.in_post_auction(ctx.ts,
+                                                       index=self.index))
+        except Exception:                                  # noqa: BLE001
+            p.post_auction = False
+        try:
+            p.cas_preprint = bool(_SCP.cas_phase(ctx.ts, index=self.index)
+                                  in ("CAS_REFERENCE", "CAS_ENTRY",
+                                      "CAS_LIMIT_ONLY"))
+        except Exception:                                  # noqa: BLE001
+            p.cas_preprint = False
+        if p.post_auction or p.cas_preprint:
+            from core import post_auction as _PAX
+            _g = _PAX.load()
+            if _g.tp_pct > 0:
+                p.target = fill.avg_price * (1.0 + _g.tp_pct)
+                p.stop = fill.avg_price * (1.0 - _g.sl_pct)
+                log.info("POST-AUCTION position: target %.2f (+%.1f%%) "
+                         "stop %.2f (-%.1f%%) hold %.0fm flat %s",
+                         p.target, 100 * _g.tp_pct, p.stop,
+                         100 * _g.sl_pct, _g.hold_minutes, _g.flat_hm)
+        PS.save(self.index, p)          # v9.9.6: durable from birth
         p._dyn_tp_pct = _dyn_tp_pct        # vol-scaled target (0 ⇒ base)
         p._dyn_src = _dyn_src
         # v9.7.1 fast lane: a genuinely high-conviction entry qualifies for the
@@ -466,10 +506,21 @@ class PositionManager:
         # railed at DYN_TP_MAX but a wall/em target could plant +547%. One
         # rail for every path: a target the payoff can't plausibly reach is
         # not a target, it is a disabled exit.
+        # v9.9.16 — THE TARGET LOGIC WAS BACKWARDS. It took the LARGER of
+        # (runway capped at DYN_TP_MAX) and (vault-calibrated target), so
+        # whenever the wall was far the cap became the target: 2026-08-06
+        # planted +120% on a 5-DTE ATM call, exactly as 2026-08-03 planted
+        # +120% on a SENSEX put. DYN_TP_MAX is a CEILING, never a goal.
+        # The vault-calibrated target leads; the runway may EXTEND it, but
+        # only by a bounded multiple and never past the ceiling. The
+        # extendable-target machinery already pushes further when price
+        # actually travels — that is where reaching for the wall belongs,
+        # after the move proves itself, not planted at entry.
         _tp_cap = float(getattr(config, "DYN_TP_MAX", 1.20))
-        p.target = fill.avg_price + max(
-            min(prem_room, fill.avg_price * _tp_cap),
-            fill.avg_price * _tp_floor)
+        _ext = float(getattr(config, "DYN_TP_EXTEND_MULT", 2.0))
+        _base_tp = fill.avg_price * _tp_floor
+        _reach = min(prem_room, _base_tp * _ext, fill.avg_price * _tp_cap)
+        p.target = fill.avg_price + max(_base_tp, _reach)
         p.peak = fill.avg_price
         p.peak_ts = float(ctx.ts)
         p.shield = TrapShield(direction)
@@ -515,8 +566,38 @@ class PositionManager:
         if p is None:
             return None
         bid = float(quote.get("bid") or 0)
-        ltp = float(quote.get("ltp") or bid or p.entry)
+        # v9.9.16 STALE-MARK SAFETY. This fell back to p.entry when the
+        # quote was empty, so on 2026-08-06 a position with failing quotes
+        # logged "mark 51.45 (entry 51.45) | uPnL +0" every tick while the
+        # option actually traded elsewhere. A mark fabricated AT ENTRY can
+        # never breach a stop, never arm a trail and never hit a target:
+        # the position looked healthy and was in fact unmanaged. Now the
+        # last REAL mark is carried, and if there has never been one the
+        # position is flagged stale and only the constitution (EOD, stale-
+        # feed flatten) may act — no profit rule is allowed to run on a
+        # number the market did not produce.
+        ltp = float(quote.get("ltp") or 0)
         mark = bid if bid > 0 else ltp
+        if mark > 0:
+            p.last_mark = mark
+            p.last_mark_ts = float(ctx.ts)
+        else:
+            mark = float(getattr(p, "last_mark", 0.0) or 0.0)
+            _age = float(ctx.ts) - float(getattr(p, "last_mark_ts", 0.0) or 0)
+            if mark <= 0:
+                log.warning("%s: no real mark yet for %s — holding under "
+                            "constitution only (no stop/target/trail can be "
+                            "evaluated on a fabricated price)",
+                            self.index, p.symbol)
+                mark = p.entry
+                p.mark_stale = True
+            else:
+                p.mark_stale = _age > float(getattr(
+                    config, "MARK_STALE_WARN_S", 15))
+                if p.mark_stale:
+                    log.warning("%s: mark for %s is %.0fs stale — exits run "
+                                "on the last real price, not a guess",
+                                self.index, p.symbol, _age)
         upnl = (mark - p.entry) * p.qty
         upnl_pct = (mark / p.entry - 1.0) * 100 if p.entry else 0.0
         # distance to the rungs that matter, as % of premium
@@ -564,6 +645,53 @@ class PositionManager:
                 f"target {p.target:.2f} (+{to_tgt:.0f}%) | {armed}{lock}{tvs} | "
                 f"held {held_s:.0f}s | OIΔ {oi:+.2%}{trap}{wp}")
 
+    def _snap(self) -> None:
+        """v9.9.6: called after every manage() pass. The ratchet, the
+        extended target and the dwell clocks all move DURING a trade;
+        a snapshot taken only at entry would restore a stale exit stack
+        and re-risk profit the trail had already locked."""
+        if self.pos is not None:
+            PS.save(self.index, self.pos)
+
+    def restore(self, broker_symbols=None):
+        """Rebuild an open Position after a restart. Returns the symbol
+        restored, or None. Risk is NOT re-charged — the daily ledger is
+        durable and already booked this trade at entry."""
+        j = PS.load(self.index, broker_symbols)
+        if not j:
+            return None
+        try:
+            p = Position(**{k: v for k, v in j.items()
+                            if not k.startswith("_")})
+        except Exception as e:                             # noqa: BLE001
+            log.error("could not rebuild %s position from snapshot (%s) — "
+                      "starting flat", self.index, e)
+            PS.clear(self.index)
+            return None
+        # transient machinery is rebuilt, never restored: a TrapShield or
+        # a trail carries live tape state that is meaningless after a gap.
+        try:
+            p.shield = TrapShield()
+        except Exception:                                  # noqa: BLE001
+            p.shield = None
+        p.trail = None
+        self.pos = p
+        return p.symbol
+
+    def _post_auction_exit(self, ctx, mark: float) -> str | None:
+        """The 5-minute ladder, consulted BEFORE the 60-minute stack for a
+        post-auction position. Returns an exit reason or None."""
+        p = self.pos
+        if p is None or not getattr(p, "post_auction", False):
+            return None
+        from core import post_auction as _PAX
+        held_min = max((float(ctx.ts) - float(p.entry_ts)) / 60.0, 0.0)
+        import datetime as _d
+        now_hm = _d.datetime.fromtimestamp(float(ctx.ts)).strftime("%H:%M")
+        go, why = _PAX.exit_decision(p.entry, mark, max(p.peak, mark),
+                                     held_min, now_hm)
+        return why if go else None
+
     def manage(self, ctx: TickContext, quote: dict) -> str | None:
         p = self.pos
         if p is None:
@@ -571,8 +699,58 @@ class PositionManager:
         p.shield.observe(ctx.spot_velocity_1s)
         bid = float(quote.get("bid") or 0)
         ask = float(quote.get("ask") or 0)
-        ltp = float(quote.get("ltp") or bid or p.entry)
+        # v9.9.16 STALE-MARK SAFETY. This fell back to p.entry when the
+        # quote was empty, so on 2026-08-06 a position with failing quotes
+        # logged "mark 51.45 (entry 51.45) | uPnL +0" every tick while the
+        # option actually traded elsewhere. A mark fabricated AT ENTRY can
+        # never breach a stop, never arm a trail and never hit a target:
+        # the position looked healthy and was in fact unmanaged. Now the
+        # last REAL mark is carried, and if there has never been one the
+        # position is flagged stale and only the constitution (EOD, stale-
+        # feed flatten) may act — no profit rule is allowed to run on a
+        # number the market did not produce.
+        ltp = float(quote.get("ltp") or 0)
         mark = bid if bid > 0 else ltp
+        if mark > 0:
+            p.last_mark = mark
+            p.last_mark_ts = float(ctx.ts)
+        else:
+            mark = float(getattr(p, "last_mark", 0.0) or 0.0)
+            _age = float(ctx.ts) - float(getattr(p, "last_mark_ts", 0.0) or 0)
+            if mark <= 0:
+                log.warning("%s: no real mark yet for %s — holding under "
+                            "constitution only (no stop/target/trail can be "
+                            "evaluated on a fabricated price)",
+                            self.index, p.symbol)
+                mark = p.entry
+                p.mark_stale = True
+            else:
+                p.mark_stale = _age > float(getattr(
+                    config, "MARK_STALE_WARN_S", 15))
+                if p.mark_stale:
+                    log.warning("%s: mark for %s is %.0fs stale — exits run "
+                                "on the last real price, not a guess",
+                                self.index, p.symbol, _age)
+        # v9.9.14: a post-auction position lives on the 5-minute ladder and
+        # must be asked FIRST — the 60-minute stack below would hold it past
+        # the bell. The method existed but nothing called it.
+        if getattr(p, "cas_preprint", False):
+            from core import cas_capture as _CCX
+            from core import session_calendar as _SCX
+            import datetime as _dd
+            _hm = _dd.datetime.fromtimestamp(float(ctx.ts)).strftime("%H:%M")
+            _go, _w = _CCX.preprint_exit_decision(
+                p.entry, mark, max(p.peak, mark), _hm,
+                _SCX.cas_phase(ctx.ts, index=self.index))
+            if _go:
+                return self._exit(ctx, quote, _w,
+                                  urgent=_w.endswith(("BELL", "FLOOR",
+                                                      "STOP")))
+            return None                 # carry into the print, no other rule
+        _pa_exit = self._post_auction_exit(ctx, mark)
+        if _pa_exit:
+            return self._exit(ctx, quote, _pa_exit,
+                              urgent=_pa_exit.endswith(("BELL", "STOP")))
         if mark > p.peak:                       # raw peak + WHEN it moved
             p.peak = mark
             p.peak_ts = float(ctx.ts)
@@ -621,7 +799,21 @@ class PositionManager:
             return self._exit(ctx, quote, "PROFIT_LOCK", urgent=True)
         # 2) EOD — AUDIT S2-F1: the equity 15:15 string flattened a commodity
         # with 8h of MCX session left. Each book passes ITS OWN flatten time.
-        _flat = getattr(self, "flatten_hm", None) or config.FORCE_FLATTEN_AT
+        # v9.9.14: the flatten time is PER POSITION, not per book. A normal
+        # 60-minute trade still flattens at FORCE_FLATTEN_AT (15:15, safely
+        # before the broker's F&O MIS auto square-off) — but a POST-AUCTION
+        # position is born at 15:36 and must be allowed to live to its own
+        # bell. Using one book-level time would either kill the new regime
+        # or hold ordinary positions 24 minutes past their intended flatten.
+        if getattr(p, "post_auction", False) or getattr(p, "cas_preprint",
+                                                        False):
+            # a pre-print position MUST survive to the print and beyond;
+            # the 15:15 book flatten would kill it before the event it was
+            # opened for.
+            _flat = str(getattr(config, "POST_AUCTION_FLAT_HM", "15:39"))
+        else:
+            _flat = (getattr(self, "flatten_hm", None)
+                     or config.FORCE_FLATTEN_AT)
         if ctx.hm >= _flat:
             return self._exit(ctx, quote, "EOD_FLATTEN", urgent=True)
         # 3) stale feed
@@ -900,6 +1092,7 @@ class PositionManager:
                                  n_sell_orders=max(fill.n_orders, 1))
         pnl = sold_value - buy_value - costs
         p.pnl_realized += pnl
+        PS.save(self.index, p)          # v9.9.6: partial exits are durable
         # ★ audit fix: log BEFORE clearing any state — symbol never None again
         self._log(ts=ctx.ts, event="SELL_FILL", index=self.index,
                   symbol=p.symbol, direction=p.direction, qty=fill.qty,
@@ -934,5 +1127,6 @@ class PositionManager:
                                    p.meta_gate_zone)
             except Exception as _e:                        # noqa: BLE001
                 log.warning("meta-close callback failed (%s)", _e)
+        PS.clear(self.index)            # v9.9.6: flat ⇒ the snapshot is a lie
         self.pos = None
         return reason

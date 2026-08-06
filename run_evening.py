@@ -31,6 +31,7 @@ steps — 0 is a clean evening. --serial reproduces the legacy one-at-a-
 time behaviour with identical ordering.
 """
 import argparse
+import json
 import os
 import subprocess
 import threading
@@ -73,7 +74,16 @@ GROUPS = [
                           # system carries, did it make ranking and rupees
                           # better, worse, or is the vault still too thin
                           # to say? Paired on real days, FDR-corrected.
-                          "tools/ab_ablation.py"]),
+                          "tools/ab_ablation.py",
+                          # v9.9.10: what did each REAL fill leave on the
+                          # table, and which exit rule would have left
+                          # less? MFE/MAE capture + paired counterfactual
+                          # exit policies over the whole session.
+                          "tools/trade_potential.py",
+                          # v9.9.12: measures the 15:35-15:40 window and
+                          # OPENS it once a week of data proves the median
+                          # move can pay the spread at 2:1 odds.
+                          "tools/post_auction_calibrate.py"]),
     # v9.9.3: the analyst runs LAST — its brief can now digest the forge
     # verdicts and the ₹ exam, and its model no longer squats in RAM ahead
     # of the heaviest stages.
@@ -81,6 +91,49 @@ GROUPS = [
 ]
 
 LOG_DIR = Path("logs/evening")
+TIMINGS = Path("state/evening_timings.json")
+
+
+def _load_timings() -> dict:
+    try:
+        return json.loads(TIMINGS.read_text(encoding="utf-8"))
+    except Exception:                                      # noqa: BLE001
+        return {}
+
+
+def _save_timings(results, prev: dict) -> None:
+    """Exponentially-smoothed per-step durations. Smoothing (α=0.4) keeps
+    one anomalous night from re-ordering everything, while still tracking
+    a tool that genuinely got faster."""
+    out = dict(prev)
+    for script, _rc, dt in results:
+        k = Path(script).stem
+        out[k] = round(0.4 * float(dt) + 0.6 * float(out.get(k, dt)), 1)
+    try:
+        TIMINGS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TIMINGS.with_name(f"{TIMINGS.stem}.{os.getpid()}.tmp.json")
+        tmp.write_text(json.dumps(out, indent=1), encoding="utf-8")
+        os.replace(tmp, TIMINGS)
+    except Exception as e:                                 # noqa: BLE001
+        print(f"[warn] could not persist step timings: {e}", flush=True)
+
+
+def _lpt_order(steps: list[str], timings: dict) -> list[str]:
+    """Longest-Processing-Time-first (Graham 1969).
+
+    v9.9.8. On 2026-08-03 the derived group ran [rvnet 3449s, toxicity
+    4697s, epistemic 0s, fast_lane 11982s] two-at-a-time in LIST order.
+    fast_lane — the longest job by a factor of three — was picked up
+    LAST, at t=3449, so the group ended at 15431s instead of the 11982s
+    its own critical path required: 57 minutes of two-slot machine idling
+    behind one long tail. Scheduling the longest job first is the classic
+    fix and carries a proven makespan bound of (4/3 − 1/3m) × optimal.
+    A step with no history sorts FIRST (assumed long), so a newly added
+    tool is never starved at the end of a group.
+    """
+    return sorted(steps,
+                  key=lambda s_: -float(timings.get(Path(s_).stem,
+                                                    float("inf"))))
 _PRINT_LOCK = threading.Lock()
 _MASTER = None          # every console line also lands here
 
@@ -161,6 +214,7 @@ def main() -> int:
             print(f"[{name:8s}] {mode:12s} {', '.join(steps)}")
         return 0
     global _MASTER
+    _timings = _load_timings()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     _MASTER = (LOG_DIR / "_evening.log").open("a", encoding="utf-8",
                                               errors="replace")
@@ -176,8 +230,13 @@ def main() -> int:
         if par and not a.serial and len(steps) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             share = _inner_share(a.jobs)
+            steps = _lpt_order(steps, _timings)
+            _known = [f"{Path(x).stem} {_timings[Path(x).stem] / 60:.0f}m"
+                      for x in steps if Path(x).stem in _timings]
             emit(f"      {a.jobs} tool(s) at a time, {share} day-worker(s) "
                  f"each (machine-wide RAM cap respected)")
+            emit(f"      longest-first order: "
+                 f"{', '.join(_known) if _known else 'no history yet'}")
             with ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
                 futs = {}
                 for s_ in steps:
@@ -208,6 +267,7 @@ def main() -> int:
         emit(f"{stem:32s} {rc:3d} {dt / 60:7.1f}   "
              f"logs/evening/{stem}.log"
              + ("   <<< FAILED" if rc else ""))
+    _save_timings(results, _timings)
     emit(f"master log: logs/evening/_evening.log")
     if _MASTER is not None:
         _MASTER.close()

@@ -104,6 +104,14 @@ def load_commodity_meta():
         if p.exists():
             j = json.loads(p.read_text())
             _ah = j.get("config_hash")     # v9.9.1: same fail-closed rule
+            _auc_c = j.get("auc_cal", j.get("auc"))
+            _bar_c = float(getattr(config, "META_MIN_AUC", 0.52))
+            if _auc_c is None or float(_auc_c) < _bar_c:   # v9.9.9: same
+                log.error("commodity meta REJECTED: recorded AUC %s < %.2f "
+                          "— never demonstrated ranking ability; heuristic "
+                          "only.", "absent" if _auc_c is None
+                          else f"{float(_auc_c):.4f}", _bar_c)
+                return None
             if _ah and _ah != config.CONFIG_HASH:   # as the equity loader
                 log.error("commodity meta REJECTED: trained under config "
                           "%s, running %s — heuristic-only until the "

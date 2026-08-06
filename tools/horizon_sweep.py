@@ -112,12 +112,28 @@ def _evaluate(hold_min: int, perday, Y, W, SD) -> dict | None:
     d = SD[m]
     auc, ci_lo, p = CL.cluster_bootstrap_auc_p(
         s, y, d, n_boot=int(getattr(config, "HORIZON_BOOT", 1500)))
-    cap = CL.assess(y, W[m], d)
+    # v9.9.7: PER-DAY AUC as well, so horizons can be compared PAIRED — each
+    # day is its own control. The absolute figures stay for context.
+    per_day = {}
+    for dd in np.unique(d):
+        sel = d == dd
+        yy = y[sel]
+        if yy.size < 4 or yy.min() == yy.max():
+            continue
+        per_day[str(dd)] = float(_auc_np(s[sel], yy))
     return {"hold_min": hold_min, "n": int(y.size), "days": int(len(perday)),
             "base_rate": round(float(y.mean()), 4),
             "auc": round(float(auc), 4), "auc_ci90_lo": round(float(ci_lo), 4),
-            "p_one_sided": round(float(p), 5),
-            "mde_auc": round(cap.mde_auc, 4), "stage": cap.stage}
+            "p_one_sided": round(float(p), 5), "_per_day": per_day}
+
+
+def _auc_np(scores, y) -> float:
+    pos, neg = scores[y > 0.5], scores[y <= 0.5]
+    if pos.size == 0 or neg.size == 0:
+        return float("nan")
+    r = np.argsort(np.argsort(np.concatenate([pos, neg]))) + 1.0
+    return float((r[:pos.size].sum() - pos.size * (pos.size + 1) / 2.0)
+                 / (pos.size * neg.size))
 
 
 def _history() -> list[dict]:
@@ -178,15 +194,22 @@ def main() -> int:
                  "promotion-grade power at the current sample rate "
                  "(%.0f/day)", cap.stage, cap.days_to_promote_power,
                  cap.samples_per_day)
-        if not cap.allows("SCREEN"):
-            log.warning("STAGE %s — the smallest AUC this vault can "
-                        "separate from chance is %.3f. Sweeping horizons "
-                        "now would report its own noise floor. Refusing; "
-                        "re-run when the vault is ~%d day(s) deeper.",
-                        cap.stage, cap.mde_auc, cap.days_to_promote_power)
-            _write(days, cap, [], None, "refused: underpowered (STAGE "
-                   + cap.stage + ")")
+        # v9.9.7: the horizon question is COMPARATIVE — "is 90 better than
+        # 60?" — so it is gated on the stratified resolution, not the
+        # pooled one. On 2026-08-04 the pooled gate (0.729) refused work
+        # that ab_ablation was resolving to 0.03 the same night.
+        if not cap.allows_comparative("SCREEN"):
+            log.warning("COMPARATIVE STAGE %s — even a paired, day-matched "
+                        "comparison can only resolve %.3f here. Refusing; "
+                        "a sweep now would report its own noise floor.",
+                        cap.stage_comparative, cap.mde_auc_within)
+            _write(days, cap, [], None, "refused: underpowered (comparative "
+                   "STAGE " + cap.stage_comparative + ")")
             return 0
+        log.info("GATE | comparative stage %s (stratified resolution %.3f) "
+                 "— pooled stage is %s (%.3f), which governs ABSOLUTE "
+                 "claims only", cap.stage_comparative, cap.mde_auc_within,
+                 cap.stage, cap.mde_auc)
 
         cands = [int(h) for h in getattr(
             config, "HORIZON_CANDIDATES", [20, 30, 45, 60, 90, 120])]
@@ -226,26 +249,50 @@ def main() -> int:
     # ---- gate 3: FDR across the horizons actually tested
     live = [r for r in rows if not r.get("skipped")]
     winner = None
-    if live:
+    inc = next((r for r in live
+                if r["hold_min"] == int(config.MAX_HOLD_MINUTES)), None)
+    if live and inc:
+        # v9.9.7 PAIRED SELECTION: per-day ΔAUC against the INCUMBENT
+        # horizon, day-cluster bootstrap + sign-flip permutation, then BH
+        # across the challengers. A challenger must beat 60 minutes on the
+        # same days — not merely beat chance on its own.
+        chall = [r for r in live if r is not inc]
+        for r in chall:
+            d = {k: r["_per_day"][k] - inc["_per_day"][k]
+                 for k in r["_per_day"] if k in inc["_per_day"]}
+            st = CL.paired_test(d, n_boot=int(getattr(config,
+                                                      "HORIZON_BOOT", 1500)))
+            r["delta_vs_incumbent"] = {k: (round(v, 5)
+                                           if isinstance(v, float) else v)
+                                       for k, v in st.items()
+                                       if k != "ci90"}
+            r["delta_vs_incumbent"]["ci90"] = st["ci90"]
+            log.info("  %3d vs %3d min: ΔAUC %+.4f (CI90 %+.4f..%+.4f, "
+                     "p=%.3f, resolvable %.4f over %d day(s))",
+                     r["hold_min"], inc["hold_min"], st["mean"],
+                     st["ci90"][0], st["ci90"][1], st["p"],
+                     st.get("mde", float("nan")), st["n_days"])
         rej, adj = CL.benjamini_hochberg(
-            [r["p_one_sided"] for r in live],
+            [r["delta_vs_incumbent"]["p"] for r in chall],
             float(getattr(config, "DISCOVERY_FDR_Q", 0.10)))
-        for r, ok_, q_ in zip(live, rej, adj):
+        for r, ok_, q_ in zip(chall, rej, adj):
             r["p_adj_bh"] = round(float(q_), 5)
             r["survives_fdr"] = bool(ok_)
-        passing = [r for r in live if r["survives_fdr"]
-                   and r["auc"] >= config.META_MIN_AUC]
+        inc["survives_fdr"] = False
+        passing = [r for r in chall if r["survives_fdr"]
+                   and r["delta_vs_incumbent"]["mean"] > 0]
         if passing:
-            winner = max(passing, key=lambda r: r["auc"])
+            winner = max(passing,
+                         key=lambda r: r["delta_vs_incumbent"]["mean"])
             log.info("FDR survivor(s): %s | best %d min AUC %.4f "
                      "(q=%.4f)", [r["hold_min"] for r in passing],
                      winner["hold_min"], winner["auc"], winner["p_adj_bh"])
         else:
-            log.info("NO horizon clears BH-FDR q=%.2f AND the promotion "
-                     "bar %.2f. The 60-minute null stands — this is a "
+            log.info("NO challenger beats the incumbent after BH-FDR "
+                     "q=%.2f (bar %.2f). The %d-minute null stands — a "
                      "recorded result, not a failure.",
                      float(getattr(config, "DISCOVERY_FDR_Q", 0.10)),
-                     config.META_MIN_AUC)
+                     config.META_MIN_AUC, int(config.MAX_HOLD_MINUTES))
 
     # ---- gate 4: a winner must REPEAT before it may change live behaviour
     verdict = "no winner"

@@ -143,7 +143,18 @@ def main() -> int:
 
     cap = CL.assess(Y, W, SD)
     log.info("LADDER | %s", cap.reason)
-    if not cap.allows("DISCOVER"):
+    # v9.9.7: two lenses, two gates. UNIVARIATE asks an absolute question
+    # ("does this feature rank better than chance?") and pays the pooled
+    # penalty. ABLATION asks a paired one ("does dropping it change the
+    # model on the same days?") and is gated on the stratified resolution.
+    do_uni = cap.allows("DISCOVER")
+    do_abl = cap.allows_comparative("DISCOVER")
+    log.info("GATE | univariate %s (pooled %.3f, stage %s) | ablation %s "
+             "(stratified %.3f, stage %s)",
+             "ON" if do_uni else "OFF", cap.mde_auc, cap.stage,
+             "ON" if do_abl else "OFF", cap.mde_auc_within,
+             cap.stage_comparative)
+    if not do_uni and not do_abl:
         log.warning("STAGE %s — per-feature effects are smaller than this "
                     "vault's resolution (%.3f). Screening 64 features now "
                     "would yield ~%.0f false leads at q=%.2f and nothing "
@@ -158,6 +169,9 @@ def main() -> int:
 
     dim = X.shape[1]
     grp = _groups(dim)
+    if not do_uni:
+        log.info("univariate screen SKIPPED (pooled resolution %.3f) — "
+                 "running the paired ablation only", cap.mde_auc)
     log.info("screening %d feature(s) in %d group(s) over %d day(s), "
              "n=%d", dim, len(grp), len(perday), Y.size)
 
@@ -175,7 +189,7 @@ def main() -> int:
 
     # ---- lens A: univariate, day-clustered
     uni = []
-    for j in range(dim):
+    for j in (range(dim) if do_uni else []):
         col = X[:, j]
         if not np.isfinite(col).all() or float(np.nanstd(col)) < 1e-12:
             uni.append({"feature": j, "auc": float("nan"),
@@ -211,6 +225,12 @@ def main() -> int:
                  "correction — recorded as the null at this depth")
 
     # ---- lens B: group ablation
+    if not do_abl:
+        log.info("ablation SKIPPED (stratified resolution %.3f)",
+                 cap.mde_auc_within)
+        _write(cap, uni, [], f"{len(hits)} univariate survivor(s); "
+               f"ablation gated off")
+        return 0
     full = _oof_auc(perday, SD)
     log.info("ABLATION | full-model OOF AUC %.4f", full)
     abl = []

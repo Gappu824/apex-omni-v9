@@ -44,8 +44,29 @@ def _hm_to_sod(hm: str) -> int:
 
 
 def _equity_window() -> tuple[int, int]:
+    """v9.9.12 — THE DATA-CAPTURE FIX.
+
+    This read the legacy 15:30 constant, so from 2026-08-03 every equity
+    process was being shut down TEN MINUTES BEFORE THE MARKET CLOSED. The
+    2026-08-03 brain report proves it: `session_complete` stamped at
+    10:00:00Z — 15:30 IST — while index options traded on until 15:40.
+    The vault therefore holds ZERO seconds of the closing auction, the
+    uncrossing, or the post-auction window: the system could not have
+    traded those moves because it was not even watching them, and no
+    amount of research can recover data that was never harvested.
+
+    The window now follows core.session_calendar for TODAY, per index, so
+    it is 15:30 + buffer on pre-reform days and 15:40 + buffer from the
+    reform onward — and it will follow BSE automatically the day
+    BSE_FOLLOWS_NSE_CAS is turned on.
+    """
+    import datetime as _dt
+    from core import session_calendar as _SC
+    today = _dt.date.today()
+    close = max(_hm_to_sod(_SC.session_close_hm(today, i))
+                for i in (list(getattr(config, "TRADABLE", [])) or ["NIFTY"]))
     return (_hm_to_sod(config.SESSION_OPEN) - PRE_OPEN_MIN * 60,
-            _hm_to_sod(config.SESSION_CLOSE) + POST_CLOSE_MIN * 60)
+            close + POST_CLOSE_MIN * 60)
 
 
 def _mcx_window() -> tuple[int, int]:

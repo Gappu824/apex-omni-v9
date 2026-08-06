@@ -159,6 +159,31 @@
    "date": "2026-07-31",
    "index": "NIFTY",
    "name": "mined_stale_2026-07-31_1205"
+  },
+  {
+   "kind": "gap",
+   "hm": "09:59",
+   "pts": 201.0,
+   "open": 24597.5,
+   "date": "2026-08-03",
+   "index": "NIFTY",
+   "name": "mined_gap_2026-08-03_0959"
+  },
+  {
+   "kind": "stale",
+   "hm": "12:05",
+   "dur_s": 10879,
+   "date": "2026-08-03",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-08-03_1205"
+  },
+  {
+   "kind": "stale",
+   "hm": "12:05",
+   "dur_s": 11868,
+   "date": "2026-08-04",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-08-04_1205"
   }
  ]
 }

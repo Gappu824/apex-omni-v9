@@ -19,8 +19,13 @@ Self-test:   python core/calibration.py
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
+
+import config
+
+log = logging.getLogger("calibration")
 
 
 def _cfg(name: str, default):
@@ -72,6 +77,21 @@ def calib() -> dict:
             d = json.load(fh)
     except Exception:                                          # pragma: no cover
         d = {}
+    # v9.9.17: calibration is deliberately NOT hash-gated. Every other
+    # artifact (meta model, drift reference, certificates) REFUSES on a
+    # config mismatch, and rightly — a model trained under different rules
+    # answers a different question. Calibration is the opposite case: it
+    # carries ATR proxies and commodity eligibility, and refusing it would
+    # fail CLOSED into no dynamic stops and no commodity trading at all,
+    # which is far worse than slightly stale volatility statistics. So it
+    # loads — but it says so, once per file, so a stale artifact is
+    # discovered in the log rather than in a post-mortem.
+    _h = d.get("config_hash")
+    if _h and _h != config.CONFIG_HASH:
+        log.warning("calibration.json was written under config %s, running "
+                    "%s — loading it anyway (refusing would disable dynamic "
+                    "stops and commodity eligibility). Re-run the "
+                    "calibration chain to refresh.", _h, config.CONFIG_HASH)
     _CAL_CACHE.update({"mtime": mt, "data": d})
     return d
 

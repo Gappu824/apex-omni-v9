@@ -163,26 +163,12 @@ def _run_arm(perday, SD, RET, ECON, drop: list[int] | None, rot: int):
 
 
 # --------------------------------------------------------- paired testing
-def _paired(deltas: dict[str, float], n_boot: int = 4000, seed: int = 11):
-    """Day-cluster bootstrap CI + paired sign-flip permutation p (two-
-    sided). Days are the exchangeable unit; under the null the sign of a
-    day's delta is arbitrary."""
-    v = np.array([x for x in deltas.values() if np.isfinite(x)], float)
-    if v.size < 3:
-        return dict(mean=float("nan"), ci90=[None, None], p=1.0, n_days=int(v.size))
-    rng = np.random.default_rng(seed)
-    bs = np.array([rng.choice(v, v.size, replace=True).mean()
-                   for _ in range(n_boot)])
-    obs = float(v.mean())
-    signs = rng.choice([-1.0, 1.0], size=(n_boot, v.size))
-    null = (signs * v).mean(axis=1)
-    p = float((np.abs(null) >= abs(obs)).mean())
-    return dict(mean=obs, ci90=[float(np.percentile(bs, 5)),
-                                float(np.percentile(bs, 95))],
-                p=max(p, 1.0 / (n_boot + 1)), n_days=int(v.size),
-                sd=float(v.std(ddof=1)),
-                mde=float(2.49 * v.std(ddof=1) / np.sqrt(v.size)))
-    # 2.49 ≈ (z_.975 + z_.80): smallest paired mean this many days can resolve
+def _paired(deltas: dict, n_boot: int = 4000, seed: int = 11) -> dict:
+    """v9.9.7: the paired test moved to core.capability_ladder so the
+    horizon sweep, the feature ablation and this tool all share ONE
+    implementation. Behaviour is unchanged (same bootstrap, same sign-flip
+    permutation, same 80%-power resolution bound)."""
+    return CL.paired_test(deltas, n_boot=n_boot, seed=seed)
 
 
 def main() -> int:

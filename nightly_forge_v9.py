@@ -508,6 +508,19 @@ class _Replayer:
                 except Exception as _e:                    # noqa: BLE001
                     _cv_all = None
             for idx in config.TRADABLE:
+                # v9.9.11: from 2026-08-03 the live brain suspends entries
+                # during the cash Closing Auction (index constituents in
+                # auction ⇒ spot is not a traded price). Grading an entry
+                # there would train the meta on decisions serving can never
+                # make — the same train/serve skew class as the peer-context
+                # bug. Pre-reform days are untouched.
+                from core import session_calendar as _SCG
+                if not _SCG.entries_allowed(ts, day=self.day,
+                                            index=idx)[0]:
+                    if self.funnel is not None:
+                        self.funnel.record(idx, "cas_auction",
+                                           "session phase")
+                    continue
                 ctx = market.get(idx)
                 spot = float(((ctx or {}).get("spot") or {}).get("ltp") or 0)
                 if not ctx or spot <= 0:
@@ -1873,8 +1886,12 @@ def _build_path_config_names() -> list[str]:
     rebuild ⇒ still fail-closed."""
     import inspect
     from core import meta_gate as _MGT
+    from core import session_calendar as _SC
     fns = [build_dataset, replay_day, _hold_seconds, _session_minutes_left,
-           _MGT.shaped_barriers]
+           _MGT.shaped_barriers, _SC.session_minutes, _SC.session_close_hm,
+           _SC.cas_window, _SC.in_cas_blackout, _SC.cas_phase,
+           _SC.index_price_quality, _SC.in_post_auction,
+           _SC.entries_allowed]
     names: set[str] = set()
     for fn in fns:
         try:

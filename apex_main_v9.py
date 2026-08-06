@@ -214,6 +214,31 @@ def load_meta():
                     _ah, config.CONFIG_HASH)
                 _meta_cache.update(ts=mt, m=None)   # log once, not per second
                 return None
+            # v9.9.9: PROVEN-RANKING GATE. On 2026-08-03 the brain served
+            # `engine=logistic n=1599 va=no` — the pre-v2 fallback trained
+            # on the very samples the GBM guard had rejected. It emitted
+            # p50 0.0004 (max 0.254), every value floored to META_P_FLOOR
+            # 0.50, and blocked 12,005 model-driven entries across the
+            # three indices. NIFTY and BANKNIFTY took ZERO trades all day.
+            # The hash guard could not catch it: the file carried the
+            # CURRENT hash. So the rule is no longer about provenance but
+            # about evidence — an artifact serves only if it RECORDED
+            # discrimination at or above the promotion bar. No AUC field,
+            # or an AUC below the bar, means it never proved it can rank,
+            # and a model that cannot rank must not be allowed to veto.
+            _auc = j.get("auc_cal", j.get("auc"))
+            _bar = float(getattr(config, "META_MIN_AUC", 0.52))
+            if _auc is None or float(_auc) < _bar:
+                logging.getLogger("brain").error(
+                    "META ARTIFACT REJECTED: recorded AUC %s < required "
+                    "%.2f (engine=%s n=%s). A model that never demonstrated "
+                    "ranking ability cannot gate trades. Delete %s and "
+                    "re-forge; the conviction bar governs until then.",
+                    "absent" if _auc is None else f"{float(_auc):.4f}",
+                    _bar, j.get("engine"), j.get("n"),
+                    config.META_MODEL_PATH)
+                _meta_cache.update(ts=mt, m=None)
+                return None
             if j.get("engine") != "gbm" and "w" in j:
                 j["w"] = np.array(j["w"], np.float32)
                 j["mu"] = np.array(j["mu"], np.float32)
@@ -273,13 +298,34 @@ class QuoteCache:
         missing = [k for k in keys if k not in fresh]
         if missing and self.kite and time.time() - self.last_call >= 1.05:
             try:
-                q = self.kite.quote(missing)
+                # v9.9.16: 2026-08-06 09:15-09:17 — every quote() call hit a
+                # 7-second READ timeout and the loop blocked for the full
+                # duration each time, so a 1 Hz brain ran at ~0.14 Hz with a
+                # position open. net_guard only bounds NAME RESOLUTION; a
+                # read timeout on an established connection is a different
+                # failure and needs its own deadline. Bound it well under
+                # one loop tick, and back off hard after repeated failures
+                # so a sick endpoint cannot own the session — the ring feed
+                # (age 0.1 s in that same log) already carries the prices.
+                from core.net_guard import call_with_deadline
+                _budget = float(getattr(config, "QUOTE_API_DEADLINE_S", 2.0))
+                q = call_with_deadline(lambda: self.kite.quote(missing),
+                                       _budget, "kite.quote")
                 self.last_call = time.time()
+                self._fails = 0
                 for k, v in q.items():
                     self.cache[k] = (time.time(), v)
                     fresh[k] = v
             except Exception as e:                        # noqa: BLE001
-                log.warning("quote(): %s", e)
+                self._fails = getattr(self, "_fails", 0) + 1
+                # exponential backoff: 1 → 2 → 4 → … capped. A dead endpoint
+                # gets asked less and less instead of once per tick.
+                back = min(2.0 ** min(self._fails, 6), 120.0)
+                self.last_call = time.time() + back - 1.05
+                if self._fails in (1, 3, 10) or self._fails % 25 == 0:
+                    log.warning("quote() failed x%d (%s) — backing off %.0fs; "
+                                "the ring feed still carries prices",
+                                self._fails, e, back)
         return {k.split(":", 1)[1]: v for k, v in fresh.items()}
 
 
@@ -304,6 +350,16 @@ def main():
     risk = RiskGovernor(kite=kite, persist=True)
     ring = BinaryRingBuffer()
     builder = StateBuilder()
+    # v9.9.6: pin the API hostnames and arm the stall watchdog BEFORE the
+    # first network call. 2026-07-29 lost 36 minutes to a blocked
+    # getaddrinfo with a position open — no timeout covers name
+    # resolution, so the names are cached and every miss is deadlined.
+    from core import session_calendar as SC
+    from core import cas_capture as CASC
+    from core import net_guard as NG
+    NG.install()
+    _wd = NG.LoopWatchdog(name="brain").start()
+
     engine = ExecutionEngine(kite=kite, quote_fn=lambda tok: {})
     qc = QuoteCache(kite)
     policy = PolicyLoader()
@@ -322,15 +378,42 @@ def main():
     for _pm_i in pms.values():
         _pm_i.on_meta_close = _meta_close_feed
     broker_open = engine.reconcile()
-    if broker_open:
-        risk.kill("broker shows pre-existing open positions — square off "
-                  "manually, then restart")
+    # v9.9.6 RESTART RECOVERY. Previously ANY pre-existing position killed
+    # the session, and in paper mode the open trade simply evaporated —
+    # 2026-07-29 lost three that way, with their outcomes missing from the
+    # day's P&L. Now: a position we have a validated snapshot for is
+    # RESTORED with its original entry_ts (the theta clock continues), and
+    # only genuinely unknown broker positions still halt the session.
+    _known = set()
+    for _i, _pm in pms.items():
+        _sym = _pm.restore(set(broker_open) if broker_open else None)
+        if _sym:
+            _known.add(_sym)
+    _strangers = set(broker_open or []) - _known
+    if _strangers:
+        risk.kill(f"broker shows position(s) this brain cannot account for "
+                  f"({', '.join(sorted(_strangers))}) — square off "
+                  f"manually, then restart")
+    elif _known:
+        log.warning("resumed %d open position(s) across restart: %s — risk "
+                    "was NOT re-charged (the daily ledger is durable and "
+                    "already holds this trade)", len(_known),
+                    ", ".join(sorted(_known)))
     # AUDIT 2026-07-29: three MAX_HOLD_THETA exits fired at 45 min while the
     # report claimed the 60-min config — a partial install / stale __pycache__
     # can run old bytecode under a new config hash. Print the EFFECTIVE exit
     # constants and source mtimes at every start so that drift is visible in
     # the first screen of the log, not in a post-mortem.
     import core.position_manager as _pmmod
+    import datetime as _dt
+    _today = _dt.date.today()
+    for _i in config.TRADABLE:
+        log.info("session %s | close %s | %d min | CAS %s | hard-flat %s",
+                 _i, SC.session_close_hm(_today, _i),
+                 SC.session_minutes(_today, _i),
+                 (lambda w: f"{w[0]}-{w[1]}" if w else "n/a")(
+                     SC.cas_window(_today, _i)),
+                 SC.hard_flat_hm(_today, _i))
     log.info("effective exit constants | MAX_HOLD %sm (0DTE %sm, ride x%s, "
              "dte_lt %s) | BASE_TP/SL %s/%s | DYN_TP_MAX %s | src mtimes "
              "pm=%s cfg=%s",
@@ -370,6 +453,7 @@ def main():
     actions = np.zeros(config.ACTION_DIM, np.float32)
     last_conv: dict[str, float] = {}       # post-regime conv, ≤1 s old
     last_wp_hold: dict[str, float | None] = {}
+    _cas_last: dict[str, dict | None] = {}     # v9.9.15 latest CAS tape row
     last_ivl: dict[str, tuple | None] = {}     # v9.9 (p0,p1,p̄,integrity)
     last_econ: dict[str, tuple | None] = {}    # v9.9 (p*, tp%, sl%)
     # v9.7.1: signed Kaufman ER of the recent spot path, refreshed 1 Hz — the
@@ -682,6 +766,7 @@ def main():
 
     while True:
         time.sleep(0.2)
+        _wd.beat("ring read")           # v9.9.6: stall detector heartbeat
         state, age = ring.read_state()
         if state is None:
             continue
@@ -1501,6 +1586,8 @@ def main():
                     _pnl_before = pm.risk.realized_pnl
                     _dir_held = pm.pos.direction
                     pm.manage(tctx, ring_quotes.get(pm.pos.token, {}))
+                    pm._snap()      # v9.9.6: trail/peak/target moves are
+                    #                 durable, not just the entry
                     # v9.7.1: if a CASCADE trade just exited at a loss, tell
                     # SmartLockout the losing z — so a STRONGER re-trigger can
                     # be recognised as trend continuation, not revenge.
@@ -1665,6 +1752,14 @@ def main():
                         "ltp": _lq.premium}
                 log.info("%s entry signal — gate: %s | P(win) %.2f | %s",
                          idx, gate_desc, wp_a, tag)
+                # v9.9.12: the entry curfew now follows the session close,
+                # so it extended itself to 15:35 on 2026-08-03 instead of
+                # a hand-set 15:05 shutting entries 35 minutes early.
+                tctx.curfew_hm = SC.entry_curfew_hm(_dt.date.today(),
+                                                    index=idx)
+                # Ordinary positions keep their own flatten; the
+                # post-auction bell is applied per-position inside the PM.
+                pm.flatten_hm = config.FORCE_FLATTEN_AT
                 pm.try_enter(tctx, direction, conv_a, wp_a, hierarchy,
                              probe=probe, meta_zone=meta_zone,
                              tp_pct=tp_pct, sl_pct=sl_pct)
@@ -1741,6 +1836,68 @@ def main():
             # DECISION GATE — model-driven when a trained meta-model exists,
             # else the fixed conviction bar (bootstrap). One shared copy in
             # core/decision.entry_gate — the forge grades with the same bytes.
+            # v9.9.11 CAS BLACKOUT (from 2026-08-03). Between 15:15 and
+            # 15:35 the F&O constituents of this index are in auction, so
+            # the spot print driving conviction, delta, GEX walls, the
+            # flip and the regime label is no longer a continuously-traded
+            # price. The OPTION is still live — which is why exits stay
+            # fully armed a few lines above — but a NEW entry here is an
+            # entry on a number the model was never trained to read.
+            _now_t = time.time()
+            # v9.9.13 CAS TAPE. Through 15:15-15:40 the cash constituents
+            # are in auction but the index options never stop trading, so
+            # put-call parity on the ATM pair yields a continuously-traded
+            # synthetic underlying — the market's live forecast of what the
+            # auction will print. One row per second; this tape is the only
+            # record of the window anywhere in the system.
+            if (bool(getattr(config, "CAS_CAPTURE_ENABLED", True))
+                    and SC.cas_phase(_now_t, index=idx) != "CTS"):
+                try:
+                    _lg = (ctx_m.get("legs") or {})
+                    _rows = (mapper.hierarchy(idx, spot, "CE")
+                             if mapper else []) or []
+                    if _rows:
+                        _cas_last[idx] = CASC.record(
+                            _dt.date.today().isoformat(), idx, _now_t,
+                            SC.cas_phase(_now_t, index=idx), spot,
+                            (_lg.get("atm_ce") or {}).get("snap"),
+                            (_lg.get("atm_pe") or {}).get("snap"),
+                            float(_rows[0]["strike"]),
+                            float(ctx_m.get("T") or 0.0))
+                except Exception as _e:                    # noqa: BLE001
+                    log.debug("cas tape skipped (%s)", _e)
+            _ok_phase, _why_phase = SC.entries_allowed(_now_t, index=idx)
+            # v9.9.15 CAS PRE-PRINT ENTRY. Inside 15:15-15:35 the conviction
+            # stack is reading an indicative index and must not vote. If the
+            # window is open, the option-implied basis decides direction on
+            # its own — it is the only number here sourced from
+            # continuously-traded instruments. Sizing, the risk governor,
+            # TrapShield and the daily ledger are unchanged.
+            if _ok_phase and _why_phase.startswith("CAS_PREPRINT"):
+                _row = _cas_last.get(idx)
+                _dir_pp, _why_pp = (CASC.preprint_signal(
+                    float(_row["basis"]), float(_row["quality"]), idx)
+                    if _row else (None, "no CAS tape row yet"))
+                if _dir_pp is None:
+                    skip_reason[idx] = f"CAS pre-print: {_why_pp}"
+                    funnel.record(idx, "cas_auction", skip_reason[idx])
+                    continue
+                tctx.curfew_hm = SC.entry_curfew_hm(_dt.date.today(),
+                                                    index=idx)
+                pm.flatten_hm = config.FORCE_FLATTEN_AT
+                log.info("CAS PRE-PRINT %s %s | %s", idx, _dir_pp, _why_pp)
+                _attempt(_dir_pp, 1.0, config.META_P_FLOOR,
+                         f"CAS-PREPRINT {_why_pp}", "CAS-PREPRINT")
+                continue
+            if not _ok_phase:
+                # NSE disseminates an INDICATIVE index through CAS — it
+                # moves, and jumps as the book builds and again at the
+                # random closure. Conviction, GEX, the flip and the regime
+                # label would all be reading auction mechanics. Exits stay
+                # armed above; only new entries stop.
+                skip_reason[idx] = _why_phase
+                funnel.record(idx, "cas_auction", _why_phase)
+                continue
             _ec = last_econ.get(idx)
             gate = D.entry_gate_v3(conv, wp, wp_meta, eff_bar,
                                    last_ivl.get(idx),

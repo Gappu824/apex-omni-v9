@@ -422,6 +422,16 @@ PARALLEL_RAM_RESERVE_GB    = 2.5   # v9.9.3: 4.0 zeroed the pool on a busy 16 GB
 PARALLEL_RAM_PER_WORKER_GB = 1.5
 PARALLEL_RAM_WORKSET_MULT  = 2.0   # v9.9.3: 3x over-charged cache-READ workers
 PARALLEL_RAM_AWARE         = True
+# ── v9.9.6 durability & network resilience ───────────────────────────
+POSITION_SNAPSHOT_MAX_AGE_S = 900    # refuse a snapshot older than 15 min
+NET_GUARD_ENABLED           = True
+NET_GUARD_HOSTS             = ["api.kite.trade", "kite.zerodha.com",
+                               "ws.kite.trade"]
+DNS_CACHE_TTL_S             = 300
+DNS_TIMEOUT_S               = 5.0
+SOCKET_DEFAULT_TIMEOUT_S    = 15.0
+LOOP_STALL_WARN_S           = 90     # 2026-07-29: 36 min of silence, unseen
+
 # ── v9.9.4 discovery / capability ladder ──────────────────────────────
 DISCOVERY_ENABLED          = True
 LADDER_POWER               = 0.80    # detect at 80% power…
@@ -492,6 +502,13 @@ MAX_ORDER_REJECTS        = 3      # then halt the day (reject-storm kill switch)
 DATA_STALE_BLOCK_S       = 5.0    # no NEW entries if feed older than this
 DATA_STALE_FLATTEN_S     = 60.0   # emergency-flatten open positions beyond this
 MACRO_STALE_S            = 420.0  # GEX json older than this = advisory dead
+# v9.9.12: the equity curfew is now DERIVED from the session calendar
+# (session close − NO_ENTRY_BEFORE_CLOSE_MIN), not a hand-set clock time,
+# so it moved with the 2026-08-03 extension instead of silently shutting
+# entries off 35 minutes early. core.session_calendar.entry_curfew_hm()
+# is the single source; this constant remains only as the pre-reform
+# fallback for anything that reads it directly.
+NO_ENTRY_BEFORE_CLOSE_MIN = 5      # last entry this many min before close
 NO_ENTRY_AFTER = "15:05"   # 2026-07-28: was 14:45. Five of seven cascade
 # triggers on 07-27 fired at/after 14:45 and one was blocked outright — the
 # cascade's natural window is the late session. CAUTION: FORCE_FLATTEN_AT is
@@ -500,7 +517,66 @@ NO_ENTRY_AFTER = "15:05"   # 2026-07-28: was 14:45. Five of seven cascade
 # exits; if late entries mostly die on the flatten, this window is too tight.
 FORCE_FLATTEN_AT         = "15:15"   # safely before broker MIS auto square-off (~15:20)
 SESSION_OPEN             = "09:15"
-SESSION_CLOSE            = "15:30"
+# ── 2026-08-03 CLOSING AUCTION SESSION REFORM (NSE circular 2026-05-30,
+#    SEBI CAS framework). Equity DERIVATIVES now close 15:40 (was 15:30);
+#    the cash market runs a Closing Auction 15:15–15:35 for F&O stocks,
+#    whose auction price replaces the VWAP close. Index constituents are
+#    all F&O names, so for those twenty minutes the INDEX PRINT is not a
+#    continuously-traded price even though the option still is.
+#    SESSION_CLOSE stays as the LEGACY value: core.session_calendar is
+#    date-aware and returns 15:30 for every session before the reform, so
+#    the vault's June/July days replay under the rules that actually
+#    governed them.
+SESSION_CLOSE            = "15:30"   # pre-reform / fallback
+SESSION_CLOSE_CAS        = "15:40"   # NSE derivatives, from 2026-08-03
+CAS_START                = "15:15"   # cash auction begins (F&O stocks)
+CAS_END                  = "15:35"   # auction price published
+CAS_BLACKOUT_ENABLED     = True      # suspend ENTRIES while spot is in auction
+HARD_FLAT_MARGIN_MIN     = 5         # be flat this many minutes before close
+# BSE has published a CAS scrip-master indicator but its timing circular is
+# still awaited. Until it lands, SENSEX/BANKEX keep the 15:30 close: assuming
+# an unconfirmed extension would leave positions open in a shut market.
+BSE_FOLLOWS_NSE_CAS      = False
+# 15:35-15:40 POST-AUCTION WINDOW: cash close known and published, index
+# derivatives still open. Ten minutes that did not exist before 2026-08-03
+# and about which this vault holds ZERO observations. Entries there stay
+# OFF until the harvester has banked enough post-auction sessions for the
+# discovery stack to say something; exits and position management run
+# normally throughout.
+POST_AUCTION_ENTRIES     = False
+# Phase 2 of the same SEBI framework (circular 2026-01-16): the morning
+# pre-open is restructured from 2026-09-07 — 09:00-09:05 market+limit,
+# 09:05-09:10 limit only with random close 09:08-09:10, 09:10-09:12
+# matching, 09:12-09:15 transition. Dated here so the system is ready
+# rather than surprised; SESSION_OPEN itself is unchanged at 09:15.
+PREOPEN_REFORM_DATE      = "2026-09-07"
+# ── post-auction regime (15:35-15:40). Opens ITSELF once the vault holds
+#    POST_AUCTION_MIN_SESSIONS of the window AND the fitted geometry shows
+#    the median move can pay the round-trip spread at 2:1 odds. If it
+#    cannot, the window never opens — that is a result, not a failure.
+POST_AUCTION_ENABLED        = True   # master switch for the regime
+POST_AUCTION_MIN_SESSIONS   = 7      # a week of data before it may trade
+POST_AUCTION_HOLD_MIN       = 4.0    # minutes — the window is five long
+POST_AUCTION_FLAT_HM        = "15:39"
+POST_AUCTION_PREMIUM_LEVERAGE = 12.0  # prior for premium response to spot
+POST_AUCTION_MIN_EDGE_MULT  = 1.0    # net edge must exceed 1x the spread
+# ── CAS capture (15:15-15:35). The cash constituents are in auction but the
+#    INDEX OPTIONS never stop trading, so put-call parity on the ATM pair
+#    gives a continuously-traded synthetic underlying — the market's own
+#    forecast of what the auction will print. Recorded every second to
+#    state/cas_tape/ ; this tape is the training set for the regime and
+#    nothing else in the system stores it.
+DYN_TP_EXTEND_MULT       = 2.0    # runway may extend the vault target by
+#                                   this multiple, never past DYN_TP_MAX
+QUOTE_API_DEADLINE_S     = 2.0    # hard bound on any kite.quote() call
+MARK_STALE_WARN_S        = 15     # warn when exits run on an older mark
+CAS_CAPTURE_ENABLED      = True
+CAS_PREPRINT_ENABLED     = True   # may we position BEFORE the 15:35 print?
+CAS_MIN_SESSIONS         = 7      # tapes required before that may open
+CAS_ALPHA                = 0.05   # exact sign-test level (NOT a hit-rate
+#                                   floor: at n=9, 6/9 correct signs is 67%
+#                                   and occurs 25% of the time on noise)
+CAS_MAX_QUALITY_PENALTY  = 0.10   # drop rows built from >10% wide quotes
 
 # Stops / targets (PREMIUM-based; spot context only shapes them)
 BASE_SL_PCT          = 0.20   # initial stop: -20% of entry premium
@@ -1416,6 +1492,15 @@ _HASH_EXCLUDE = frozenset({
     "COMMODITY_CALIB_MIN_TICKS", "COMMODITY_HEURISTIC_W",
     "COMMODITY_ENTRY_CONVICTION", "COMMODITY_META_MIN_TRAIN",
     "COMMODITY_FORGE_COOLDOWN_S", "EVENING_CAPTURE_ENABLED",
+    "CAS_BLACKOUT_ENABLED", "HARD_FLAT_MARGIN_MIN",
+    "POST_AUCTION_ENTRIES", "PREOPEN_REFORM_DATE",
+    "POST_AUCTION_ENABLED", "POST_AUCTION_MIN_SESSIONS",
+    "POST_AUCTION_HOLD_MIN", "POST_AUCTION_FLAT_HM",
+    "POST_AUCTION_PREMIUM_LEVERAGE", "POST_AUCTION_MIN_EDGE_MULT",
+    "QUOTE_API_DEADLINE_S", "MARK_STALE_WARN_S", "DYN_TP_EXTEND_MULT",
+    "CAS_CAPTURE_ENABLED", "CAS_PREPRINT_ENABLED", "CAS_MIN_SESSIONS",
+    "CAS_ALPHA", "CAS_MAX_QUALITY_PENALTY",
+    "NO_ENTRY_BEFORE_CLOSE_MIN",
     "COMMODITY_SESSION_OPEN", "SUPERVISOR_TABS", "RISK_STATE_PERSIST",
     "COMMODITY_CAPITAL_FRAC", "COMMODITY_CAPITAL_RS", "COMMODITY_NO_ENTRY_BEFORE_CLOSE_MIN",
     "COMMODITY_FLATTEN_BEFORE_CLOSE_MIN", "FEED_SILENT_WARN_S",
@@ -1426,6 +1511,9 @@ _HASH_EXCLUDE = frozenset({
     "PARALLEL_RAM_RESERVE_GB", "PARALLEL_RAM_PER_WORKER_GB",
     "PARALLEL_RAM_WORKSET_MULT", "PARALLEL_RAM_AWARE",
     "PARALLEL_MIN_WORKERS", "PROMOTION_MIN_TRADES",
+    "POSITION_SNAPSHOT_MAX_AGE_S", "NET_GUARD_ENABLED",
+    "NET_GUARD_HOSTS", "DNS_CACHE_TTL_S", "DNS_TIMEOUT_S",
+    "SOCKET_DEFAULT_TIMEOUT_S", "LOOP_STALL_WARN_S",
     "DISCOVERY_ENABLED", "LADDER_POWER", "LADDER_ALPHA",
     "LADDER_SCREEN_MDE", "LADDER_DISCOVER_MDE", "DISCOVERY_FDR_Q",
     "HORIZON_CANDIDATES", "HORIZON_MIN_DAYS", "HORIZON_BOOT",

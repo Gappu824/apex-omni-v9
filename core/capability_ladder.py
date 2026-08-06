@@ -204,7 +204,10 @@ class Capability:
     n_eff: float
     n_eff_pos: float
     n_eff_neg: float
-    mde_auc: float                 # minimum detectable AUC, this vault
+    mde_auc: float                 # minimum detectable AUC, POOLED
+    n_eff_within: float            # effective n for a WITHIN-DAY comparison
+    mde_auc_within: float          # the resolution comparative work really has
+    stage_comparative: str         # ladder stage for paired/ablation research
     promote_bar: float             # META_MIN_AUC
     stage: str
     stage_idx: int
@@ -213,7 +216,23 @@ class Capability:
     reason: str
 
     def allows(self, stage: str) -> bool:
+        """Gate for ABSOLUTE claims: 'this model ranks better than chance',
+        'this horizon has signal'. Pays the full clustering penalty."""
         return self.stage_idx >= STAGES.index(stage)
+
+    def allows_comparative(self, stage: str) -> bool:
+        """Gate for PAIRED claims: 'A beats B', 'dropping this group hurts'.
+
+        v9.9.7. The 2026-08-04 run exposed the flaw: horizon_sweep and
+        feature_discovery were both refused at MDE 0.729 while
+        ab_ablation — on the SAME vault, the same night — resolved paired
+        differences of 0.032-0.054. Both numbers were right about
+        different questions. A pooled AUC estimate pays for between-day
+        variance (ICC 0.445 here: nearly half the label variance is
+        'which day was it'); a within-day comparison CANCELS it, because
+        each day is its own control. Gating comparative research on the
+        pooled number blocked exactly the research this vault CAN do."""
+        return STAGES.index(self.stage_comparative) >= STAGES.index(stage)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -235,7 +254,7 @@ def assess(y, w, day, power: float | None = None,
     n_days = int(days.size)
     if n == 0 or n_days == 0:
         return Capability(0, 0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
-                          bar, "BLIND", 0, 0.0, 9999,
+                          0.0, 1.0, "BLIND", bar, "BLIND", 0, 0.0, 9999,
                           "empty vault — nothing to assess")
     base = float(y.mean())
     n_kish = kish_effective_n(w)
@@ -257,6 +276,25 @@ def assess(y, w, day, power: float | None = None,
     n_eff_pos = n_eff * base
     n_eff_neg = n_eff * (1.0 - base)
     mde = min_detectable_auc(n_eff_pos, n_eff_neg, power, alpha)
+    # Stratified resolution: a within-day comparison is its own control, so
+    # the cluster inflation does not apply — only the weight collapse does.
+    # This is a CONSERVATIVE bound: the realised paired resolution measured
+    # by tools/ab_ablation has been better still, because it also averages
+    # repeated folds.
+    n_eff_w = max(n_kish, float(n_days))
+    mde_w = min_detectable_auc(n_eff_w * base, n_eff_w * (1.0 - base),
+                               power, alpha)
+
+    def _stage_for(m: float) -> str:
+        if m <= bar:
+            return "PROMOTE"
+        if m <= float(getattr(config, "LADDER_DISCOVER_MDE", 0.55)):
+            return "DISCOVER"
+        if m <= float(getattr(config, "LADDER_SCREEN_MDE", 0.60)):
+            return "SCREEN"
+        return "BLIND"
+
+    stage_cmp = _stage_for(mde_w)
     if mde <= bar:
         stage = "PROMOTE"
     elif mde <= float(getattr(config, "LADDER_DISCOVER_MDE", 0.55)):
@@ -285,9 +323,12 @@ def assess(y, w, day, power: float | None = None,
               f"power {power:.0%} the smallest AUC this vault can "
               f"separate from chance is {mde:.3f} (promotion bar "
               f"{bar:.2f})")
+    reason += (f"; stratified (within-day) resolution is {mde_w:.3f} ⇒ "
+               f"comparative stage {stage_cmp}")
     return Capability(n, n_days, base, n_kish, icc, deff, n_eff,
-                      n_eff_pos, n_eff_neg, mde, bar, stage,
-                      STAGES.index(stage), spd, need_days, reason)
+                      n_eff_pos, n_eff_neg, mde, n_eff_w, mde_w, stage_cmp,
+                      bar, stage, STAGES.index(stage), spd, need_days,
+                      reason)
 
 
 # ------------------------------------------------- multiple-testing tools
@@ -311,6 +352,31 @@ def benjamini_hochberg(pvals, q: float = 0.10):
     out_adj = np.empty(m)
     out_adj[order] = adj
     return out_adj <= q, out_adj
+
+
+def paired_test(deltas: dict, n_boot: int = 4000, seed: int = 11) -> dict:
+    """Day-cluster bootstrap CI + paired sign-flip permutation p for a set
+    of PER-DAY differences. Days are the exchangeable unit under the null,
+    so flipping a day's sign is an exact randomisation. `mde` is the
+    smallest paired mean these days could resolve at 80% power / 5% two-
+    sided — the honest bound that turns 'no effect' into 'no effect
+    larger than X'."""
+    v = np.array([x for x in deltas.values() if np.isfinite(x)], float)
+    if v.size < 3:
+        return dict(mean=float("nan"), ci90=[None, None], p=1.0,
+                    n_days=int(v.size))
+    rng = np.random.default_rng(seed)
+    bs = np.array([rng.choice(v, v.size, replace=True).mean()
+                   for _ in range(n_boot)])
+    obs = float(v.mean())
+    signs = rng.choice([-1.0, 1.0], size=(n_boot, v.size))
+    null = (signs * v).mean(axis=1)
+    p = float((np.abs(null) >= abs(obs)).mean())
+    sd = float(v.std(ddof=1))
+    return dict(mean=obs, ci90=[float(np.percentile(bs, 5)),
+                                float(np.percentile(bs, 95))],
+                p=max(p, 1.0 / (n_boot + 1)), n_days=int(v.size), sd=sd,
+                mde=float(2.49 * sd / np.sqrt(v.size)))
 
 
 def cluster_bootstrap_auc_p(scores, y, day, n_boot: int = 2000,
