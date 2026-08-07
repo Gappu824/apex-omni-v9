@@ -217,6 +217,8 @@ def load_macro_archive(con: sqlite3.Connection, day: str, index: str) -> list[di
     # and a threshold change re-sanitises history automatically).
     _lim = float(getattr(config, "CASCADE_MAX_FLIP_DIST_PCT", 0.05))
     out = []
+    # (the same test now lives in sanitise_snapshot() below, which the LIVE
+    #  brain calls on every macro read — see the note there)
     _drop_flip = _drop_wall = 0
     for (ts_ms, spot, expiry, dte, cw, pw, aiv, ivr, pcr, mp, ng,
          flip, flip_w, ndex, sj, ij, gj) in rows:
@@ -597,3 +599,50 @@ def main():
 if __name__ == "__main__":
     config.setup_logging("macro")
     main()
+
+def sanitise_snapshot(j: dict | None) -> dict | None:
+    """Drop a degenerate flip or wall from a LIVE macro snapshot.
+
+    v9.9.18. This test existed only on the ARCHIVE read, so the forge
+    refused these solves while the live brain consumed them. 2026-08-06,
+    15:29: `SENSEX flip 72276` against `spot 78955` — 6,679 points, 8.5%
+    away, served fresh (`nflip …(16s)`) to the cascade, whose entire
+    premise is spot crossing the flip. A flip that far below spot can
+    never be crossed, so the flip-break trigger for that index was dead
+    for as long as the bad solve persisted, and the charm/vanna figures
+    printed beside it (-₹3.0bn/min against BANKNIFTY's -₹39.9m) came from
+    the same broken surface.
+
+    The archive comment claimed "the live brain already refuses these".
+    It did not. Now the same function does both, so the two can never
+    disagree again.
+    """
+    if not j:
+        return j
+    try:
+        sp = float(j.get("spot") or 0.0)
+        if sp <= 0:
+            return j
+        lim = float(getattr(config, "CASCADE_MAX_FLIP_DIST_PCT", 0.05))
+        out = dict(j)
+        dropped = []
+        for key in ("flip", "call_wall", "put_wall"):
+            v = out.get(key)
+            try:
+                v = float(v) if v is not None else None
+            except (TypeError, ValueError):
+                v = None
+            if v and abs(v / sp - 1.0) > lim:
+                out[key] = None
+                dropped.append(f"{key}={v:.0f}")
+                if key == "flip":
+                    out["flip_width"] = None
+        if dropped:
+            log.warning("%s: degenerate macro solve dropped live (%s) vs "
+                        "spot %.0f, limit %.0f%% — the cascade will not "
+                        "trade against a level the surface cannot support",
+                        j.get("index", "?"), ", ".join(dropped), sp,
+                        100 * lim)
+        return out
+    except Exception:                                      # noqa: BLE001
+        return j

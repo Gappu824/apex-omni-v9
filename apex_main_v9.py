@@ -281,7 +281,15 @@ def read_macro(idx: str) -> dict | None:
         return None
     if time.time() - float(j.get("ts", 0)) > config.MACRO_STALE_S:
         return None                                       # advisory dead, not fatal
-    return j
+    # v9.9.18: sanitise on the LIVE read with the SAME test the archive
+    # reader uses — the forge was refusing degenerate flips/walls that the
+    # brain happily consumed (2026-08-06: SENSEX flip 72276 vs spot 78955).
+    try:
+        from macro_gex_v9 import sanitise_snapshot
+        j.setdefault("index", idx)
+        return sanitise_snapshot(j)
+    except Exception:                                     # noqa: BLE001
+        return j
 
 
 class QuoteCache:
@@ -774,7 +782,16 @@ def main():
         ts = float(state.get("ts", time.time()))
         risk.on_tick()
         hm = dt.datetime.now().strftime("%H:%M")
-        if hm >= config.SESSION_CLOSE:
+        # v9.9.18: this read the LEGACY constant, so on 2026-08-06 — a
+        # post-reform Thursday — the brain logged "session over" at
+        # 15:30:00 while index options traded on to 15:40. Ten minutes of
+        # market, the entire closing auction and the whole post-auction
+        # window: unobserved, untradable, and invisible in every report.
+        # The calendar knows the real close per index and per date; take
+        # the LATEST across the books so no index is cut short.
+        _close_now = max(SC.session_close_hm(_dt.date.today(), _i)
+                         for _i in (list(config.TRADABLE) or ["NIFTY"]))
+        if hm >= _close_now:
             if flybook.pos is not None:
                 _cr = flybook.manage(ts=ts, hm=hm,
                                     spot=last_spot.get(
@@ -1548,9 +1565,12 @@ def main():
                     vol_delta=float(_atm_dir_snap.get("vol_delta") or 0))
             except Exception:                              # noqa: BLE001
                 pass
-            mins_left = max((dt.datetime.strptime(config.SESSION_CLOSE, "%H:%M")
-                             - dt.datetime.strptime(hm, "%H:%M")).seconds / 60,
-                            1.0)
+            # v9.9.18: the same constant, quieter damage — a 385-minute
+            # session measured against a 15:30 close understates time left
+            # all afternoon and goes NEGATIVE after 15:30, shrinking every
+            # expected move and every barrier that scales with sqrt(t).
+            mins_left = max(SC.minutes_to_close(dt.datetime.now(),
+                                                index=idx), 1.0)
             tctx = TickContext(
                 ts=ts, hm=hm, spot=spot, spot_velocity_1s=vel,
                 data_age_s=age,

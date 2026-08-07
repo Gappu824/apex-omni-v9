@@ -74,6 +74,7 @@ v9.1.1 (first-live-day fixes, 2026-07-04):
 from __future__ import annotations
 import datetime as dt
 import ast
+import datetime as _dt
 import json
 import logging
 import math
@@ -307,7 +308,18 @@ def _session_minutes_left(ts):
     expected move. `ts` is UTC epoch seconds (the vault stores the exchange
     timestamp; on the IST trading host that is true UTC epoch). India has no DST,
     fixed UTC+5:30, so IST-seconds-of-day = (ts + 19800) mod 86400. Vectorized."""
-    ch, cm = (int(x) for x in config.SESSION_CLOSE.split(":"))
+    # v9.9.18: date-aware. A June session really did end at 15:30 and an
+    # August one ends at 15:40; one constant for both would either
+    # fabricate ten minutes of June or truncate ten of August.
+    from core import session_calendar as _SCC
+    # `ts` is a UTC epoch (scalar or array), not a date — an earlier draft
+    # referenced a `day` that was never in this scope and crashed the very
+    # first cache build. Derive the session date from the FIRST timestamp
+    # of the bar array: every array handed here belongs to one session, so
+    # one lookup is both correct and cheap.
+    _t0 = float(np.ravel(np.asarray(ts, np.float64))[0])
+    _d = _dt.datetime.utcfromtimestamp(_t0 + 19800.0).date()   # IST date
+    ch, cm = (int(x) for x in _SCC.session_close_hm(_d).split(":"))
     close_sod = ch * 3600 + cm * 60
     ist_sod = (np.asarray(ts, np.float64) + 19800.0) % 86400.0
     return np.maximum((close_sod - ist_sod) / 60.0, 1.0)
@@ -1938,7 +1950,15 @@ def _build_and_cache(dbpath: str, day: str) -> tuple[str, bool, float]:
     _CACHE_DIR.mkdir(exist_ok=True)
     con = sqlite3.connect(dbpath)
     try:
-        o, t, p = build_dataset(con, day)
+        # v9.9.19: one bad day must not abort a 37-day rebuild hours in.
+        # Report the failure, return the empty marker map_days already
+        # understands, and let every remaining day continue.
+        try:
+            o, t, p = build_dataset(con, day)
+        except Exception as _e:                            # noqa: BLE001
+            log.error("  %s: build failed (%s) — skipped; the remaining "
+                      "days continue", day, _e)
+            return day, False, 0.0
     finally:
         con.close()
     if o is None:
