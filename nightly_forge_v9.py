@@ -486,11 +486,21 @@ class _Replayer:
         # (its intraday state files are live-only) ⇒ no VOL_CRUSH label;
         # ann_vol for the governor's vol-target scaling = archive ATM IV.
 
-    def run(self, decide, on_block=None, actions_fn=None):
+    def run(self, decide, on_block=None, actions_fn=None, on_signal=None):
         """decide(obs, frame, iidx) -> raw policy conviction (pre-shock).
         v9.4: on_block(idx, gate, detail, ctx) — the counterfactual hook —
         fires where the replayer itself kills a signal (meta-veto near-miss,
-        persistence, throttle); the grader wires it on the promotion day."""
+        persistence, throttle); the grader wires it on the promotion day.
+
+        v9.9.14: on_signal(idx, ctx) — the COMPLETE conviction stream, fired
+        unconditionally the moment conviction is final and BEFORE any gate
+        sees it. on_block alone is not a signal stream: it fires only where a
+        signal was REJECTED, so it silently omits exactly the handful the
+        live bar ACCEPTED — which are the highest-conviction seconds of the
+        day. A bar sweep fed from on_block would therefore evaluate every
+        candidate bar below the incumbent on a sample with its best members
+        deleted, and would conclude those bars are worse than they are. This
+        hook is read-only and changes no grading decision."""
         from simulation.scenario_engine import N
         _oh, _om = (int(x) for x in config.SESSION_OPEN.split(":"))
         open_sod = _oh * 3600 + _om * 60
@@ -621,6 +631,13 @@ class _Replayer:
                                 break
                         except Exception:                  # noqa: BLE001
                             _econ = None
+                if on_signal is not None:
+                    on_signal(idx, {"t": t, "ts": ts, "conv": conv, "wp": wp,
+                                    "direction": "CE" if conv > 0 else "PE",
+                                    "spot": spot, "mac": mac, "hm": hm,
+                                    "eff_bar": eff_bar,
+                                    "dte": (ctx or {}).get("dte", 9.0),
+                                    "T": (ctx or {}).get("T") or 0.01})
                 gate = D.entry_gate_v3(conv, wp, wp_meta, eff_bar, _ivl,
                                        _econ[0] if _econ else None)
                 if not gate.ok:

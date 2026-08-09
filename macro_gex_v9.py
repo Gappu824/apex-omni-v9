@@ -600,6 +600,9 @@ if __name__ == "__main__":
     config.setup_logging("macro")
     main()
 
+_SANITISE_SEEN: dict = {}      # (index, fields) -> (suppressed, last_log_ts)
+
+
 def sanitise_snapshot(j: dict | None) -> dict | None:
     """Drop a degenerate flip or wall from a LIVE macro snapshot.
 
@@ -638,11 +641,31 @@ def sanitise_snapshot(j: dict | None) -> dict | None:
                 if key == "flip":
                     out["flip_width"] = None
         if dropped:
-            log.warning("%s: degenerate macro solve dropped live (%s) vs "
-                        "spot %.0f, limit %.0f%% — the cascade will not "
-                        "trade against a level the surface cannot support",
-                        j.get("index", "?"), ", ".join(dropped), sp,
-                        100 * lim)
+            # v9.9.20: throttled. read_macro() is called several times per
+            # tick per index, so an unthrottled warning wrote 2,071 lines
+            # in seven minutes on 2026-08-07 — all reporting the SAME
+            # frozen SENSEX solve (flip 72301 vs spot 78536). A defect
+            # worth knowing about once becomes noise that hides everything
+            # else. Log on the first sight of a given value, then at most
+            # every MACRO_SANITISE_LOG_S, with the suppressed count.
+            key = (j.get("index", "?"), tuple(dropped))
+            now = time.time()
+            seen, last = _SANITISE_SEEN.get(key, (0, 0.0))
+            gap = float(getattr(config, "MACRO_SANITISE_LOG_S", 300))
+            # `last == 0` means never logged; resetting the COUNTER on each
+            # notice must not also reset first-sight, or every call takes
+            # the first-sight branch and nothing is throttled at all.
+            if last == 0.0 or now - last >= gap:
+                log.warning("%s: degenerate macro solve dropped live (%s) "
+                            "vs spot %.0f, limit %.0f%% — the cascade will "
+                            "not trade against a level the surface cannot "
+                            "support%s", j.get("index", "?"),
+                            ", ".join(dropped), sp, 100 * lim,
+                            f" [{seen} more since last notice]"
+                            if seen else "")
+                _SANITISE_SEEN[key] = (0, now)
+            else:
+                _SANITISE_SEEN[key] = (seen + 1, last)
         return out
     except Exception:                                      # noqa: BLE001
         return j

@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import datetime as _dt
 import sys
 from pathlib import Path
 
@@ -305,6 +306,32 @@ def main():
         cal = calibrate_daily(candles, commodity=c,
                               event_dates=_event_dates_for(c))
         cal["front_future"] = symbol
+        # v9.9.21 DATA-PRESERVATION. On 2026-08-07 the access token had
+        # expired, historical_data failed for all five commodities, and
+        # this line wrote `{"_note": "no daily candles"}` OVER five years
+        # of good Track-A statistics. commodity_trade_eligible requires
+        # Track-A, so a transient auth failure silently DISABLED commodity
+        # trading for the whole day — and the previous good numbers were
+        # gone, so re-running after a fresh login was the only recovery.
+        # A failed fetch is not new information: keep what we had.
+        if int(cal.get("n_days", 0) or 0) <= 0:
+            prev = (existing.get("commodities_daily") or {}).get(c) or {}
+            if int(prev.get("n_days", 0) or 0) > 0:
+                prev["front_future"] = symbol      # roll the contract only
+                prev["stale_since"] = _dt.datetime.now().isoformat(
+                    timespec="seconds")
+                existing["commodities_daily"][c] = prev
+                log.warning("  %s: fetch returned NO candles — KEEPING the "
+                            "previous Track-A calibration (%d day(s), "
+                            "atr_daily=%s). Commodity trading stays "
+                            "eligible; re-run after a fresh Kite login to "
+                            "refresh.", c, int(prev.get("n_days", 0)),
+                            prev.get("atr_proxy_daily"))
+                continue
+            log.error("  %s: fetch returned NO candles and there is no "
+                      "previous calibration to fall back on — this "
+                      "commodity will be INELIGIBLE until a successful "
+                      "backfill runs.", c)
         existing["commodities_daily"][c] = cal
         log.info("  %s: %d days | atr_daily=%s rv_annual=%s gap_p90=%s",
                  c, cal.get("n_days", 0), cal.get("atr_proxy_daily"),

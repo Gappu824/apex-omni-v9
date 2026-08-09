@@ -1248,6 +1248,72 @@ CF_NEAR_MISS    = 0.05    # bootstrap-bar near-miss band: shadow |conv| ≥ bar�
 CF_MAX_PER_GATE = 400     # per-gate/day shadow cap (sampling noted in report)
 
 # ----------------------------------------------------------------------------
+# SHADOW BOOK (v9.9.13) — every trade we took keeps trading, in parallel,
+# until the session closes. The real exit stays the baseline; the shadow
+# marks the SAME instrument under alternative exit rules to the bell, so
+# "what did the exit leave on the table" becomes a measured number instead
+# of an anecdote. Paper-only by construction: the shadow never routes.
+#
+# EVERY CONSTANT HERE IS IN _HASH_EXCLUDE. Measurement must never be able
+# to invalidate the trained model or the raw day caches — a shadow knob
+# rotating CONFIG_HASH would trigger the 31-replay cache rebuild that cost
+# 12 hours on 2026-07-29. Measurement is operational, not part of the
+# feature world.
+SHADOW_ENABLED          = True    # live parallel book (apex_main + commodity)
+SHADOW_MARK_S           = 1.0     # seconds between shadow marks
+SHADOW_MAX_STALE_S      = 120     # carry a dead quote this long, then NaN
+SHADOW_MIN_COVERAGE     = 0.60    # a trade below this live-mark coverage is
+                                  # REPORTED but excluded from any verdict
+SHADOW_LEDGER_PATH      = LOG_DIR / "shadow_ledger_v9.csv"
+SHADOW_SNAPSHOT_MAX_AGE_S = 900   # restore refuses a snapshot older than this
+SHADOW_MAX_OPEN         = 64      # per-process guard on the virtual book
+
+# The policy family. Pre-registered here so no policy can be invented after
+# its result exists — the registry check in tools/trade_potential.py reads
+# this list, not the tool's own locals.
+SHADOW_POLICIES = (
+    "as_traded",        # the real exit — the baseline, never a candidate
+    "hold_to_close", "hold_2x", "hold_3x",
+    "trail_10", "trail_20", "trail_30",
+    "target_1R", "target_2R", "target_3R",
+    "lock_5pct", "lock_10pct",
+    "trail20_hold2x",
+)
+
+# ---- promotion gate: what it takes for a measured policy to become law
+SHADOW_PROMOTE_ENABLED    = True
+SHADOW_PROMOTE_MIN_DAYS   = 20    # distinct sessions of paired evidence
+SHADOW_PROMOTE_MIN_TRADES = 60
+SHADOW_PROMOTE_FDR_Q      = 0.10  # BH across the policy family
+SHADOW_PROMOTE_MDE_MULT   = 1.0   # mean Δ₹/day must exceed this × MDE
+SHADOW_PROMOTE_MIN_CI_LO  = 0.0   # ...and the 90% CI lower bound must clear
+SHADOW_PROMOTE_HOLDOUT    = 0.30  # last 30% of days held out; sign must agree
+# ---- ENTRY BAR SWEEP (v9.9.14). The entry-side twin of the shadow book.
+# THE CONSTRAINT THAT FRAMES ALL OF IT: MAX_CONCURRENT_POSITIONS=1 with a
+# 60-min guillotine and a 180s cooldown caps the session at ~5 trades. The
+# bar cannot buy volume; it only chooses WHICH ~5 slots get filled. Every
+# report from core.entry_bar_store leads with that arithmetic.
+ENTRY_BAR_GRID = (0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55,
+                  0.60, 0.65, 0.70, 0.75, 0.80, 0.85)
+ENTRY_BAR_ALPHA          = 0.05   # family-wise alpha on the max statistic
+ENTRY_BAR_FDR_Q          = 0.10   # BH across the grid (description only)
+ENTRY_BAR_MIN_DAYS       = 30     # the grid is nested; it needs more days
+ENTRY_BAR_MDE_MULT       = 1.0
+ENTRY_BAR_BOOT           = 20000  # Westfall-Young sign-flip draws
+ENTRY_BAR_LADDER_STAGE   = "DISCOVER"
+# OFF by default, deliberately. The bar is the knob with the shortest path
+# to capital; it moves by hand, after reading the evidence, or not at all.
+ENTRY_BAR_PROMOTE_ENABLED = False
+ENTRY_BAR_PATH           = STATE_DIR / "entry_bar.json"
+
+SHADOW_PROMOTE_LADDER_STAGE = "DISCOVER"  # capability_ladder COMPARATIVE
+                                  # stage required. STAGES = BLIND, SCREEN,
+                                  # DISCOVER, PROMOTE. A promotion is a
+                                  # decision, so it sits one stage above the
+                                  # research tools.
+SHADOW_POLICY_PATH        = STATE_DIR / "exit_policy.json"
+
+# ----------------------------------------------------------------------------
 # v9.5 - TRANCHES 2-4, delivered whole (PROGRAM.md is the binding scope)
 LC_WINDOW           = 15      # living-cert rolling window (fills)
 LC_MIN_EVENTS       = 10      # ...minimum before a de-arm can trigger
@@ -1492,6 +1558,25 @@ _HASH_EXCLUDE = frozenset({
     "COMMODITY_CALIB_MIN_TICKS", "COMMODITY_HEURISTIC_W",
     "COMMODITY_ENTRY_CONVICTION", "COMMODITY_META_MIN_TRAIN",
     "COMMODITY_FORGE_COOLDOWN_S", "EVENING_CAPTURE_ENABLED",
+    # v9.9.13 SHADOW BOOK — measurement only. These must never rotate
+    # CONFIG_HASH: the shadow reads the same tape the engine trades and
+    # trains nothing. A rotation here would invalidate every raw day cache
+    # and re-run the forge for a knob that cannot change a decision.
+    "SHADOW_ENABLED", "SHADOW_MARK_S", "SHADOW_MAX_STALE_S",
+    "SHADOW_MIN_COVERAGE", "SHADOW_LEDGER_PATH", "SHADOW_MAX_OPEN",
+    "SHADOW_SNAPSHOT_MAX_AGE_S", "SHADOW_POLICIES",
+    "SHADOW_PROMOTE_ENABLED", "SHADOW_PROMOTE_MIN_DAYS",
+    "SHADOW_PROMOTE_MIN_TRADES", "SHADOW_PROMOTE_FDR_Q",
+    "SHADOW_PROMOTE_MDE_MULT", "SHADOW_PROMOTE_MIN_CI_LO",
+    "SHADOW_PROMOTE_HOLDOUT", "SHADOW_POLICY_PATH",
+    "SHADOW_PROMOTE_LADDER_STAGE",
+    # entry-bar sweep: measurement + a hand-operated gate. Same rule as the
+    # shadow constants — studying the bar must never rotate the hash and
+    # rebuild every day cache.
+    "ENTRY_BAR_GRID", "ENTRY_BAR_ALPHA", "ENTRY_BAR_FDR_Q",
+    "ENTRY_BAR_MIN_DAYS", "ENTRY_BAR_MDE_MULT", "ENTRY_BAR_BOOT",
+    "ENTRY_BAR_LADDER_STAGE", "ENTRY_BAR_PROMOTE_ENABLED",
+    "ENTRY_BAR_PATH",
     "CAS_BLACKOUT_ENABLED", "HARD_FLAT_MARGIN_MIN",
     "POST_AUCTION_ENTRIES", "PREOPEN_REFORM_DATE",
     "POST_AUCTION_ENABLED", "POST_AUCTION_MIN_SESSIONS",

@@ -33,6 +33,7 @@ time behaviour with identical ordering.
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import threading
 import sys
@@ -79,11 +80,33 @@ GROUPS = [
                           # table, and which exit rule would have left
                           # less? MFE/MAE capture + paired counterfactual
                           # exit policies over the whole session.
-                          "tools/trade_potential.py",
+                          # v9.9.13: rewritten. Correct FIFO reconstruction
+                          # (short legs and re-entries are visible again),
+                          # the DATE-AWARE session window (15:40 after the
+                          # reform), a staleness mask so a pruned leg reads
+                          # as dead instead of flat, and --promote, which
+                          # closes the loop that has been open since
+                          # v9.9.10: the verdict now goes through
+                          # core.exit_policy_store's ladder gate instead of
+                          # into a JSON nobody reads.
+                          "tools/trade_potential.py --promote",
                           # v9.9.12: measures the 15:35-15:40 window and
                           # OPENS it once a week of data proves the median
                           # move can pay the spread at 2:1 odds.
-                          "tools/post_auction_calibrate.py"]),
+                          "tools/post_auction_calibrate.py",
+                          # v9.9.14: the ENTRY-side twin of trade_potential.
+                          # Sweeps the pre-registered conviction-bar grid as
+                          # a POLICY (one book, real cooldown/throttle/
+                          # curfew/affordability, one shared exit) rather
+                          # than grading blocked signals in isolation, and
+                          # judges it with a Westfall-Young max-statistic
+                          # because the grid is a nested correlated ladder.
+                          # Leads every report with the capacity arithmetic:
+                          # 1 concurrent position + 60min guillotine + 180s
+                          # cooldown caps the session at ~5 trades, so the
+                          # bar chooses WHICH slots fill, never HOW MANY.
+                          # Promotion is OFF by default.
+                          "tools/entry_bar_study.py"]),
     # v9.9.3: the analyst runs LAST — its brief can now digest the forge
     # verdicts and the ₹ exam, and its model no longer squats in RAM ahead
     # of the heaviest stages.
@@ -92,6 +115,55 @@ GROUPS = [
 
 LOG_DIR = Path("logs/evening")
 TIMINGS = Path("state/evening_timings.json")
+
+
+
+def _day_is_complete(force: bool = False) -> tuple[bool, str]:
+    """Refuse to analyse a session that has not finished yet.
+
+    There was no guard here at all. The chain would run happily at 16:00,
+    read a vault whose MCX legs stop at whatever second the operator hit
+    enter, and produce calibrations, a forge retrain and a bar sweep over a
+    truncated day — every one of them silently wrong, none of them raising.
+    Equity closes 15:40; SILVER runs to 23:55. The whole tape matters.
+    """
+    import datetime as _dt
+    import sqlite3 as _sq
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import config
+        closes = ["15:40"] + [str(v.get("session_close", "23:55"))
+                              for v in (getattr(config, "COMMODITIES", {})
+                                        or {}).values()]
+        last_hm = max(closes)
+        h, m = (int(x) for x in last_hm.split(":")[:2])
+        now = _dt.datetime.now()
+        today = now.date().isoformat()
+        con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT MAX(ts_local_ms)/1000 FROM ticks_v9 WHERE "
+                "date(ts_local_ms/1000,'unixepoch','localtime')=?",
+                (today,)).fetchone()
+        finally:
+            con.close()
+        if not row or not row[0]:
+            return (True, f"no ticks for {today} — treating as a rest day / "
+                          f"catch-up run")
+        newest = _dt.datetime.fromtimestamp(float(row[0]))
+        need = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if newest >= need - _dt.timedelta(minutes=5):
+            return (True, f"newest tick {newest:%H:%M:%S} ≥ last close "
+                          f"{last_hm} — the day is complete")
+        return (False, f"newest tick for {today} is {newest:%H:%M:%S}, but "
+                       f"the last session closes {last_hm}. The tape is "
+                       f"INCOMPLETE — calibration, the forge retrain and the "
+                       f"bar sweep would all fit a truncated day and none of "
+                       f"them would raise. Wait for the close, or re-run "
+                       f"with --force if this is a deliberate catch-up.")
+    except Exception as e:                                 # noqa: BLE001
+        return (True, f"completeness check unavailable ({e}) — proceeding")
 
 
 def _load_timings() -> dict:
@@ -107,7 +179,7 @@ def _save_timings(results, prev: dict) -> None:
     a tool that genuinely got faster."""
     out = dict(prev)
     for script, _rc, dt in results:
-        k = Path(script).stem
+        k = Path(shlex.split(script)[0]).stem
         out[k] = round(0.4 * float(dt) + 0.6 * float(out.get(k, dt)), 1)
     try:
         TIMINGS.parent.mkdir(parents=True, exist_ok=True)
@@ -132,7 +204,7 @@ def _lpt_order(steps: list[str], timings: dict) -> list[str]:
     tool is never starved at the end of a group.
     """
     return sorted(steps,
-                  key=lambda s_: -float(timings.get(Path(s_).stem,
+                  key=lambda s_: -float(timings.get(Path(shlex.split(s_)[0]).stem,
                                                     float("inf"))))
 _PRINT_LOCK = threading.Lock()
 _MASTER = None          # every console line also lands here
@@ -176,15 +248,21 @@ def _run_step(script: str, live: bool = True, inner: str | None = None
     gets its own clean, unprefixed logs/evening/<step>.log."""
     t0 = time.time()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    lf = LOG_DIR / (Path(script).stem + ".log")
+    # v9.9.13: a step may now carry arguments ("tools/x.py --promote").
+    # Popen was handed the whole string as ONE argv element, so any step
+    # with a flag died with "can't open file 'tools/x.py --promote'".
+    # shlex.split makes every step in every group argument-capable, and
+    # leaves bare script names byte-identical to before.
+    argv = shlex.split(script)
+    lf = LOG_DIR / (Path(argv[0]).stem + ".log")
     env = dict(os.environ)
     if inner:                       # parallel group: hand out a share
         env["APEX_INNER_WORKERS"] = inner
     else:                           # solo stage: full machine, as before
         env.pop("APEX_INNER_WORKERS", None)
-    tag = Path(script).stem if inner else ""
+    tag = Path(argv[0]).stem if inner else ""
     with lf.open("w", encoding="utf-8", errors="replace") as f:
-        proc = subprocess.Popen([sys.executable, script], env=env,
+        proc = subprocess.Popen([sys.executable, *argv], env=env,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8",
@@ -204,6 +282,9 @@ def main() -> int:
                     help="max concurrent tools inside a parallel group "
                          "(default 2; each still gets its own day-worker "
                          "pool, sized so the machine-wide total is capped)")
+    ap.add_argument("--force", action="store_true",
+                    help="run even if today's tape is incomplete (catch-up "
+                         "or a deliberate partial-day analysis)")
     ap.add_argument("--plan", action="store_true",
                     help="print the group plan and exit")
     a = ap.parse_args()
@@ -213,6 +294,11 @@ def main() -> int:
                 par and not a.serial) else "serial"
             print(f"[{name:8s}] {mode:12s} {', '.join(steps)}")
         return 0
+    ok, why = _day_is_complete(getattr(a, "force", False))
+    if not ok and not getattr(a, "force", False):
+        print(f"[preflight] {why}")
+        return 2
+    print(f"[preflight] {why}")
     global _MASTER
     _timings = _load_timings()
     LOG_DIR.mkdir(parents=True, exist_ok=True)

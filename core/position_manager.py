@@ -92,7 +92,17 @@ def _sane_delta(d, symbol: str = "") -> float:
 LEDGER_FIELDS = ["ts", "event", "index", "symbol", "direction", "qty",
                  "price", "value", "conviction", "win_prob", "pnl",
                  "costs", "reason", "order_id", "regime",
-                 "fingerprints"]   # v9.7.1 AUDIT S2-F3: _log silently
+                 "fingerprints",
+                 # v9.9.13 AUDIT F: `token` was NEVER a column. Every
+                 # post-hoc study that reads this ledger looked up
+                 # ti.get(0) in the day cache, missed, and skipped the
+                 # trade — tools/trade_potential.py has run nightly
+                 # since v9.9.10 and studied exactly zero fills. The
+                 # symbol alone cannot identify an instrument in the
+                 # tick vault; the vault is keyed by token.
+                 "token",
+                 # the shadow that keeps marking this trade to the bell
+                 "shadow_id"]   # v9.7.1 AUDIT S2-F3: _log silently
                  # DROPPED these kwargs; nightly_forge:1258 reads
                  # "fingerprints" — the trap labels were never recorded.
 
@@ -245,6 +255,60 @@ class PositionManager:
         self.events: list[dict] = []      # in-memory mirror (simulator reads)
 
     # ------------------------------------------------------------ ledger
+    # ------------------------------------------------- v9.9.13 shadow book
+    # The shadow is attached here, at the two moments the ledger already
+    # records, so no caller has to remember to wire it. Both helpers are
+    # TOTAL: a shadow failure can never propagate into an entry or an exit.
+    # The book itself is injected (self.shadow) by apex_main; when it is
+    # absent these are no-ops and the engine behaves exactly as before.
+    shadow = None
+
+    def _shadow_open(self, p, ctx) -> str:
+        if self.shadow is None:
+            return ""
+        try:
+            sid = self.shadow.open_shadow(
+                symbol=p.symbol, token=getattr(p, "token", 0) or 0,
+                entry_px=float(p.entry), qty=int(p.qty),
+                side=+1,                      # the long book buys premium
+                kind="SINGLE", entry_ts=float(getattr(p, "entry_ts", ctx.ts)),
+                stop_pct=(abs(p.entry - p.stop) / p.entry
+                          if getattr(p, "stop", 0) else None))
+            try:
+                p.shadow_id = sid
+            except Exception:                              # noqa: BLE001
+                pass
+            self._pin_shadow_tokens()
+            return sid
+        except Exception as e:                             # noqa: BLE001
+            log.warning("shadow open failed (%s) — trade is unaffected", e)
+            return ""
+
+    def _shadow_real_exit(self, p, fill, pnl, reason, ctx) -> None:
+        if self.shadow is None:
+            return
+        try:
+            sid = getattr(p, "shadow_id", "") or self.shadow.id_for(p.symbol)
+            if sid:
+                self.shadow.note_real_exit(sid, float(fill.avg_price),
+                                           float(pnl), str(reason),
+                                           ts=float(ctx.ts))
+        except Exception as e:                             # noqa: BLE001
+            log.warning("shadow exit note failed (%s)", e)
+
+    def _pin_shadow_tokens(self) -> None:
+        """Tell the harvester not to prune anything we are still marking."""
+        if self.shadow is None:
+            return
+        try:
+            from core import token_pins as TP
+            toks = set(self.shadow.pinned_tokens())
+            if self.pos is not None and getattr(self.pos, "token", 0):
+                toks.add(int(self.pos.token))
+            TP.publish(f"pm:{self.index}", toks)
+        except Exception as e:                             # noqa: BLE001
+            log.debug("pin publish failed (%s)", e)
+
     def _log(self, **row):
         row = {k: row.get(k, "") for k in LEDGER_FIELDS}
         self.events.append(row)
@@ -550,7 +614,8 @@ class PositionManager:
                   price=f"{p.entry:.2f}", value=f"{outlay:.2f}",
                   conviction=f"{conviction:.3f}", win_prob=f"{win_prob:.3f}",
                   reason=fill.reason or "maker fill", order_id=p.order_id,
-                  regime=ctx.regime_label)
+                  regime=ctx.regime_label, token=getattr(p, "token", "") or "",
+                  shadow_id=self._shadow_open(p, ctx))
         log.info("ENTER %s %s ×%d @ %.2f | stop %.2f floor %.2f target %.2f",
                  self.index, p.symbol, p.qty, p.entry, p.stop, p.floor, p.target)
         self.last_block_reason = ""
@@ -1100,7 +1165,14 @@ class PositionManager:
                   pnl=f"{pnl:.2f}", costs=f"{costs:.2f}", reason=reason,
                   order_id=fill.order_id,
                   conviction=f"{p.conviction:.3f}",
-                  win_prob=f"{p.win_prob:.3f}")
+                  win_prob=f"{p.win_prob:.3f}",
+                  token=getattr(p, "token", "") or "",
+                  shadow_id=getattr(p, "shadow_id", "") or "")
+        # v9.9.13: the real exit is the BASELINE, not the end. The shadow
+        # keeps marking this instrument under every pre-registered exit
+        # rule until the bell, so "what did this exit leave on the table"
+        # becomes a measured number instead of a log-reading anecdote.
+        self._shadow_real_exit(p, fill, pnl, reason, ctx)
         remaining = p.qty - fill.qty
         # AUDIT S2-F4: the old call released the FULL original outlay on a
         # PARTIAL fill (deployed hit 0 with units still held) and then released

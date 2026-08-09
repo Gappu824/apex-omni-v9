@@ -361,6 +361,27 @@ class Harvester:
             want.add(info["token"])
         stale = {t for t, role in self.token_role.items()
                  if role[0] == index and role[1] != "spot"} - want
+        # v9.9.13 PIN GUARD. The brain and the shadow book publish the
+        # tokens they are still marking (core.token_pins). Pruning one of
+        # those stops its ticks mid-trade: the live shadow then marks a
+        # dead price and the vault stores a gap the nightly replay
+        # forward-fills into a flat line to the close. A held leg is
+        # pinned until it is released, whatever the ATM has done.
+        try:
+            from core import token_pins as TP
+            pinned = TP.read_pins()
+        except Exception as _e:                            # noqa: BLE001
+            log.debug("pin read unavailable (%s) — pruning unguarded", _e)
+            pinned = set()
+        if pinned:
+            keep = stale & pinned
+            if keep:
+                log.info("%s: keeping %d pinned token(s) subscribed past "
+                         "the ±%d-step prune band (a tracked position must "
+                         "keep quoting)", index, len(keep),
+                         config.PRUNE_STEPS)
+                stale -= keep
+                want |= keep
         new = want - self.subscribed
         if new:
             self.kws.subscribe(list(new))

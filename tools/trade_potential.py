@@ -1,7 +1,8 @@
 """
-TRADE POTENTIAL — how much of each trade did we actually capture?
-==================================================================
+TRADE POTENTIAL v2 — how much of each trade did we actually capture?
+====================================================================
     python tools/trade_potential.py [--days N] [--json out.json]
+                                    [--promote | --dry-run]
 
 Every exit this system has taken has been a clock. 2026-08-03 is the
 clean example: SENSEX 78300PE entered at ₹189.85, peaked at ₹197.85,
@@ -9,56 +10,61 @@ exited on MAX_HOLD_THETA at ₹170.30 for −₹444.70. The target sat at
 ₹417.67 — unreachable, so it never armed anything. The trade had power
 in it; the exit stack did not collect any.
 
-This tool measures that gap on EVERY real fill, and then asks which
-exit policy would have collected more — over the WHOLE session, not
-just the window the trade happened to live in.
+WHAT CHANGED IN v2, AND WHY
+---------------------------
+v1 shipped in v9.9.10 and ran nightly. It never studied a single trade,
+and six independent defects were responsible:
+
+  F. `token` was not a column in LEDGER_FIELDS, so every reconstructed
+     fill carried token=0, every `ti.get(0)` missed, and every trade hit
+     the "not in the day cache" continue. n_trades was 0 every night.
+     → the ledger schema now carries token; core.trade_reconstruct
+       backfills history from instrument_snapshots.
+  B. Pairing required BUY_FILL first, so the entire SHORT book — every
+     butterfly body, every shortvol spread — was invisible.
+     → signed FIFO; long-first and short-first share one code path.
+  C. `opens[sym] = r` destroyed the first of two entries in one symbol
+     and mispriced the survivor.
+     → FIFO lots; re-entries stack, partials split.
+  A. The path array ran 09:15→15:30 from constants written before the
+     2026-08-03 reform, so every post-auction fill was out of bounds and
+     every trade open at 15:30 was amputated.
+     → simulation.session_paths takes the window from the DATE-AWARE
+       core.session_calendar, so a pre-reform day still ends 15:30 and
+       no ten minutes are ever fabricated.
+  E. Unbounded forward-fill turned a pruned, unquoted leg into a
+     perfectly flat, perfectly finite price series. Trails could not
+     fire on it; targets could not be hit; MFE and capture were computed
+     over a path that had stopped existing.
+     → bounded carry + a freshness mask. Dead is NaN, and every trade
+       reports its live-mark coverage.
+  D. Nothing read the output. The loop was open.
+     → the verdict goes through core.exit_policy_store, which promotes
+       only on paired-by-day, FDR-corrected, MDE-clearing, holdout-
+       agreeing evidence.
 
 METHOD
 ------
-1. FILLS ARE REAL. BUY_FILL→SELL_FILL pairs from execution_ledger_v9.csv,
-   matched exactly as core.edge_audit and the harnesses match them. No
-   re-simulated entries: this study conditions on the entry and asks
-   only about the exit, which is the one question a post-hoc replay can
-   answer without selection bias.
-
-2. PATHS ARE REAL. The per-second bid/ask arrays for that exact symbol
-   come from the day cache the forge already builds. Exits mark at the
-   BID (you sell into the bid) and every policy pays the identical
-   round-trip cost stack, so policies differ only in WHEN they leave.
-
-3. MFE / MAE (Sweeney 1996). For each trade: the best unrealised gain
-   available after entry (MFE), the worst drawdown (MAE), when each
-   occurred, and the CAPTURE RATIO — realised ÷ MFE. Capture is the
-   headline: it is "the full power of the trade" expressed as a number
-   between 0 and 1.
-
-4. COUNTERFACTUAL POLICIES, replayed to session close under the rules
-   in force from 2026-08-03:
-       as_traded      what actually happened (the baseline)
-       hold_to_close  no time stop at all
-       hold_2x/3x     theta budget extended (ride multiples)
-       trail_10/20/30 peak-anchored ratchet, k% giveback from peak
-       target_1R/2R/3R  R = entry − stop, the risk actually taken
-   Every policy still obeys the disaster floor and the session hard-flat,
-   because those are constitution, not preference.
-
-5. STATISTICS. Per-policy minus as_traded, PAIRED per trade and
-   clustered by DAY through core.capability_ladder.paired_test, then
-   Benjamini-Hochberg across the policy family. Every policy is
-   pre-registered in the trial registry before its result exists. The
-   report always states the smallest ₹ difference this sample could
-   have resolved, so "no better policy" is never confused with "not
+1. FILLS ARE REAL, and now completely read (core.trade_reconstruct).
+2. PATHS ARE REAL and honestly masked (simulation.session_paths). Exits
+   mark at the side you would transact against and every policy pays the
+   identical cost stack, so policies differ only in WHEN they leave.
+3. MFE / MAE (Sweeney 1996) and the CAPTURE RATIO — realised ÷ MFE.
+4. POLICIES come from core.exit_policies — the SAME functions the live
+   shadow book steps every second. There is no second implementation to
+   drift.
+5. STATISTICS: per-day pairing, day-cluster bootstrap + sign-flip
+   permutation, Benjamini-Hochberg across the pre-registered family, and
+   an explicit MDE so "no better policy" is never confused with "not
    enough trades to tell".
 
-WHAT THIS IS NOT: a backtest of a new strategy. It cannot tell you
-whether to enter. It tells you, of the trades you did take, how much
-was left on the table and which exit rule would have left less.
+WHAT THIS IS NOT: a backtest of a new strategy. It conditions on the
+entry and asks only about the exit — the one question a post-hoc replay
+can answer without selection bias.
 """
 from __future__ import annotations
 
 import argparse
-import csv
-import datetime as dt
 import json
 import sqlite3
 import sys
@@ -75,277 +81,189 @@ config.setup_logging("trade_potential")
 import logging                                             # noqa: E402
 log = logging.getLogger("trade_potential")
 
-from core import capability_ladder as CL                   # noqa: E402
+from core import exit_policy_store as EPS                  # noqa: E402
+from core.exit_policies import (PolicySpec, TradeCtx,      # noqa: E402
+                                replay, pnl_of)
 from core.execution_engine import round_trip_costs         # noqa: E402
+from core.trade_reconstruct import reconstruct_all         # noqa: E402
+from simulation.session_paths import (load_session_paths,  # noqa: E402
+                                      traded_tokens)
 
 REPORT = config.LOG_DIR / "trade_potential_{d}.json"
 
 
-# ------------------------------------------------------------------ fills
-def closed_fills() -> list[dict]:
-    """BUY_FILL→SELL_FILL pairs, matched on symbol exactly as the
-    harnesses do. Open positions are excluded — an unfinished trade has
-    no realised number to compare a policy against."""
-    p = Path(config.LEDGER_PATH)
-    if not p.exists():
-        return []
-    out, opens = [], {}
-    for r in csv.DictReader(p.open(encoding="utf-8")):
-        ev, sym = r.get("event"), r.get("symbol") or ""
-        if ev == "BUY_FILL":
-            opens[sym] = r
-        elif ev == "SELL_FILL" and sym in opens:
-            b = opens.pop(sym)
-            try:
-                out.append({
-                    "symbol": sym,
-                    "buy_ts": float(b.get("ts") or 0),
-                    "sell_ts": float(r.get("ts") or 0),
-                    "entry": float(b.get("price") or 0),
-                    "exit": float(r.get("price") or 0),
-                    "qty": int(float(b.get("qty") or 0)),
-                    "token": int(float(b.get("token") or 0) or 0),
-                    "pnl": float(r.get("pnl") or 0),
-                    "reason": r.get("reason") or r.get("note") or "",
-                })
-            except (TypeError, ValueError):
-                continue
-    return [f for f in out if f["entry"] > 0 and f["qty"] > 0]
-
-
-def _day_of(ts: float) -> str:
-    return dt.datetime.fromtimestamp(ts).date().isoformat()
-
-
-# ------------------------------------------------------------- one replay
-def _pnl(entry: float, exit_px: float, qty: int) -> float:
-    """Net ₹ for one round trip at the live cost stack — identical for
-    every policy, so the comparison isolates timing."""
-    gross = (exit_px - entry) * qty
-    return gross - round_trip_costs(entry * qty, exit_px * qty)
-
-
-def _policies(entry: float, stop: float, qty: int, path: np.ndarray,
-              held_s: int, hold_budget_s: int) -> dict[str, float]:
-    """Replay each exit rule along the real bid path (index = seconds
-    after entry). Returns net ₹ per policy."""
-    n = path.size
-    if n == 0:
-        return {}
-    R = max(entry - stop, 1e-6)          # the risk actually taken, per unit
-    floor_px = entry * (1.0 - float(getattr(config, "MAX_LOSS_PER_TRADE_PCT",
-                                            0.3)))
-    out: dict[str, float] = {}
-
-    be_px = entry + round_trip_costs(entry * qty, entry * qty) / max(qty, 1)
-
-    def _walk(limit_s: int, trail_pct: float | None = None,
-              target_px: float | None = None,
-              lock_at: float | None = None) -> float:
-        peak = entry
-        end = min(limit_s, n - 1)
-        for t in range(end + 1):
-            px = float(path[t])
-            if not np.isfinite(px) or px <= 0:
-                continue
-            peak = max(peak, px)
-            if px <= floor_px:                       # disaster floor: law
-                return _pnl(entry, px, qty)
-            if target_px is not None and px >= target_px:
-                return _pnl(entry, target_px, qty)
-            if trail_pct is not None and t >= 1:
-                # A trailing stop is a STOP: it fires on giveback from the
-                # running peak whether or not the peak was ever in profit.
-                # An earlier draft required the ratchet level to sit above
-                # entry, which meant a trade peaking only +4% (the real
-                # 2026-08-03 case) could never trail at all and rode all
-                # the way down to the clock. The profit-LOCK variant below
-                # is the separate policy that refuses to give back gains.
-                if px <= peak * (1.0 - trail_pct):
-                    return _pnl(entry, px, qty)
-            if lock_at is not None and peak >= entry * (1.0 + lock_at):
-                # profit lock: once the trade has shown `lock_at`, never
-                # exit below breakeven+costs again.
-                if px <= be_px:
-                    return _pnl(entry, be_px, qty)
-        last = float(path[end])
-        return _pnl(entry, last, qty) if np.isfinite(last) else 0.0
-
-    out["hold_to_close"] = _walk(n - 1)
-    out["hold_2x"] = _walk(int(hold_budget_s * 2))
-    out["hold_3x"] = _walk(int(hold_budget_s * 3))
-    for k in (10, 20, 30):
-        out[f"trail_{k}"] = _walk(n - 1, trail_pct=k / 100.0)
-    for m in (1, 2, 3):
-        out[f"target_{m}R"] = _walk(int(hold_budget_s), target_px=entry + m * R)
-    for lk in (5, 10):
-        out[f"lock_{lk}pct"] = _walk(int(hold_budget_s), lock_at=lk / 100.0)
-    out["trail20_hold2x"] = _walk(int(hold_budget_s * 2), trail_pct=0.20)
-    return out
+def _register(names) -> None:
+    """Pre-register every policy BEFORE its result exists. The names come
+    from config.SHADOW_POLICIES, not from this tool's locals, so a policy
+    cannot be invented after the fact and back-dated into the family."""
+    try:
+        from core.trial_registry import register
+        for n in sorted(names):
+            register(family="trade_potential", spec_id=n,
+                     kind="pre_registered", n_trades=0)
+    except Exception as e:                                 # noqa: BLE001
+        log.debug("registry unavailable (%s)", e)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=0)
     ap.add_argument("--json", type=str, default="")
+    ap.add_argument("--promote", action="store_true",
+                    help="write the promotion if the gate is cleared")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="evaluate the gate but never write")
     a = ap.parse_args()
 
-    fills = closed_fills()
-    if not fills:
-        log.info("no closed fills in the ledger yet — nothing to study")
+    rec = reconstruct_all(days=a.days)
+    rec.log_summary(log)
+    trades = [t for t in rec.trades if t.resolved and t.qty > 0]
+    if not trades:
+        log.info("no reconstructable closed trade with a resolved token — "
+                 "nothing to study. If the ledger is non-empty, the gap is "
+                 "instrument_snapshots (symbol→token), not the ledger.")
         return 0
-    if a.days > 0:
-        cutoff = time.time() - a.days * 86400
-        fills = [f for f in fills if f["buy_ts"] >= cutoff]
-    by_day: dict[str, list] = {}
-    for f in fills:
-        by_day.setdefault(_day_of(f["buy_ts"]), []).append(f)
-    log.info("studying %d closed fill(s) over %d session(s)",
-             len(fills), len(by_day))
 
-    from simulation.replay_real_day import load_day
-    con = sqlite3.connect(str(config.DB_PATH))
-    rows, deltas = [], {}
+    specs = PolicySpec.family()
+    _register([s.name for s in specs])
+    log.info("policy family (pre-registered in config.SHADOW_POLICIES): %s",
+             ", ".join(s.name for s in specs))
+
+    by_day_index: dict[tuple[str, str], list] = {}
+    for t in trades:
+        by_day_index.setdefault((t.day, t.index), []).append(t)
+
+    con = sqlite3.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    rows, per_trade = [], []
+    no_path = 0
     try:
-        for day, day_fills in sorted(by_day.items()):
-            try:
-                loaded = load_day(con, day, config.TRADABLE[0])
-            except Exception as e:                         # noqa: BLE001
-                log.warning("  %s: day cache unavailable (%s) — skipped",
-                            day, e)
+        for (day, index), day_trades in sorted(by_day_index.items()):
+            ps = load_session_paths(con, day, index,
+                                    tokens=traded_tokens(day_trades))
+            if ps is None:
+                log.warning("  %s %s: no ticks in the vault — %d trade(s) "
+                            "skipped", day, index, len(day_trades))
+                no_path += len(day_trades)
                 continue
-            if not loaded:
-                continue
-            _stok, by_sec, ti, bidA, askA = loaded
-            base = min(by_sec) if by_sec else 0
-            for f in day_fills:
-                k = ti.get(f["token"])
-                if k is None:
-                    log.warning("  %s %s: token not in the day cache — "
-                                "skipped", day, f["symbol"])
+            win = ps.window
+            log.info("  %s %s: window %s→%s (%ds), %d token(s)",
+                     day, index, win.open_hm, win.close_hm, win.n,
+                     len(ps.ti))
+            for t in day_trades:
+                t0 = win.ts_to_t(t.entry_ts)
+                if not win.contains(t0):
+                    log.warning("    %s entry %s outside the session window "
+                                "— skipped", t.symbol, win.t_to_hm(t0))
+                    no_path += 1
                     continue
-                t0 = int(f["buy_ts"] - base)
-                if t0 < 0 or t0 >= bidA.shape[1]:
+                side_key = "bid" if t.side > 0 else "ask"
+                path = ps.path(t.token, t0, side=side_key)
+                fresh = ps.fresh_mask(t.token, t0)
+                if path is None or path.size < 10:
+                    no_path += 1
                     continue
-                path = np.asarray(bidA[k, t0:], dtype=float)
-                if path.size < 10:
-                    continue
-                held_s = max(int(f["sell_ts"] - f["buy_ts"]), 1)
-                # rules in force from 2026-08-03: the 60-minute guillotine
-                # (25 on expiry day) is the budget every hold multiple
-                # extends from.
-                dte_guess = 9.0
-                hold_budget = int(config.MAX_HOLD_MINUTES * 60)
-                entry, qty = f["entry"], f["qty"]
-                stop = entry * (1.0 - float(config.BASE_SL_PCT))
+                cov = ps.coverage(t.token, t0)
+                budget = int(float(getattr(config, "MAX_HOLD_MINUTES",
+                                           60)) * 60)
+                ctx = TradeCtx(entry=t.entry_px, qty=t.qty, side=t.side,
+                               hold_budget_s=budget,
+                               session_end_t=max(win.n - t0 - 1, 1))
+                outs = {s.name: replay(s, ctx, path, round_trip_costs, fresh)
+                        for s in specs}
+                real = float(t.realized_pnl)
                 finite = path[np.isfinite(path) & (path > 0)]
                 if finite.size == 0:
+                    no_path += 1
                     continue
-                mfe_px = float(finite.max())
-                mae_px = float(finite.min())
-                i_mfe = int(np.nanargmax(np.where(np.isfinite(path), path,
-                                                  -np.inf)))
-                mfe_rs = _pnl(entry, mfe_px, qty)
-                mae_rs = _pnl(entry, mae_px, qty)
-                real = float(f["pnl"])
-                cap_ratio = (real / mfe_rs) if mfe_rs > 0 else None
-                pol = _policies(entry, stop, qty, path, held_s, hold_budget)
-                pol["as_traded"] = real
-                for name, v in pol.items():
-                    if name == "as_traded":
-                        continue
-                    deltas.setdefault(name, {}).setdefault(day, []).append(
-                        v - real)
+                fav = (finite - t.entry_px) * t.side
+                mfe_px = float(finite[int(np.argmax(fav))])
+                mae_px = float(finite[int(np.argmin(fav))])
+                mfe_rs = pnl_of(ctx, mfe_px, round_trip_costs)
+                died = ps.died_at(t.token)
+
+                per_trade.append({
+                    "day": t.day, "as_traded": real, "coverage": cov,
+                    "policy_pnl": {k: o.pnl for k, o in outs.items()}})
                 rows.append({
-                    "day": day, "symbol": f["symbol"],
-                    "entry": round(entry, 2), "exit": round(f["exit"], 2),
-                    "qty": qty, "held_min": round(held_s / 60.0, 1),
-                    "reason": f["reason"],
-                    "realised_rs": round(real, 2),
+                    "day": t.day, "index": t.index, "symbol": t.symbol,
+                    "kind": t.kind, "side": t.side, "qty": t.qty,
+                    "entry": round(t.entry_px, 2),
+                    "exit": round(t.exit_px, 2),
+                    "held_min": round(t.held_s / 60.0, 1),
+                    "reason": t.reason, "realised_rs": round(real, 2),
                     "mfe_px": round(mfe_px, 2), "mfe_rs": round(mfe_rs, 2),
-                    "mfe_at_min": round(i_mfe / 60.0, 1),
-                    "mae_px": round(mae_px, 2), "mae_rs": round(mae_rs, 2),
-                    "capture_ratio": (round(cap_ratio, 3)
-                                      if cap_ratio is not None else None),
-                    "policies": {k2: round(v2, 2) for k2, v2 in pol.items()},
-                })
+                    "mae_px": round(mae_px, 2),
+                    "capture_ratio": (round(real / mfe_rs, 3)
+                                      if mfe_rs > 0 else None),
+                    "coverage": round(cov, 3),
+                    "feed_died_at": (win.t_to_hm(died) if died is not None
+                                     else None),
+                    "policies": {k: o.as_dict() for k, o in outs.items()}})
     finally:
         con.close()
 
     if not rows:
-        log.error("no fill could be matched to a day cache — run the forge "
-                  "so the caches exist, then re-run")
-        return 1
+        log.info("no trade had a usable path — nothing to conclude")
+        return 0
 
-    # ---------------------------------------------------------- capture
-    caps = [r["capture_ratio"] for r in rows if r["capture_ratio"] is not None]
+    min_cov = float(getattr(config, "SHADOW_MIN_COVERAGE", 0.60))
+    thin = [r for r in rows if r["coverage"] < min_cov]
     tot_real = sum(r["realised_rs"] for r in rows)
     tot_mfe = sum(r["mfe_rs"] for r in rows if r["mfe_rs"] > 0)
-    log.info("─" * 72)
-    log.info("CAPTURE | %d trade(s) | realised ₹%+,.0f against ₹%+,.0f of "
-             "peak unrealised available ⇒ %.1f%% captured",
-             len(rows), tot_real, tot_mfe,
-             100.0 * tot_real / tot_mfe if tot_mfe > 0 else float("nan"))
-    if caps:
-        log.info("        per-trade capture: median %.2f | p25 %.2f | "
-                 "p75 %.2f", float(np.median(caps)),
-                 float(np.percentile(caps, 25)),
-                 float(np.percentile(caps, 75)))
-    log.info("        peak arrived at median %.1f min after entry "
-             "(exits happened at median %.1f min)",
-             float(np.median([r["mfe_at_min"] for r in rows])),
-             float(np.median([r["held_min"] for r in rows])))
 
-    # ------------------------------------------------- policy comparison
-    cap = CL.assess(np.array([1.0 if r["realised_rs"] > 0 else 0.0
-                              for r in rows]),
-                    np.ones(len(rows)),
-                    np.array([r["day"] for r in rows]))
-    log.info("LADDER | %s", cap.reason)
-    try:
-        from core.trial_registry import register
-        for name in sorted(deltas):
-            register(family="trade_potential", spec_id=name,
-                     kind="pre_registered", n_trades=len(rows))
-    except Exception as e:                                 # noqa: BLE001
-        log.debug("registry unavailable (%s)", e)
-
-    pol_rows = []
-    for name, per_day in sorted(deltas.items()):
-        day_mean = {d: float(np.mean(v)) for d, v in per_day.items()}
-        st = CL.paired_test(day_mean)
-        pol_rows.append({"policy": name, "delta_rs": st,
-                         "total_rs": round(sum(sum(v) for v in
-                                               per_day.values()), 2)})
-    if pol_rows:
-        rej, adj = CL.benjamini_hochberg(
-            [p["delta_rs"]["p"] for p in pol_rows],
-            float(getattr(config, "DISCOVERY_FDR_Q", 0.10)))
-        for p_, ok_, q_ in zip(pol_rows, rej, adj):
-            p_["p_adj_bh"] = round(float(q_), 4)
-            p_["significant"] = bool(ok_)
     log.info("─" * 72)
-    log.info("%-14s %12s %12s %9s  %s", "policy", "Σ Δ₹ vs as-traded",
+    log.info("%d trade(s) over %d session(s) | realised ₹%s | MFE ₹%s | "
+             "CAPTURE %s", len(rows), len({r["day"] for r in rows}),
+             f"{tot_real:,.0f}", f"{tot_mfe:,.0f}",
+             f"{100.0 * tot_real / tot_mfe:.1f}%" if tot_mfe > 0 else "n/a")
+    if no_path:
+        log.warning("%d trade(s) had no usable path and were EXCLUDED "
+                    "(reported, never hidden)", no_path)
+    if thin:
+        log.warning("%d trade(s) below %.0f%% live-mark coverage — counted "
+                    "here, excluded from the verdict. A policy may not be "
+                    "promoted on forward-filled corpses.",
+                    len(thin), 100 * min_cov)
+
+    verdict = EPS.evaluate(per_trade)
+    log.info("─" * 72)
+    log.info("%-15s %17s %12s %9s  %s", "policy", "Σ Δ₹ vs as-traded",
              "mean/day", "p(BH)", "verdict")
-    for p_ in sorted(pol_rows, key=lambda z: -z["total_rs"]):
-        st = p_["delta_rs"]
-        verdict = ("BETTER" if p_.get("significant") and st["mean"] > 0 else
-                   "WORSE" if p_.get("significant") else
-                   f"indistinguishable (could resolve ₹"
-                   f"{st.get('mde', float('nan')):,.0f}/day)")
-        log.info("%-14s %+12,.0f %+12,.0f %9.3f  %s", p_["policy"],
-                 p_["total_rs"], st["mean"], p_.get("p_adj_bh", 1.0), verdict)
+    for p_ in sorted(verdict.get("policies", []),
+                     key=lambda z: -(z.get("total_rs") or -1e18)):
+        mean = p_.get("mean", float("nan"))
+        mde = p_.get("mde", float("nan"))
+        if p_.get("significant") and mean > 0:
+            v = "BETTER"
+        elif p_.get("significant"):
+            v = "WORSE"
+        else:
+            v = f"indistinguishable (could resolve ₹{mde:,.0f}/day)"
+        log.info("%-15s %+17s %+12s %9.3f  %s", p_["policy"],
+                 f"{p_.get('total_rs', 0.0):,.0f}", f"{mean:,.0f}",
+                 p_.get("p_adj_bh", 1.0), v)
     log.info("─" * 72)
+    for k, ok in verdict.get("gates", {}).items():
+        log.info("gate %-28s %s", k, "PASS" if ok else "FAIL")
+
+    if a.promote or a.dry_run:
+        EPS.promote(verdict, dry_run=a.dry_run)
+    else:
+        log.info("verdict computed but NOT promoted (pass --promote). "
+                 "Winner would be: %s", verdict.get("winner") or "none")
+
     log.info("These are EXIT counterfactuals on trades already entered. "
              "They cannot say whether an entry was right — only how much "
              "of it was collected.")
 
     out = {"ts": time.time(), "config_hash": config.CONFIG_HASH,
-           "n_trades": len(rows), "n_days": len(by_day),
+           "n_trades": len(rows), "n_days": len({r["day"] for r in rows}),
+           "n_no_path": no_path, "n_thin_coverage": len(thin),
            "realised_rs": round(tot_real, 2), "mfe_rs": round(tot_mfe, 2),
            "capture_pct": (round(100.0 * tot_real / tot_mfe, 2)
                            if tot_mfe > 0 else None),
-           "ladder": cap.as_dict(), "policies": pol_rows, "trades": rows}
+           "reconstruction": rec.summary(),
+           "verdict": verdict, "trades": rows}
     p = Path(a.json) if a.json else Path(
         str(REPORT).format(d=time.strftime("%Y-%m-%d")))
     try:

@@ -376,6 +376,24 @@ def main():
     drift = DriftMonitor()
     drift_grade = "NO_REF"
     pms = {i: PositionManager(i, risk, engine) for i in config.TRADABLE}
+    # ---------------------------------------------------------------- v9.9.13
+    # SHADOW BOOK. Every trade the engine takes keeps trading, in parallel,
+    # under the whole pre-registered exit family until the bell. It cannot
+    # route, cannot raise into this loop, and cannot cost it (arithmetic on
+    # quotes the ring already holds, throttled to SHADOW_MARK_S). The real
+    # exit stays the baseline; the shadow is how "what did that exit leave
+    # on the table" stops being a log-reading anecdote.
+    shadows: dict[str, object] = {}
+    if bool(getattr(config, "SHADOW_ENABLED", True)):
+        from core.shadow_book import ShadowBook
+        for _i in config.TRADABLE:
+            _sb = ShadowBook(_i)
+            _sb.restore()           # a restart must not reset peaks/clocks
+            shadows[_i] = _sb
+            pms[_i].shadow = _sb
+        log.info("shadow book armed for %s — %d policy(ies) per trade",
+                 ", ".join(config.TRADABLE),
+                 len(getattr(config, "SHADOW_POLICIES", ())) - 1)
     # v9.9 META-GATE v3: one adaptive margin per book; every FLAT close of
     # a meta-gated position feeds it (served p vs outcome). ACI-style: an
     # overstating model tightens its own gate; an understating one unblocks.
@@ -802,6 +820,20 @@ def main():
                     log.warning("Ⓥ SHORTVOL session-close flat → ₹%+.2f",
                                 _cr["pnl"])
                     report.d["shortvol"]["events"].append(_cr)
+            # v9.9.13: the bell closes the shadow book too. Every remaining
+            # shadow is force-closed at its last real mark and written to the
+            # shadow ledger, which is what tools/trade_potential.py reads.
+            for _i, _sb in shadows.items():
+                _n = _sb.close_session(now=ts)
+                if _n:
+                    log.info("shadow book %s: %d shadow(s) closed at the "
+                             "bell", _i, _n)
+            try:
+                from core import token_pins as TP
+                for _i in config.TRADABLE:
+                    TP.clear(f"pm:{_i}")
+            except Exception as _e:                        # noqa: BLE001
+                log.debug("pin release failed (%s)", _e)
             log.info("session over — done. PnL ₹%.2f", risk.realized_pnl)
             break
 
@@ -1035,6 +1067,12 @@ def main():
                          _fly_mark["mode"], _tr_s)
 
         # refresh ring-backed quotes for the paper engine + surfaces from macro
+        # v9.9.13: mark the shadow book off the PREVIOUS ring before it is
+        # cleared and rebuilt — the shadows track instruments the engine may
+        # already be flat in, so they must be marked from the full ring
+        # rather than from any single position's quote.
+        for _sb in shadows.values():
+            _sb.mark(ring_quotes, now=ts)
         ring_quotes.clear()
         for idx, ctx_m in market.items():
             for leg, info in (ctx_m.get("legs") or {}).items():
