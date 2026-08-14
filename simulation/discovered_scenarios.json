@@ -184,6 +184,22 @@
    "date": "2026-08-04",
    "index": "NIFTY",
    "name": "mined_stale_2026-08-04_1205"
+  },
+  {
+   "kind": "stale",
+   "hm": "11:01",
+   "dur_s": 854,
+   "date": "2026-08-10",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-08-10_1101"
+  },
+  {
+   "kind": "stale",
+   "hm": "11:40",
+   "dur_s": 2297,
+   "date": "2026-08-11",
+   "index": "NIFTY",
+   "name": "mined_stale_2026-08-11_1140"
   }
  ]
 }

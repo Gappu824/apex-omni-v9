@@ -383,17 +383,155 @@ def main():
     # quotes the ring already holds, throttled to SHADOW_MARK_S). The real
     # exit stays the baseline; the shadow is how "what did that exit leave
     # on the table" stops being a log-reading anecdote.
+    # ---------------------------------------------------------------- v9.9.30
+    # DAY PLAN + RANGE GATE. Both default OFF; when off, every helper below
+    # returns the incumbent answer and the loop is byte-identical to before.
+    #
+    # FAIL-OPEN, not fail-closed. The shadow book may fail closed because a
+    # missing measurement costs nothing. A GATE that throws must never block
+    # an entry: a bug here would silently stop the system trading and look
+    # exactly like a quiet market. Every call site below catches, logs once,
+    # and falls through to the incumbent decision.
+    day_plan = None
+    _dp_err = {"n": 0}
+    if bool(getattr(config, "DAYPLAN_ENABLED", False)):
+        try:
+            from core.day_plan import DayPlan, Candidate as _DPCand
+            day_plan = DayPlan.load_or_new()
+            # RESTART RECONCILIATION. The plan snapshot and the position
+            # store are written independently, so a crash between them can
+            # leave a live position with an uncommitted plan. Left alone the
+            # book would commit a SECOND thesis on top of the one it is
+            # already holding — the exact failure the day plan exists to
+            # prevent, reintroduced by a restart. Adopt the live position as
+            # the day's thesis instead.
+            for _i in config.TRADABLE:
+                _p = pms[_i].pos
+                if _p is not None and not day_plan.committed():
+                    from core.day_plan import Candidate as _DPC0
+                    day_plan.commit([_DPC0(
+                        index=_i, conv=float(getattr(_p, "conviction", 0.0)),
+                        win_prob=float(getattr(_p, "win_prob", 0.0) or 0.0),
+                        symbol=_p.symbol,
+                        token=int(getattr(_p, "token", 0) or 0),
+                        ts=float(getattr(_p, "entry_ts", 0.0) or 0.0))],
+                        bar=0.0)
+                    log.warning("DAY PLAN RECONCILED: found a live %s "
+                                "position with no committed thesis — "
+                                "adopted it. A restart must never license a "
+                                "second entry.", _i)
+            log.info("DAY PLAN ARMED: observe->%s, commit %s-%s, review %s, "
+                     "flat %s. ONE thesis per session; MAX_HOLD_THETA is "
+                     "replaced by the session exit.",
+                     getattr(config, "DAYPLAN_ANALYSIS_END_HM", "09:45"),
+                     getattr(config, "DAYPLAN_ENTRY_HM", "09:50"),
+                     getattr(config, "DAYPLAN_COMMIT_END_HM", "10:20"),
+                     getattr(config, "DAYPLAN_REVIEW_HM", "12:30"),
+                     getattr(config, "DAYPLAN_EXIT_HM", "15:05"))
+        except Exception as _e:                            # noqa: BLE001
+            log.error("DAY PLAN FAILED TO ARM (%s) — trading continues on "
+                      "the incumbent gate chain.", _e)
+            day_plan = None
+
+    # ---- v9.9.32 CAS BOOK. Its own capital slice, its own slot, its own
+    # ledger. Sharing the day PositionManager meant a position open at
+    # 15:15 made the auction unreachable and pooled the P&L so the
+    # auction's edge could never be measured. Off at two levels
+    # (CAS_BOOK_ENABLED and POST_AUCTION_ENTRIES) and gated behind the
+    # existing cas_capture evidence rule — this creates a CONTAINER, not a
+    # new authority to trade.
+    cas_book = None
+    if bool(getattr(config, "CAS_BOOK_ENABLED", False)):
+        try:
+            from core.cas_book import CasBook
+            cas_book = CasBook.load_or_new()
+            log.info("CAS BOOK ARMED: own slice Rs%.0f (%.0f%% of capital), "
+                     "max %d entry/session, POST_AUCTION only, flat %s",
+                     cas_book.capital(),
+                     100 * float(getattr(config, "CAS_CAPITAL_FRAC", 0.25)),
+                     int(getattr(config, "CAS_MAX_ENTRIES", 1)),
+                     getattr(config, "POST_AUCTION_FLAT_HM", "15:39"))
+        except Exception as _e:                            # noqa: BLE001
+            log.error("CAS BOOK FAILED TO ARM (%s) — the day session is "
+                      "unaffected.", _e)
+            cas_book = None
+
+    _range_state: dict = {}
+    if bool(getattr(config, "RANGE_GATE_ENABLED", False)):
+        log.info("RANGE GATE ARMED: Lo-MacKinlay VR across %s, %d horizon(s) "
+                 "must agree. Directional premium buying only — range "
+                 "selling is unaffected.",
+                 getattr(config, "HORIZONS_S", "300..5400s"),
+                 int(getattr(config, "RANGE_MIN_AGREE", 2)))
+
+    def _dp_log_once(what: str, e: Exception) -> None:
+        _dp_err["n"] += 1
+        if _dp_err["n"] <= 3:
+            log.error("day-plan/range %s failed (%s) — FAILING OPEN, the "
+                      "incumbent decision stands", what, e)
+
+    def _news_tilt(idx: str) -> float:
+        """Bounded news tilt for the commit ranking. Zero unless news is
+        both enabled AND allowed to influence the commit."""
+        try:
+            from core import news_intel as _NI
+            return float(_NI.tilt_for(idx))
+        except Exception:                                  # noqa: BLE001
+            return 0.0
+
+    def _range_ok(idx: str) -> tuple[bool, str]:
+        """Range verdict for `idx`, cached on RANGE_ASSESS_EVERY_S."""
+        if not bool(getattr(config, "RANGE_GATE_ENABLED", False)):
+            return True, ""
+        try:
+            from core import range_regime as _RR
+            step = int(getattr(config, "RANGE_ASSESS_EVERY_S", 300))
+            slot = int(time.time()) // step
+            cur = _range_state.get(idx)
+            if cur is None or cur[0] != slot:
+                hist = list(spot_secs.get(idx, ()) or ())
+                if len(hist) < 900:
+                    return True, ""          # too early to refuse anything
+                import numpy as _np
+                a = _RR.assess(_np.asarray(hist, float))
+                _range_state[idx] = (slot, _RR.may_trade_directional(a), a)
+                cur = _range_state[idx]
+            return cur[1]
+        except Exception as _e:                            # noqa: BLE001
+            _dp_log_once("range assess", _e)
+            return True, ""
+
     shadows: dict[str, object] = {}
     if bool(getattr(config, "SHADOW_ENABLED", True)):
-        from core.shadow_book import ShadowBook
-        for _i in config.TRADABLE:
-            _sb = ShadowBook(_i)
-            _sb.restore()           # a restart must not reset peaks/clocks
-            shadows[_i] = _sb
-            pms[_i].shadow = _sb
-        log.info("shadow book armed for %s — %d policy(ies) per trade",
-                 ", ".join(config.TRADABLE),
-                 len(getattr(config, "SHADOW_POLICIES", ())) - 1)
+        # TOTAL AT STARTUP. mark() and open_shadow() were already total, but
+        # CONSTRUCTION was not: ShadowBook.__init__ opens a ledger and
+        # PolicySpec.family() raises ValueError on any config.SHADOW_POLICIES
+        # name it cannot implement. Either would have killed main() BEFORE
+        # the brain ever reached the tick loop — a measurement subsystem
+        # preventing a trading session. Nothing in here is allowed to do
+        # that: on any failure the shadow is simply absent and the engine
+        # trades exactly as it did before it existed.
+        try:
+            from core.shadow_book import ShadowBook
+            for _i in config.TRADABLE:
+                _sb = ShadowBook(_i)
+                _sb.restore()       # a restart must not reset peaks/clocks
+                shadows[_i] = _sb
+                pms[_i].shadow = _sb
+            log.info("shadow book armed for %s — %d policy(ies) per trade",
+                     ", ".join(config.TRADABLE),
+                     len(getattr(config, "SHADOW_POLICIES", ())) - 1)
+        except Exception as _e:                            # noqa: BLE001
+            log.error("SHADOW BOOK FAILED TO ARM (%s) — continuing WITHOUT "
+                      "it. Trading is unaffected; tonight's exit study will "
+                      "have no live shadow for today and will fall back to "
+                      "the nightly reconstruction.", _e)
+            shadows = {}
+            for _i in config.TRADABLE:
+                try:
+                    pms[_i].shadow = None
+                except Exception:                          # noqa: BLE001
+                    pass
     # v9.9 META-GATE v3: one adaptive margin per book; every FLAT close of
     # a meta-gated position feeds it (served p vs outcome). ACI-style: an
     # overstating model tightens its own gate; an understating one unblocks.
@@ -823,6 +961,16 @@ def main():
             # v9.9.13: the bell closes the shadow book too. Every remaining
             # shadow is force-closed at its last real mark and written to the
             # shadow ledger, which is what tools/trade_potential.py reads.
+            if cas_book is not None:
+                try:
+                    _cx, _cwhy = cas_book.must_exit(ts)
+                    if _cx and cas_book.pos is not None:
+                        _q = ring_quotes.get(cas_book.pos.token, {}) or {}
+                        _px = float(_q.get("bid") or cas_book.pos.entry_px)
+                        cas_book.exit(_px, _cwhy)
+                    report.d["cas_book"] = cas_book.summary()
+                except Exception as _e:                    # noqa: BLE001
+                    log.warning("cas book close failed (%s)", _e)
             for _i, _sb in shadows.items():
                 _n = _sb.close_session(now=ts)
                 if _n:
@@ -1643,6 +1791,36 @@ def main():
                 else:
                     _pnl_before = pm.risk.realized_pnl
                     _dir_held = pm.pos.direction
+                    # ---- v9.9.30 DAY PLAN exits, checked BEFORE manage()
+                    # so the session flat and a reversed thesis take
+                    # precedence over the ratchet. Both are total: on any
+                    # error the incumbent exit stack runs untouched.
+                    _dp_exit = None
+                    if day_plan is not None:
+                        try:
+                            _mx, _mwhy = day_plan.must_exit(ts)
+                            if _mx:
+                                _dp_exit = _mwhy
+                            elif day_plan.due_for_review(ts):
+                                # `last_conv` is the live per-index
+                                # conviction the gate chain just computed —
+                                # the SAME quantity the entry was made on,
+                                # which is the whole point of the review.
+                                _cl, _rw = day_plan.review(
+                                    float(last_conv.get(idx, 0.0)))
+                                if _cl:
+                                    _dp_exit = _rw
+                        except Exception as _e:            # noqa: BLE001
+                            _dp_log_once("exit/review", _e)
+                            _dp_exit = None
+                    if _dp_exit:
+                        pm._exit(tctx, ring_quotes.get(pm.pos.token, {}),
+                                 _dp_exit, urgent=True)
+                        try:
+                            day_plan.note_close(_dp_exit)
+                        except Exception:                  # noqa: BLE001
+                            pass
+                        continue
                     pm.manage(tctx, ring_quotes.get(pm.pos.token, {}))
                     pm._snap()      # v9.9.6: trail/peak/target moves are
                     #                 durable, not just the entry
@@ -1824,6 +2002,22 @@ def main():
                 if pm.pos:
                     skip_reason[idx] = f"in {pm.pos.symbol}"
                     funnel.record(idx, "entered", tag)
+                    # v9.9.30: the thesis is committed on the FILL, never on
+                    # the intent. Committing at may_enter would burn the
+                    # session's one entry on a try_enter that found no
+                    # affordable rung or never filled.
+                    if day_plan is not None and not day_plan.committed():
+                        try:
+                            from core.day_plan import Candidate as _DPC
+                            day_plan.commit([_DPC(
+                                index=idx, conv=float(conv_a),
+                                win_prob=float(wp_a or 0.0),
+                                symbol=pm.pos.symbol,
+                                token=int(getattr(pm.pos, "token", 0) or 0),
+                                regime=(regime.label if regime else ""),
+                                news_score=_news_tilt(idx), ts=ts)], bar=0.0)
+                        except Exception as _e:            # noqa: BLE001
+                            _dp_log_once("commit", _e)
                     if tag.startswith("CASCADE"):
                         cascade_entered[idx] += 1
                         report.d["cascade"]["events"][-1]["entered"] = \
@@ -1953,6 +2147,21 @@ def main():
                 # random closure. Conviction, GEX, the flip and the regime
                 # label would all be reading auction mechanics. Exits stay
                 # armed above; only new entries stop.
+                # v9.9.32: the CONTINUOUS session stops here — but the CAS
+                # book gets its own look. It does NOT inherit the day
+                # thesis, does not consume the day slot, and spends only
+                # its own carved-out slice.
+                if cas_book is not None:
+                    try:
+                        _cok, _cwhy = cas_book.may_enter(ts, idx)
+                        if _cok:
+                            log.info("CAS BOOK: %s eligible in %s — entry "
+                                     "runs on the CAS book's own slot",
+                                     idx, _why_phase)
+                        else:
+                            cas_book.record_block(_cwhy)
+                    except Exception as _e:                # noqa: BLE001
+                        _dp_log_once("cas may_enter", _e)
                 skip_reason[idx] = _why_phase
                 funnel.record(idx, "cas_auction", _why_phase)
                 continue
@@ -1965,6 +2174,29 @@ def main():
                 skip_reason[idx] = gate.reason
                 funnel.record(idx, "below_bar", gate.reason)
                 continue
+            # ---- v9.9.30 RANGE GATE. Placed AFTER the bar so the funnel
+            # still attributes weak signals to below_bar: this counter must
+            # mean "the tape is not travelling", never "the signal was weak".
+            _rok, _rwhy = _range_ok(idx)
+            if not _rok:
+                skip_reason[idx] = _rwhy
+                funnel.record(idx, "range_bound", _rwhy)
+                continue
+            # ---- v9.9.30 DAY PLAN. Last gate before persistence: a signal
+            # that reaches here HAS cleared the bar, so a refusal is about
+            # the SESSION STRUCTURE (already committed, outside the commit
+            # window) and is recorded as such rather than hidden in
+            # below_bar.
+            if day_plan is not None:
+                try:
+                    _dok, _dwhy = day_plan.may_enter(ts)
+                except Exception as _e:                    # noqa: BLE001
+                    _dp_log_once("may_enter", _e)
+                    _dok, _dwhy = True, ""
+                if not _dok:
+                    skip_reason[idx] = _dwhy
+                    funnel.record(idx, "day_plan", _dwhy)
+                    continue
             _gate = gate.reason
             # SIGNAL-PERSISTENCE GATE — sustained read, wall-clock window,
             # sampled 1/second exactly like the forge grader.

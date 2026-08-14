@@ -117,6 +117,9 @@ class PathSet:
     ask: np.ndarray
     fresh: np.ndarray                  # (tokens, n) bool — True = real tick
     last_tick_t: dict[int, int]        # token → index of its final real tick
+    two_sided: set = None              # tokens that had a real bid AND ask;
+    #                                    anything else is a computed level
+    #                                    (index spot) and is NOT tradeable
 
     def row(self, token: int) -> int | None:
         return self.ti.get(int(token))
@@ -189,7 +192,15 @@ def load_session_paths(con: sqlite3.Connection, day: str, index: str,
         # form cannot use an index, so it full-scans a 4.6M-row day (the
         # 2026-08-07 harvest was 4 621 320 rows) on every call.
         rows = con.execute(
-            "SELECT ts_local_ms/1000.0, token, bid, ask FROM ticks_v9 "
+            # `ltp` is selected too, and that is not cosmetic: an INDEX SPOT is a
+            # computed level, not a quoted instrument, so its rows carry
+            # bid=ask=0. The bid/ask filter below therefore dropped the spot
+            # entirely, `ti` had no row for it, and every caller asking for
+            # the spot got None. post_auction_calibrate then reported
+            # "window outside this session (close 15:40) — pre-reform day",
+            # which is self-contradictory: a 15:40 close IS post-reform.
+            # The window arithmetic was right; the spot was simply missing.
+            "SELECT ts_local_ms/1000.0, token, bid, ask, ltp FROM ticks_v9 "
             "WHERE ts_local_ms >= ? AND ts_local_ms < ? ORDER BY ts_ms",
             (lo_ms, hi_ms)).fetchall()
     except sqlite3.Error as e:                             # noqa: BLE001
@@ -200,7 +211,7 @@ def load_session_paths(con: sqlite3.Connection, day: str, index: str,
 
     want = {int(t) for t in tokens} if tokens else None
     seen: dict[int, list[tuple[int, float, float]]] = {}
-    for s, tok, bid, ask in rows:
+    for s, tok, bid, ask, ltp in rows:
         tok = int(tok)
         if want is not None and tok not in want:
             continue
@@ -209,9 +220,19 @@ def load_session_paths(con: sqlite3.Connection, day: str, index: str,
             continue
         if bid and ask and bid > 0 and ask > 0:
             seen.setdefault(tok, []).append((t, float(bid), float(ask)))
+        elif ltp and float(ltp) > 0:
+            # Quote-less instrument (index spot). Both sides carry the last
+            # level, which is the honest representation: there is no spread
+            # to model because there is nothing to transact against. A
+            # caller that needs a TRADEABLE quote must check `two_sided`.
+            seen.setdefault(tok, []).append((t, float(ltp), float(ltp)))
     if not seen:
         return None
 
+    two_sided = set()
+    for _tok, _rows in seen.items():
+        if any(abs(a - b) > 1e-9 for _t, b, a in _rows):
+            two_sided.add(_tok)
     ti = {tok: i for i, tok in enumerate(sorted(seen))}
     shape = (len(ti), win.n)
     bidA = np.full(shape, np.nan, np.float32)
@@ -246,7 +267,7 @@ def load_session_paths(con: sqlite3.Connection, day: str, index: str,
                 a_row[t] = np.nan
 
     return PathSet(window=win, ti=ti, bid=bidA, ask=askA, fresh=fresh,
-                   last_tick_t=last_tick)
+                   last_tick_t=last_tick, two_sided=two_sided)
 
 
 def traded_tokens(trades) -> set[int]:

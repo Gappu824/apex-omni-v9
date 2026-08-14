@@ -58,6 +58,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -157,6 +158,115 @@ def fresh_forge(days: int) -> tuple[bool, str]:
 
 # ------------------------------------------------------------------ plan
 # (name, script, parallel_ok, freshness_fn | None)
+
+def _day_is_complete() -> tuple[bool, str]:
+    """Is today's tape finished? WARNING ONLY — never blocks.
+
+    This matters more here than in run_evening: run_training exists to
+    produce the artifacts the brain reads at the NEXT OPEN. Fitting
+    calibration or the meta to a half-session is not an evidence problem,
+    it is tomorrow's trading. But the operator, not the script, decides —
+    a mid-afternoon re-run after a fix is entirely legitimate.
+    """
+    import datetime as _dt
+    import sqlite3 as _sq
+    try:
+        closes = ["15:40"] + [str(v.get("session_close", "23:55"))
+                              for v in (getattr(config, "COMMODITIES", {})
+                                        or {}).values()]
+        last_hm = max(closes)
+        h, m = (int(x) for x in last_hm.split(":")[:2])
+        now = _dt.datetime.now()
+        today = now.date().isoformat()
+        con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT MAX(ts_local_ms)/1000 FROM ticks_v9 WHERE "
+                "date(ts_local_ms/1000,'unixepoch','localtime')=?",
+                (today,)).fetchone()
+        finally:
+            con.close()
+        if not row or not row[0]:
+            return True, f"no ticks for {today} — rest day or catch-up run"
+        newest = _dt.datetime.fromtimestamp(float(row[0]))
+        need = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if newest >= need - _dt.timedelta(minutes=5):
+            return True, f"{today} complete (newest tick {newest:%H:%M:%S})"
+        return (False, f"{today} is INCOMPLETE — newest tick "
+                       f"{newest:%H:%M:%S}, last session closes {last_hm}. "
+                       f"Artifacts fitted now will carry a truncated "
+                       f"session into tomorrow's open.")
+    except Exception as e:                                 # noqa: BLE001
+        return True, f"completeness check unavailable ({e})"
+
+
+
+def _readiness() -> tuple[bool, list[str]]:
+    """Can the brain trade tomorrow on what is on disk RIGHT NOW?
+
+    run_training exists to answer yes. Every artifact below is one the
+    brain reads at the next open; anything missing or stale means it opens
+    on something older than it should, and nothing else in the system
+    would tell you.
+    """
+    import datetime as _dt
+    import json as _json
+    out, ok = [], True
+    now = _dt.datetime.now()
+
+    def _age_days(p):
+        try:
+            return (now - _dt.datetime.fromtimestamp(
+                p.stat().st_mtime)).total_seconds() / 86400.0
+        except OSError:
+            return None
+
+    checks = [("calibration", config.LOG_DIR / "calibration.json", 3.0),
+              ("meta model", getattr(config, "META_MODEL_PATH", None), 8.0),
+              ("model manifest", getattr(config, "MODEL_MANIFEST", None),
+               8.0)]
+    for name, path, max_age in checks:
+        if path is None:
+            continue
+        a = _age_days(Path(path))
+        if a is None:
+            out.append(f"MISSING  {name} ({path})")
+            ok = False
+        elif a > max_age:
+            out.append(f"STALE    {name} — {a:.1f}d old (limit {max_age:.0f}d)")
+            ok = False
+        else:
+            out.append(f"ok       {name} — {a:.1f}d old")
+
+    # the calibration artifact must match THIS config world
+    try:
+        cj = _json.loads((config.LOG_DIR / "calibration.json").read_text())
+        if cj.get("config_hash") != config.CONFIG_HASH:
+            out.append(f"MISMATCH calibration was written under "
+                       f"{cj.get('config_hash')} != {config.CONFIG_HASH}")
+            ok = False
+        else:
+            out.append(f"ok       calibration hash matches "
+                       f"({cj.get('days')} day(s))")
+    except Exception:                                      # noqa: BLE001
+        pass
+
+    # certificates are informational: absent is the SAFE state, never an error
+    try:
+        from core import label_certificate as LC
+        out.append(f"info     training target: {LC.active_label()}")
+    except Exception:                                      # noqa: BLE001
+        pass
+    try:
+        from core import cascade as CS
+        out.append("info     cascade cert: "
+                   + ("present" if CS.load_certificate() else
+                      "none — cascade stays paper-explore"))
+    except Exception:                                      # noqa: BLE001
+        pass
+    return ok, out
+
+
 STEPS = [
     ("prime",       "tools/prime_day_caches.py",        False, None),
     ("idx_calib",   "tools/nightly_calibration.py",     False,
@@ -169,15 +279,38 @@ STEPS = [
     ("forge",       "run_nightly.py",                   False, fresh_forge),
     ("verify",      "tools/meta_gate_replay.py",        False, None),
     ("regime",      "tools/post_auction_calibrate.py",  False, None),
+    # v9.9.21: the training TARGET is itself a trained decision. This runs
+    # after the forge, judges whether a shadow-derived label would have
+    # produced a better model on the matrix the forge just used, and the
+    # NEXT run's forge reads core.label_certificate.active_label(). It
+    # prints the month countdown every night from the first night, so a
+    # coverage problem surfaces in week one rather than week four.
+    # v9.9.25: self-arming. nightly_forge publishes the payoff matrix on
+    # every run; this reads it and decides for itself whether there is
+    # enough evidence to say anything. Below the bar it prints a countdown;
+    # above it, it measures and only fits if the measurement clears. No
+    # switch to flip, no date to remember.
+    ("payoff",      "tools/payoff_study.py",            False, None),
+    # v9.9.33: the 2x2 A/B of the day plan and range gate. Also in the
+    # weekly chain; here too so a nightly operator sees the evidence
+    # accumulate instead of waiting for Saturday. Idempotent and cached —
+    # it reads day caches the forge already built.
+    ("gate_ab",     "tools/gate_ab_study.py",           False, None),
+    ("label_cert",  "tools/label_cert_report.py --issue", False, None),
 ]
 
 
 def _run(script: str) -> tuple[str, int, float]:
     t0 = time.time()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    lf = LOG_DIR / (Path(script).stem + ".log")
+    # v9.9.21: a step may carry arguments. Popen was handed the whole
+    # string as ONE argv element, so "tools/x.py --issue" would have died
+    # with "can't open file 'tools/x.py --issue'". Bare script names are
+    # byte-identical through shlex.split.
+    argv = shlex.split(script)
+    lf = LOG_DIR / (Path(argv[0]).stem + ".log")
     with lf.open("w", encoding="utf-8", errors="replace") as f:
-        proc = subprocess.Popen([sys.executable, script],
+        proc = subprocess.Popen([sys.executable, *argv],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
                                 encoding="utf-8", errors="replace",
@@ -220,6 +353,12 @@ def main() -> int:
     ap.add_argument("--only", type=str, default="",
                     help="run a single step by name")
     a = ap.parse_args()
+
+    _ok, _why = _day_is_complete()
+    print(("[preflight] WARNING: " if not _ok else "[preflight] ") + _why,
+          flush=True)
+    print("[cadence] this is the DAILY chain. run_evening.py is weekly.",
+          flush=True)
 
     days = _vault_days()
     known = _timings()
@@ -290,6 +429,12 @@ def main() -> int:
     _save_timings(results, known)
     if _MASTER is not None:
         _MASTER.close()
+    _rok, _lines = _readiness()
+    print("\n" + "=" * 62)
+    print("READY TO TRADE" if _rok else "NOT READY — see below")
+    for _l in _lines:
+        print("  " + _l)
+    print("=" * 62)
     return fails
 
 

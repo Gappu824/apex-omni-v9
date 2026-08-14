@@ -219,6 +219,14 @@ class Position:
     cas_preprint: bool = False    # v9.9.15: entered 15:15-15:35, carried
     #                               THROUGH the print — its own ladder
     pnl_realized: float = 0.0     # v9.9: cumulative net PnL across partials
+    # v9.9.33: the link to this trade's live shadow. Persisted in
+    # position_store.DURABLE so a restart re-attaches the SAME shadow.
+    # Without it the exit falls back to shadow.id_for(symbol), which
+    # returns the NEWEST shadow for that symbol — and on 2026-08-11 the
+    # 24400 strike was open twice, so "newest" is not "mine": the real
+    # exit would be recorded as the baseline for the wrong trade and both
+    # shadows would carry a false as_traded number.
+    shadow_id: str = ""
 
 
 class PositionManager:

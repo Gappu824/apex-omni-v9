@@ -126,6 +126,13 @@ class Book:
     """One candidate policy's book. The live constraints, honestly applied."""
     name: str
     bar: float
+    # v9.9.29: an ARM may carry extra gates (day plan, range regime). They
+    # are consulted at the same point the live gate chain would consult
+    # them — after the bar, before affordability — so an A/B measures the
+    # gate and not a different ordering.
+    day_plan: object = None
+    range_fn: object = None
+    blocked_by_gate: dict = field(default_factory=dict)
     pos: dict | None = None
     last_exit_t: int = -10 ** 9
     last_try_t: int = -10 ** 9
@@ -196,12 +203,31 @@ class BarSweep:
         self.books: dict[str, Book] = {
             f"bar_{b:.2f}": Book(name=f"bar_{b:.2f}", bar=float(b))
             for b in bars}
+        self._arm_mode = False
         self.reference = include_reference
         if include_reference:
             self.books[RANDOM] = Book(name=RANDOM, bar=0.0)
             # ORACLE needs the whole day before it can choose, so it is not
             # a streaming book — it is resolved in finish().
         self._all_signals: list[Signal] = []
+
+    def add_arm(self, name: str, bar: float, day_plan=None, range_fn=None
+                ) -> Book:
+        """Register an A/B arm alongside (or instead of) the bar grid.
+
+        Every arm sees the IDENTICAL signal stream in the identical order,
+        so the comparison is exactly paired at the day level and no arm can
+        benefit from a different sample.
+        """
+        bk = Book(name=name, bar=float(bar), day_plan=day_plan,
+                  range_fn=range_fn)
+        self.books[name] = bk
+        return bk
+
+    def clear_bar_grid(self) -> None:
+        """Drop the sweep books — an A/B study wants only its own arms."""
+        for k in [k for k in self.books if k.startswith("bar_")]:
+            self.books.pop(k, None)
 
     # ---------------------------------------------------------------- feed
     def offer(self, sig: Signal) -> None:
@@ -228,6 +254,19 @@ class BarSweep:
             return
         if sig.t - bk.last_try_t < self.throttle:
             return
+        # ---- arm-specific gates, at the live position in the chain
+        if bk.range_fn is not None:
+            ok, why = bk.range_fn(sig.t, sig.index)
+            if not ok:
+                k = why.split(":")[0] or "range_bound"
+                bk.blocked_by_gate[k] = bk.blocked_by_gate.get(k, 0) + 1
+                return
+        if bk.day_plan is not None:
+            ok, why = bk.day_plan.may_enter_t(sig.t)
+            if not ok:
+                k = why.split("—")[0].strip()[:48] or "day_plan"
+                bk.blocked_by_gate[k] = bk.blocked_by_gate.get(k, 0) + 1
+                return
         bk.last_try_t = sig.t
         rung = self._affordable(sig)
         if rung is None:
@@ -244,6 +283,8 @@ class BarSweep:
         bk.pos = {"sig": sig, "ctx": ctx, "rung": rung,
                   "st": PolicyState.start(ctx), "t0": sig.t,
                   "marks": 0, "fresh": 0}
+        if bk.day_plan is not None:
+            bk.day_plan.commit_t(sig.t, sig.conv, sig.index)
 
     def _affordable(self, sig: Signal):
         """First rung that is quoted two-sided, inside the spread cap, and
@@ -276,6 +317,21 @@ class BarSweep:
 
     def _advance(self, bk: Book, t: int) -> None:
         p = bk.pos
+        # DAY PLAN: the mid-session review and the hard session flat both
+        # close a live position. Without these the arm would measure the
+        # entry restriction alone and credit the day plan with an exit
+        # discipline it never applied — the two are inseparable in the
+        # real design, so they must be inseparable here.
+        if bk.day_plan is not None:
+            close, why = bk.day_plan.tick_t(t, p["sig"].conv)
+            if close:
+                st = p["st"]
+                st.closed = True
+                st.exit_px = st.last_fresh_px or p["ctx"].entry
+                st.exit_t = t - p["t0"]
+                st.exit_reason = why
+                self._close(bk, t)
+                return
         tok = int(p["rung"]["token"])
         bid, _ask, fresh = self.quote_fn(tok, t)
         p["marks"] += 1
@@ -391,6 +447,7 @@ class BarSweep:
                 "skipped_cooldown": bk.skipped_cooldown,
                 "skipped_afford": bk.skipped_afford,
                 "skipped_nochain": bk.skipped_nochain,
+                "blocked_by_gate": dict(bk.blocked_by_gate),
                 "thin_coverage": sum(1 for x in trades if x.coverage <
                                      float(getattr(config,
                                                    "SHADOW_MIN_COVERAGE",

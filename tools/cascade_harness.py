@@ -176,6 +176,91 @@ def _grade_event(ev, mapper, ti, bidA, askA, last_tick, snap, N):
     return base
 
 
+# ---------------------------------------------------------------- v9.9.15
+# SENSITIVITY GRID — parallel, and correct across a process boundary.
+#
+# The grid was 9 knob cells x 38 days = 342 full tick replays run SERIALLY
+# in the main process, while map_days sat forty lines above it driving the
+# primary pass across a pool. On 2026-08-08 that loop ran 21 hours and was
+# a third done, with no progress output of its own: the only ETA in the log
+# came from the primary map_days, which completed all 38 days in five
+# MILLISECONDS because every day hit the result cache. Instrumentation on
+# the loop that costs nothing, none on the loop that costs everything.
+#
+# THE GRID IS PRE-REGISTERED HERE, not inline, so the deflation count and
+# the parallel units are provably the same nine cells.
+_SENS_Z  = (1.5, 2.0, 2.5)
+_SENS_GM = (0.5, 1.0, 2.0)
+
+
+def _sens_cells():
+    return [(z, gm) for z in _SENS_Z for gm in _SENS_GM]
+
+
+def _cascade_sens_day_worker(args):
+    """ALL nine cells for ONE day, in one process.
+
+    Grouped by DAY rather than by (cell, day) on purpose. Each cell replays
+    the same day's ticks; running the nine together keeps those SQLite pages
+    hot in the OS cache for replays 2..9 instead of re-reading a cold day
+    nine times from nine different workers. 38 units still balance across a
+    RAM-bound pool of 2-6.
+
+    THE KNOB MUTATION MUST HAPPEN HERE. `cascade_knob_hash()` reads
+    config.CASCADE_VEL_Z and config.CASCADE_NET_GEX_MAX at call time, and
+    that hash is the cache key. Setting them in the parent does not cross a
+    spawn boundary, so a worker would silently compute every cell under the
+    DEFAULT knobs and write nine identical results under nine different
+    stamps. The overrides are applied and the stamp is taken inside the same
+    scope, exactly as the serial loop did.
+
+    The restore in `finally` is not cosmetic: map_days falls back to
+    `[fn(d) for d in days]` IN THE PARENT on any spawn/pickling failure, and
+    an unrestored override would then corrupt config for every step after
+    this one.
+    """
+    day, N, base_gex_max = args
+    import sqlite3 as _sq
+    con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    _saved = (config.CASCADE_VEL_Z, config.CASCADE_NET_GEX_MAX)
+    out: dict = {}
+    try:
+        for z, gm in _sens_cells():
+            config.CASCADE_VEL_Z = z
+            config.CASCADE_NET_GEX_MAX = base_gex_max * gm
+            _st2 = cascade_knob_hash()          # knob-patched -> own cache
+            try:
+                c2, _s2, _ = DC.run_cached(
+                    "cascade", _st2, day,
+                    lambda d=day: (lambda t: (t[0], [t[1]], {}))(
+                        _run_day(con, d, N, primary_rows=None)))
+                out[(z, gm)] = c2
+            except Exception as e:                         # noqa: BLE001
+                log.warning("  sens cell z=%.1f g=%.1f %s failed (%s)",
+                            z, gm, day, e)
+                out[(z, gm)] = []
+    finally:
+        config.CASCADE_VEL_Z, config.CASCADE_NET_GEX_MAX = _saved
+        try:
+            con.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+    return out
+
+
+def _cell_stamp(z: float, gm: float, base_gex_max: float) -> str:
+    """The registry key a cell WOULD have had in the serial loop. Computed
+    by patching, hashing and restoring — no replay — so the trial registry
+    and the deflation count stay byte-identical to the pre-parallel code."""
+    _saved = (config.CASCADE_VEL_Z, config.CASCADE_NET_GEX_MAX)
+    try:
+        config.CASCADE_VEL_Z = z
+        config.CASCADE_NET_GEX_MAX = base_gex_max * gm
+        return cascade_knob_hash()
+    finally:
+        config.CASCADE_VEL_Z, config.CASCADE_NET_GEX_MAX = _saved
+
+
 def _cascade_day_worker(args):
     """One day, in its own process. Module-level and picklable by design.
 
@@ -503,29 +588,24 @@ def main():
 
     # ---- SENSITIVITY (diagnostic ONLY — 9 trials; deflation applies) -------
     sens = []
-    for z in (1.5, 2.0, 2.5):
-        for gm in (0.5, 1.0, 2.0):
-            oz, og = config.CASCADE_VEL_Z, config.CASCADE_NET_GEX_MAX
-            config.CASCADE_VEL_Z = z
-            config.CASCADE_NET_GEX_MAX = og * gm
-            try:
-                rr = []
-                _st2 = cascade_knob_hash()   # knob-patched → own cache
-                for day in days:
-                    _c2, _s2, _ = DC.run_cached(
-                        "cascade", _st2, day,
-                        lambda d=day: (lambda t: (t[0], [t[1]], {}))(
-                            _run_day(con, d, N, primary_rows=None)))
-                    rr += _c2
-                pf = [r["pnl"] for r in rr if "pnl" in r]
-                TR.register("cascade",
-                            f"{cascade_knob_hash()}:z{z}g{gm}",
-                            "sensitivity", events=len(pf))
-                sens.append({"z": z, "gex_mult": gm, "events": len(pf),
-                             "sum": round(float(np.sum(pf)), 2) if pf else 0.0,
-                             "mean": round(float(np.mean(pf)), 2) if pf else None})
-            finally:
-                config.CASCADE_VEL_Z, config.CASCADE_NET_GEX_MAX = oz, og
+    _base_gex = config.CASCADE_NET_GEX_MAX
+    _sens_res = map_days(_cascade_sens_day_worker,
+                         [(d, N, _base_gex) for d in days],
+                         desc="cascade sens (9 cells/day)", log_every=2)
+    for z, gm in _sens_cells():
+        rr = []
+        for _day, _o in zip(days, _sens_res):
+            if _o is None:
+                log.warning("  sens: %s produced no result — day omitted "
+                            "from every cell", _day)
+                continue
+            rr += _o.get((z, gm), [])
+        pf = [r["pnl"] for r in rr if "pnl" in r]
+        TR.register("cascade", f"{_cell_stamp(z, gm, _base_gex)}:z{z}g{gm}",
+                    "sensitivity", events=len(pf))
+        sens.append({"z": z, "gex_mult": gm, "events": len(pf),
+                     "sum": round(float(np.sum(pf)), 2) if pf else 0.0,
+                     "mean": round(float(np.mean(pf)), 2) if pf else None})
 
     cert["family_trials"] = TR.trials_for_deflation("cascade")
     _atomic_write_json(config.CASCADE_CERT_PATH, cert)         # re-stamp with the trial count

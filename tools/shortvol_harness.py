@@ -97,6 +97,65 @@ def _gex_at(nc: GammaNowcast, snap: dict | None, spot: float, ts: float):
     return snap.get("net_gex"), snap.get("flip"), snap.get("flip_width")
 
 
+# ---------------------------------------------------------------- v9.9.15
+# SENSITIVITY GRID — parallel, and correct across a process boundary.
+# Same defect and same fix as tools/cascade_harness.py: 9 cells x 38 days
+# ran SERIALLY in the main process while a pool sat idle above it. See that
+# module's note for the full diagnosis; the constraint that matters here is
+# identical — SV.sv_knob_hash() reads config.SV_IVRANK_MIN and
+# config.SV_TP_FRAC at call time and that hash IS the cache key, so the
+# override and the stamp must be taken inside the same scope, in the child.
+_SENS_IVR = (0.50, 0.60, 0.70)
+_SENS_TP  = (0.40, 0.50, 0.60)
+
+
+def _sv_sens_cells():
+    return [(ivr, tp) for ivr in _SENS_IVR for tp in _SENS_TP]
+
+
+def _shortvol_sens_day_worker(args):
+    """ALL nine cells for ONE day, in one process — grouped by day so the
+    day's SQLite pages stay hot across replays 2..9 instead of nine cold
+    re-reads. The finally-restore also protects map_days' in-parent serial
+    fallback from inheriting a patched config."""
+    day, N = args
+    import sqlite3 as _sq
+    con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    _saved = (config.SV_IVRANK_MIN, config.SV_TP_FRAC)
+    out: dict = {}
+    try:
+        for ivr, tp in _sv_sens_cells():
+            config.SV_IVRANK_MIN, config.SV_TP_FRAC = ivr, tp
+            _st2 = SV.sv_knob_hash()            # knob-patched -> own cache
+            try:
+                c, _s, _b = DC.run_cached(
+                    "shortvol", _st2, day,
+                    lambda d=day: _run_day(con, d, N, verbose=False))
+                out[(ivr, tp)] = c
+            except Exception as e:                         # noqa: BLE001
+                log.warning("  sens cell ivr=%.2f tp=%.2f %s failed (%s)",
+                            ivr, tp, day, e)
+                out[(ivr, tp)] = []
+    finally:
+        config.SV_IVRANK_MIN, config.SV_TP_FRAC = _saved
+        try:
+            con.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+    return out
+
+
+def _sv_cell_stamp(ivr: float, tp: float) -> str:
+    """The registry key the cell would have had serially — patch, hash,
+    restore. No replay; keeps the deflation count byte-identical."""
+    _saved = (config.SV_IVRANK_MIN, config.SV_TP_FRAC)
+    try:
+        config.SV_IVRANK_MIN, config.SV_TP_FRAC = ivr, tp
+        return SV.sv_knob_hash()
+    finally:
+        config.SV_IVRANK_MIN, config.SV_TP_FRAC = _saved
+
+
 def _shortvol_day_worker(args):
     """One day, own process, own read-only SQLite handle.
 
@@ -408,29 +467,22 @@ def main():
 
     # sensitivity — DIAGNOSTIC ONLY (9 trials; deflation applies)
     sens = []
-    for ivr in (0.50, 0.60, 0.70):
-        for tp in (0.40, 0.50, 0.60):
-            o1, o2 = config.SV_IVRANK_MIN, config.SV_TP_FRAC
-            config.SV_IVRANK_MIN, config.SV_TP_FRAC = ivr, tp
-            try:
-                rr = []
-                _st2 = SV.sv_knob_hash()   # knob-patched → own cache
-                for day in days:
-                    c, _, _ = DC.run_cached("shortvol", _st2, day,
-                                            lambda d=day: _run_day(
-                                                con, d, N, verbose=False))
-                    rr += c
-                pf = [r["pnl"] for r in rr]
-                TR.register("shortvol",
-                            f"{SV.sv_knob_hash()}:i{ivr}t{tp}",
-                            "sensitivity", events=len(pf))
-                sens.append({"ivrank_min": ivr, "tp_frac": tp,
-                             "events": len(pf),
-                             "sum": round(float(np.sum(pf)), 2) if pf else 0.0,
-                             "mean": round(float(np.mean(pf)), 2)
-                             if pf else None})
-            finally:
-                config.SV_IVRANK_MIN, config.SV_TP_FRAC = o1, o2
+    _sens_res = map_days(_shortvol_sens_day_worker, [(d, N) for d in days],
+                         desc="shortvol sens (9 cells/day)", log_every=2)
+    for ivr, tp in _sv_sens_cells():
+        rr = []
+        for _day, _o in zip(days, _sens_res):
+            if _o is None:
+                log.warning("  sens: %s produced no result — day omitted "
+                            "from every cell", _day)
+                continue
+            rr += _o.get((ivr, tp), [])
+        pf = [r["pnl"] for r in rr]
+        TR.register("shortvol", f"{_sv_cell_stamp(ivr, tp)}:i{ivr}t{tp}",
+                    "sensitivity", events=len(pf))
+        sens.append({"ivrank_min": ivr, "tp_frac": tp, "events": len(pf),
+                     "sum": round(float(np.sum(pf)), 2) if pf else 0.0,
+                     "mean": round(float(np.mean(pf)), 2) if pf else None})
 
     cert["family_trials"] = TR.trials_for_deflation("shortvol")
     _atomic_write_json(config.SHORTVOL_CERT_PATH, cert)         # re-stamp with the trial count

@@ -1259,6 +1259,161 @@ CF_MAX_PER_GATE = 400     # per-gate/day shadow cap (sampling noted in report)
 # rotating CONFIG_HASH would trigger the 31-replay cache rebuild that cost
 # 12 hours on 2026-07-29. Measurement is operational, not part of the
 # feature world.
+# ---- META SERVE-PATH INTEGRITY (v9.9.18). meta_gbm measured the spread of
+# a single isotonic map; serving uses an IVAP (two isotonic fits per query).
+# On matched data the isotonic map carried 925 distinct values and the
+# Venn-Abers merge carried 36 — the old check could not see a serve-path
+# collapse. 2026-08-10: an artifact that passed it served two values across
+# 14 655 evaluations. These gate on the SERVE estimator.
+# ---- META TRAINING TARGET (v9.9.19). The shadow book teaches the ENTRY
+# model by DE-NOISING the label, not by adding rows: every shadow is a trade
+# the gate already took, so it estimates P(outcome | entered) and says
+# nothing about blocked signals. "realized" is the incumbent target and the
+# default; switching is a MODEL CHANGE and must beat it head-to-head on the
+# ladder, paired by day and FDR-corrected. Specs are pre-registered in
+# core/shadow_labels.LABEL_SPECS.
+#   realized             : did the trade as EXITED make money  (incumbent)
+#   best_policy          : would the best pre-registered exit have made money
+#   any_policy_positive  : did ANY pre-registered exit come out positive
+META_LABEL_SPEC = "realized"
+
+# ---- LABEL CERTIFICATE (v9.9.20). META_LABEL_SPEC alone is NOT authority:
+# an operator editing a string must not be able to change what the model is
+# fitted to. core/label_certificate.active_label() is what the forge calls,
+# and it is fail-closed on the house pattern (core/cascade.py:224).
+# A MONTH, not a week: the regime mix rotates on roughly that scale
+# (2026-08-07 was CHOP-dominant at 11 504s; 2026-08-10 HIGH_VOL at 12 500s),
+# and a target fitted inside one regime is a target fitted to one month of
+# weather. 22 sessions is a trading month.
+LABEL_CERT_MIN_SESSIONS = 22
+LABEL_CERT_MIN_TRADES   = 60
+LABEL_CERT_ALPHA        = 0.05
+LABEL_CERT_MDE_MULT     = 1.0
+LABEL_CERT_HOLDOUT      = 0.30
+LABEL_CERT_LADDER_STAGE = "PROMOTE"   # the strictest rung: this is the
+                                      # target every other number is measured
+                                      # against, not a detector knob
+LABEL_CERT_VALID_DAYS   = 45          # longer than EDGE_CERT_VALID_DAYS (7):
+                                      # a training target should not thrash
+                                      # weekly. Finite all the same.
+LABEL_CERT_ADMIT_FRAC   = 0.50   # both models admit the SAME COUNT per
+                                      # session, so the test isolates WHICH
+                                      # trades are chosen, not how many
+LABEL_CERT_PATH         = STATE_DIR / "label_certificate.json"
+
+# The DISCRIMINATION floor, used by BOTH the verdict line and the promotion
+# gate in core/meta_gbm.py. They used to disagree (report 0.53, gate 0.52):
+# on 2026-08-11 the equity meta scored 0.5210, the log said "NO RANKING
+# SIGNAL", and it promoted. 0.53 is the number the report already treated as
+# the bar. Refusing leaves the brain heuristic-only, which is strictly safer
+# than gating on a coin flip and then SIZING on it through Kelly.
+# ---- PAYOFF TARGET (v9.9.24). Predict the MAGNITUDE (R = P&L / initial
+# risk), not the sign. Sign prediction on index options is a coin at this
+# n_eff: 2026-08-11 gave AUC 0.5210 with a detectability floor of 0.587
+# (ICC 0.05) to 0.658 (ICC 0.20). Dispersion is forecastable where direction
+# is not, which is why rv_forecaster shows skill and the meta does not.
+# core/payoff_target.MEASURES predictability before it fits anything and
+# refuses to fit when the answer is no.
+# ---- DAY PLAN (v9.9.26). ONE thesis per session. The 2026-08-11 ledger is
+# the case: 5 of 6 trades were NIFTY puts, the 24400 strike entered THREE
+# times and stopped every time, -Rs1297 for the day. That is one thesis
+# re-expressed six times, and MAX_CONCURRENT_POSITIONS=1 cannot prevent it —
+# it bounds CONCURRENCY, not REPETITION, and COOLDOWN_S=180 is irrelevant
+# against re-entries 65 and 121 minutes apart.
+# OFF by default: this changes when and how often the system trades, so it
+# is A/B-able against the incumbent rather than a one-way door.
+# ---- RANGE REGIME (v9.9.27). The regime label EXISTS and is not a gate:
+# the funnel has no `range_bound` key. 2026-08-11 NIFTY trended for 2s of
+# 18047 (0.01%) and BANKNIFTY for 7s; the system took five directional
+# NIFTY put trades that session and stopped out on every one. Buying
+# premium for direction in a market that does not travel is a theta
+# donation. Lo-MacKinlay variance ratio at several horizons at once, with
+# the heteroskedasticity-robust z — intraday index data is violently
+# heteroskedastic and the homoskedastic z manufactures trend out of
+# volatility clusters.
+# OFF by default: whether refusing these entries PAYS is a question for
+# core/entry_counterfactual.py on the real tape, not an assumption.
+# ---- NEWS INTEL (v9.9.28). An LLM in the entry path is only defensible if
+# it is REPLAYABLE: the model runs once pre-open, the scalar is persisted to
+# state/news/news_<day>.json, and the live path and the forge replay read
+# the SAME bytes. Same discipline macro_gex already follows — compute live,
+# archive, replay the archive.
+# THREE separate switches, because recording a score, tilting on it, and
+# TRAINING on it are three different decisions with three different risks.
+# ---- CAS BOOK (v9.9.31). The closing auction is a different market and
+# gets its own container: its own capital slice, its own ledger, its own
+# slot. Sharing the day session's PositionManager meant a position open at
+# 15:15 made the auction unreachable, a CAS trade consumed the day's one
+# thesis, and the two P&Ls were pooled so the auction's edge could never be
+# measured — which is exactly what CAS_MIN_SESSIONS exists to answer.
+CAS_BOOK_ENABLED          = False
+CAS_CAPITAL_FRAC          = 0.25   # carved out, never borrowed back
+CAS_MAX_ENTRIES           = 1      # the auction is one event
+
+# ---- OVERNIGHT GAP (v9.9.31). GIFT NIFTY is on NSE IX and this account's
+# dump is NFO/BFO/MCX only, so `gift_gap_pct` is ABSENT rather than zero
+# until a token resolves. The realised 09:15 gap is observable today and is
+# what a 09:50 book can actually use.
+GAP_FDR_Q                 = 0.10
+
+NEWS_ENABLED              = False  # run the model at all
+NEWS_TILT_COMMIT          = False  # let it tilt the day-plan commit ranking
+NEWS_MODEL                = "gemma"
+# Feeding news into X adds a COLUMN and genuinely IS a different feature
+# world, so it must invalidate the caches. But leaving the name out of
+# _HASH_EXCLUDE rotates the hash the moment the constant EXISTS — even at
+# False — and that costs a full 12-hour rebuild for a switch nobody turned
+# on. So the name is excluded, and core/news_intel.meta_feature() refuses
+# to serve a column unless FEATURE_WORLD is ALSO bumped. The invalidation
+# is enforced in code rather than by hoping the operator remembers.
+NEWS_FEED_META            = False
+NEWS_FEED_META_WORLD      = "fw_news_v1"   # the FEATURE_WORLD value that
+                                           # must be in force before a news
+                                           # column may enter X
+
+RANGE_GATE_ENABLED        = False
+RANGE_Z_ALPHA             = 1.96   # two-sided 5% on the robust z
+RANGE_MIN_AGREE           = 2
+RANGE_ASSESS_EVERY_S      = 300    # re-assess this often. The variance ratio
+                                   # over ~18k samples is not cheap and the
+                                   # verdict does not flip second to second;
+                                   # the A/B caches on this grid.      # horizons that must agree. One window is
+                                   # an opinion; several agreeing is evidence.
+
+DAYPLAN_ENABLED           = False
+DAYPLAN_ANALYSIS_END_HM   = "09:45"  # observe only until here
+DAYPLAN_ENTRY_HM          = "09:50"  # commit window opens
+DAYPLAN_COMMIT_END_HM     = "10:20"  # ...and closes. Not a single instant:
+                                     # a 1s window misses the day on any
+                                     # loop jitter or stale quote.
+DAYPLAN_REVIEW_HM         = "12:30"  # re-ask the ENTRY question
+DAYPLAN_EXIT_HM           = "15:05"  # hard flat; replaces the theta clock
+DAYPLAN_CAS_START_HM      = "15:15"  # CAS is a SEPARATE session/book
+DAYPLAN_REVERSAL_CONV     = 0.40     # opposite-sign conv this strong = close
+DAYPLAN_DECAY_CONV        = 0.15     # |conv| below this = the edge is gone
+DAYPLAN_NEWS_WEIGHT       = 0.15     # bounded TILT on the commit score.
+                                     # Never a veto, never a driver: an
+                                     # unbounded LLM term would make the
+                                     # day's thesis unauditable.
+
+# MAX_HOLD_THETA under the day plan. The operator asked for its removal and
+# DAYPLAN_ENABLED does it. Recorded here because the evidence points the
+# other way: on 2026-08-11 the guillotine cut the day's WORST trade (SENSEX
+# 78300CE, -Rs670.50) which had peaked at 304.80 vs entry 300.35 — up 1.5%,
+# once — and sat at 270.20 when the clock fired. Removing it does not save
+# that trade, it lets it bleed another hour. What makes the removal
+# defensible is that DAYPLAN_EXIT_HM bounds the hold and the mid-session
+# review can close a dead thesis long before it. The stop and the disaster
+# floor are untouched.
+DAYPLAN_DISABLE_THETA     = True
+
+PAYOFF_FDR_Q            = 0.10
+
+META_MIN_AUC            = 0.53
+
+META_MIN_SERVE_SPREAD   = 0.05  # q95-q05 of the merged VA probability
+META_MIN_SERVE_DISTINCT = 12    # distinct merged values over the probe
+
 SHADOW_ENABLED          = True    # live parallel book (apex_main + commodity)
 SHADOW_MARK_S           = 1.0     # seconds between shadow marks
 SHADOW_MAX_STALE_S      = 120     # carry a dead quote this long, then NaN
@@ -1562,6 +1717,29 @@ _HASH_EXCLUDE = frozenset({
     # CONFIG_HASH: the shadow reads the same tape the engine trades and
     # trains nothing. A rotation here would invalidate every raw day cache
     # and re-run the forge for a knob that cannot change a decision.
+    # Promotion gates decide WHICH model serves, never what a feature is,
+    # so they must not rotate the hash and rebuild every day cache.
+    # Day-plan constants are SCHEDULING, not features — they change when a
+    # decision is taken, never what the model sees. Hash-excluded so an A/B
+    # does not rebuild every day cache.
+    # NEWS_ENABLED / NEWS_TILT_COMMIT / NEWS_MODEL are hash-excluded: they
+    # change WHETHER a recorded scalar is consulted, not what a feature is.
+    # NEWS_FEED_META is deliberately NOT here — feeding news into X changes
+    # the feature world and MUST rotate the hash and rebuild the caches.
+    "CAS_BOOK_ENABLED", "CAS_CAPITAL_FRAC", "CAS_MAX_ENTRIES", "GAP_FDR_Q",
+    "NEWS_ENABLED", "NEWS_TILT_COMMIT", "NEWS_MODEL",
+    "NEWS_FEED_META", "NEWS_FEED_META_WORLD",
+    "RANGE_GATE_ENABLED", "RANGE_Z_ALPHA", "RANGE_MIN_AGREE",
+    "RANGE_ASSESS_EVERY_S",
+    "DAYPLAN_ENABLED", "DAYPLAN_ANALYSIS_END_HM", "DAYPLAN_ENTRY_HM",
+    "DAYPLAN_COMMIT_END_HM", "DAYPLAN_REVIEW_HM", "DAYPLAN_EXIT_HM",
+    "DAYPLAN_CAS_START_HM", "DAYPLAN_REVERSAL_CONV", "DAYPLAN_DECAY_CONV",
+    "DAYPLAN_NEWS_WEIGHT", "DAYPLAN_DISABLE_THETA",
+    "PAYOFF_FDR_Q", "META_MIN_AUC", "META_MIN_SERVE_SPREAD", "META_MIN_SERVE_DISTINCT",
+    "META_LABEL_SPEC", "LABEL_CERT_MIN_SESSIONS", "LABEL_CERT_MIN_TRADES",
+    "LABEL_CERT_ALPHA", "LABEL_CERT_MDE_MULT", "LABEL_CERT_HOLDOUT",
+    "LABEL_CERT_LADDER_STAGE", "LABEL_CERT_VALID_DAYS", "LABEL_CERT_PATH",
+    "LABEL_CERT_ADMIT_FRAC",
     "SHADOW_ENABLED", "SHADOW_MARK_S", "SHADOW_MAX_STALE_S",
     "SHADOW_MIN_COVERAGE", "SHADOW_LEDGER_PATH", "SHADOW_MAX_OPEN",
     "SHADOW_SNAPSHOT_MAX_AGE_S", "SHADOW_POLICIES",

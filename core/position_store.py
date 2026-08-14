@@ -74,7 +74,14 @@ DURABLE = ("index", "direction", "symbol", "exchange", "token", "strike",
            "extends_used", "peak", "peak_ts", "trail_armed",
            "spike_ref_spot", "spike_ref_oi", "reversal_since",
            "theta_rides", "fast_lane", "entry_conviction",
-           "_dyn_tp_pct", "_dyn_src", "meta_gate_zone", "pnl_realized")
+           "_dyn_tp_pct", "_dyn_src", "meta_gate_zone", "pnl_realized",
+           # v9.9.33: the link to the live shadow. Without it a restored
+           # position falls back to shadow.id_for(symbol), which picks the
+           # NEWEST shadow for that symbol — and on 2026-08-11 the 24400
+           # strike was entered three times, so "newest" is not "mine".
+           # The exit would then be recorded as the baseline for the wrong
+           # trade and both shadows would be wrong.
+           "shadow_id")
 
 
 def _path(index: str) -> Path:

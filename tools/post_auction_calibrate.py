@@ -72,24 +72,61 @@ def main() -> int:
             idx = config.TRADABLE[0]
             if SC.is_bse(idx):
                 continue
+            # v9.9.32: THE 0/7 BUG. This used load_day, whose array is
+            # scenario_engine's 09:15->15:30 window (22 500 columns) —
+            # constants written before the 2026-08-03 reform. The
+            # post-auction window starts at t=22 800 and ends at 23 100, so
+            # `t40 >= bidA.shape[1]` was ALWAYS true and every session was
+            # rejected. The message blamed the harvester ("process shut at
+            # 15:30?"), which was never true: the 2026-08-11 harvester
+            # report has updated_utc 13:07Z = 18:37 IST, hours past the
+            # close. The tape was captured all along; the LOADER could not
+            # see it, so the counter could never leave 0/7 no matter how
+            # many sessions passed.
+            #
+            # simulation.session_paths is DATE-AWARE (session_calendar), so
+            # a pre-reform day still ends 15:30 and no window is fabricated.
             try:
-                loaded = load_day(con, day, idx)
+                from simulation.session_paths import load_session_paths
+                ps = load_session_paths(con, day, idx)
             except Exception as e:                         # noqa: BLE001
                 log.warning("  %s: %s", day, e)
                 continue
-            if not loaded:
+            if ps is None:
+                log.info("  %s: no ticks in the vault for this session", day)
                 continue
-            stok, by_sec, ti, bidA, askA = loaded
-            base = min(by_sec) if by_sec else 0
-            day0 = dt.datetime.combine(dt.date.fromisoformat(day),
-                                       dt.time(0, 0)).timestamp()
-            t35 = int(day0 + _hm_to_min("15:35") * 60 - base)
-            t40 = int(day0 + _hm_to_min("15:40") * 60 - base)
-            k = ti.get(stok)
-            if k is None or t35 < 0 or t40 >= bidA.shape[1] or t40 <= t35:
-                log.info("  %s: window not harvested (process shut at "
-                         "15:30?) — this session cannot contribute", day)
+            stok = None
+            try:
+                _r = con.execute("SELECT token FROM spot_tokens WHERE "
+                                 "snap_date=? AND name=?",
+                                 (day, idx)).fetchone()
+                stok = int(_r[0]) if _r else None
+            except Exception:                              # noqa: BLE001
+                stok = None
+            win = ps.window
+            t35 = win.sod_to_t(_hm_to_min("15:35") * 60)
+            t40 = win.sod_to_t(_hm_to_min("15:40") * 60)
+            k = ps.row(stok) if stok else None
+            if t35 < 0 or t40 > win.n or t40 <= t35:
+                log.info("  %s: session closes %s — the 15:35-15:40 window "
+                         "does not exist on this date (pre-reform)", day,
+                         win.close_hm)
                 continue
+            if k is None:
+                # Distinguish "no window" from "no data for the spot". The
+                # first is a fact about the date; the second is a plumbing
+                # failure, and conflating them cost six sessions of silence.
+                log.warning("  %s: session closes %s so the window EXISTS, "
+                            "but the spot token %s has no path in the vault "
+                            "— this is a data/plumbing problem, not a "
+                            "calendar one", day, win.close_hm, stok)
+                continue
+            # Bind EVERY name the old load_day tuple provided. The first
+            # port bound only `bidA`, and the spread loop eleven lines below
+            # still referenced `ti`/`askA` — NameError at runtime, after
+            # 267s of replay. A partial rename is worse than none: it fails
+            # late, in the one branch that only runs on post-reform days.
+            ti, bidA, askA = ps.ti, ps.bid, ps.ask
             seg = np.asarray(bidA[k, t35:t40], dtype=float)
             seg = seg[np.isfinite(seg) & (seg > 0)]
             if seg.size < 30:
@@ -101,7 +138,14 @@ def main() -> int:
             spot_ref.append(float(seg[0]))
             # round-trip spread on the tokens that DID quote in the window
             sp = []
-            for tok, kk in list(ti.items())[:400]:
+            # TWO-SIDED ONLY. ps.two_sided is the set that had a real bid
+            # AND ask; an index spot is a computed level carrying bid=ask=0,
+            # so including it would contribute a 0% spread and drag the
+            # median toward zero — the exact artifact that made SENSEX look
+            # zero-depth in the July audit.
+            _quoted = [(tk, kk) for tk, kk in ti.items()
+                       if tk in (ps.two_sided or set())]
+            for tok, kk in _quoted[:400]:
                 b = np.asarray(bidA[kk, t35:t40], float)
                 s_ = np.asarray(askA[kk, t35:t40], float)
                 m = np.isfinite(b) & np.isfinite(s_) & (b > 0) & (s_ > 0)

@@ -128,6 +128,55 @@ def make_adapters(rep):
     return chain_fn, quote_fn
 
 
+def _sweep_day_worker(args):
+    """ONE session, every bar, in its own process. Module-level and
+    picklable by design.
+
+    v9.9.16: this was a serial loop in main(). Measured on the 2026-08-09
+    run it cost ~15 MINUTES PER DAY — 9.8 hours across 38 sessions, the
+    single most expensive step in the whole evening chain, larger than
+    cascade and shortvol combined.
+
+    Profiling showed the BarSweep itself is NOT the cost: 3.4s per day for
+    3 indices x 14 bars (336k quote marks, 320k policy steps). The 15
+    minutes is the uncached _Replayer pass — `decide` and `actions_fn` each
+    run HeuristicPolicy().predict per second per index, and unlike the
+    forge's own path this replay is not served from DC. So the fix is not
+    to micro-optimise the sweep; it is to stop running 38 independent
+    replays down a single core while nineteen threads idle — exactly the
+    defect this tool's own harness siblings had.
+
+    SQLite handles and the policy object cannot cross a process boundary,
+    so the worker builds its own, the same way _cascade_day_worker does.
+    """
+    day, bars, N = args
+    import sqlite3 as _sq
+    from nightly_forge_v9 import _Replayer, _eval_meta, _eval_cal
+    from core.heuristic_policy import HeuristicPolicy
+
+    con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    try:
+        meta, cal = _eval_meta(), _eval_cal()
+        _pol = HeuristicPolicy()
+
+        def decide(obs, frame, iidx):
+            return float(_pol.predict(frame)[2 * iidx])
+
+        def actions_fn(_o, _f):
+            return _pol.predict(_f)
+
+        return sweep_day(con, day, decide, meta, cal, bars,
+                         actions_fn=actions_fn)
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("  %s: sweep failed (%s)", day, e)
+        return None
+    finally:
+        try:
+            con.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
 def sweep_day(con, day, decide, meta, cal, bars, actions_fn=None) -> dict:
     """One session, every bar, one pass. Returns {policy: realised ₹}."""
     from nightly_forge_v9 import _Replayer
@@ -227,19 +276,27 @@ def main() -> int:
         days = sorted({r[0] for r in con.execute(
             "SELECT DISTINCT date(ts_local_ms/1000,'unixepoch','localtime') "
             "FROM ticks_v9")})
-        if a.days > 0:
-            days = days[-a.days:]
-        log.info("sweeping %d session(s)", len(days))
-        for d in days:
-            try:
-                pnl, s = sweep_day(con, d, decide, meta, cal, bars,
-                                   actions_fn=actions_fn)
-                per_day[d] = pnl
-                detail[d] = s
-            except Exception as e:                         # noqa: BLE001
-                log.warning("  %s skipped (%s)", d, e)
     finally:
         con.close()
+    if a.days > 0:
+        days = days[-a.days:]
+    log.info("sweeping %d session(s) across a pool — every bar sees the "
+             "identical signal stream within a day, so the pairing is "
+             "unaffected by which worker ran it", len(days))
+
+    from core.parallel_days import map_days
+    from simulation.scenario_engine import N as _N
+    _res = map_days(_sweep_day_worker, [(d, bars, _N) for d in days],
+                    desc="entry bar sweep", log_every=2)
+    for _d, _o in zip(days, _res):
+        if _o is None:
+            log.warning("  %s: no result — session omitted from EVERY bar "
+                        "(dropping it from one bar only would break the "
+                        "pairing)", _d)
+            continue
+        pnl, s = _o
+        per_day[_d] = pnl
+        detail[_d] = s
 
     if len(per_day) < 3:
         log.info("only %d usable session(s) — nothing to conclude",

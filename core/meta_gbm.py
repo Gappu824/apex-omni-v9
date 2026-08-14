@@ -137,6 +137,73 @@ def _isotonic(p: np.ndarray, y: np.ndarray, w: np.ndarray):
     return bx, by
 
 
+def serve_spread(scores, y, w, cap: int = 4000, probe: int = 1500,
+                 seed: int = 0):
+    """What the GATE WILL ACTUALLY EMIT — measured, not proxied.
+
+    meta_gbm has measured a calibrated OOF spread since the 2026-07-23
+    audit (the promoted meta was serving a constant 0.23). That check fits
+    ONE isotonic map over the OOF set and measures its spread. Serving does
+    something else entirely: core.meta_gate builds an IVAP — TWO isotonic
+    fits PER QUERY — and reports (p0, p1) merged. Those are different
+    estimators, and passing one says nothing about the other. On matched
+    synthetic data the isotonic map carried 925 distinct values while the
+    Venn-Abers merge carried 36: a ~26x resolution collapse the old check
+    could not see.
+
+    2026-08-10 is what that costs. The artifact loaded clean
+    (holdout_acc=0.7449, n=1901, va=yes) and the feature-integrity tripwire
+    stayed silent all session — live features genuinely varied. Yet across
+    14 655 evaluations per index the served win probability took two
+    values, 0.204 and 0.4557, and "EV: optimistic p1 0.20 < p*" became the
+    single largest block reason on every index. The gate was deciding on
+    p* alone.
+
+    So this builds the REAL VennAbers serving uses, over a stride of the
+    same OOF payload, and reports the spread and distinct count of the
+    merged probability. It imports meta_gate lazily: meta_gate imports this
+    module, and a top-level import would close the cycle.
+    """
+    import numpy as _np
+    try:
+        from core.meta_gate import VennAbers
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("serve-spread diagnostic unavailable (%s) — promotion "
+                    "will fall back to the isotonic proxy, which cannot "
+                    "see a Venn-Abers collapse", e)
+        return None
+
+    s = _np.asarray(scores, float)
+    if s.size < 50:
+        return None
+    if s.size > cap:                       # same cap serving applies
+        idx = _np.linspace(0, s.size - 1, cap).astype(int)
+        s, y, w = s[idx], _np.asarray(y)[idx], _np.asarray(w)[idx]
+    try:
+        va = VennAbers(s, _np.asarray(y, float), _np.asarray(w, float))
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("VennAbers construction failed (%s)", e)
+        return None
+
+    rng = _np.random.default_rng(seed)
+    q = rng.choice(s, size=min(probe, s.size), replace=True)
+    merged, p0s, p1s = [], [], []
+    for v in q:
+        a, b = va.interval(float(v))
+        p0s.append(a)
+        p1s.append(b)
+        merged.append(VennAbers.merge(a, b))
+    merged = _np.asarray(merged, float)
+    return {
+        "spread": float(_np.quantile(merged, 0.95)
+                        - _np.quantile(merged, 0.05)),
+        "distinct": int(len(_np.unique(_np.round(merged, 4)))),
+        "p1_distinct": int(len(_np.unique(_np.round(p1s, 4)))),
+        "p0_distinct": int(len(_np.unique(_np.round(p0s, 4)))),
+        "median": float(_np.median(merged)), "n_probe": int(merged.size),
+    }
+
+
 def fit_gbm(perday: list[tuple], min_train: int,
             oof_out: dict | None = None,
             model_path: Path | None = None) -> dict | None:
@@ -316,10 +383,21 @@ def fit_gbm(perday: list[tuple], min_train: int,
     # eating it; that is a fixable problem and argues for a RELATIVE gate.
     _auc_raw = _auc(Y[got], oof_p[got])
     _auc_cal = _auc(Y[got], _cal_oof)
+    # v9.9.23: ONE threshold, used by the verdict line AND the gate below.
+    # They disagreed: the report called anything <= 0.53 "NO RANKING SIGNAL"
+    # while the gate refused only below 0.52. On 2026-08-11 the equity meta
+    # scored _auc_cal = 0.5210 — the log printed NO RANKING SIGNAL and the
+    # gate promoted it anyway, because the stricter number was cosmetic.
+    # A system that states a model cannot rank and then ships it is worse
+    # than one that never measured: it produces an audit trail that says
+    # the right thing while the wrong thing happens.
+    _min_auc = getattr(config, "META_MIN_AUC", 0.53)
+    _ranks = (_auc_cal == _auc_cal and _min_auc is not None
+              and _auc_cal > float(_min_auc))
     log.info("META DISCRIMINATION | AUC raw %.4f | AUC calibrated %.4f "
-             "(0.500 = no ordering ability) -> %s", _auc_raw, _auc_cal,
-             "NO RANKING SIGNAL" if not (_auc_cal > 0.53)
-             else "ranks better than chance")
+             "(0.500 = no ordering ability; gate at %.3f) -> %s",
+             _auc_raw, _auc_cal, float(_min_auc if _min_auc else 0.0),
+             "ranks better than chance" if _ranks else "NO RANKING SIGNAL")
     if _auc_raw > 0.55 >= _auc_cal:
         log.warning("CALIBRATION IS DESTROYING RANKING: the booster orders "
                     "signals (AUC %.4f) but the calibrated output does not "
@@ -335,8 +413,7 @@ def fit_gbm(perday: list[tuple], min_train: int,
     # that ACTS on it. A gate model that cannot rank cannot gate: served
     # through Kelly it sizes on noise. Refusing leaves the brain heuristic-only,
     # which is strictly safer, so this one defaults to ARMED.
-    _min_auc = getattr(config, "META_MIN_AUC", 0.52)
-    if _min_auc is not None and _auc_cal == _auc_cal and _auc_cal < float(_min_auc):
+    if not _ranks and _min_auc is not None and _auc_cal == _auc_cal:
         log.warning("META NOT PROMOTED: calibrated AUC %.4f < META_MIN_AUC "
                     "%.4f — the model does not order winners above losers "
                     "(0.500 = chance). Any headline accuracy here is just the "
@@ -344,6 +421,34 @@ def fit_gbm(perday: list[tuple], min_train: int,
                     "stays heuristic-only.", _auc_cal, float(_min_auc),
                     100.0 * (1.0 - float(Y[got].mean())))
         return None
+    # ---- v9.9.18: gate on what SERVING emits, not the isotonic proxy.
+    # Reached only if the model can rank at all — spread without ordering
+    # is a model that emits varied numbers in no useful sequence, and
+    # 2026-08-11 is the proof: serve spread 0.0684 over 17 distinct values
+    # cleared this block while AUC sat at 0.4988 raw / 0.5210 calibrated.
+    # Spread is necessary, never sufficient.
+    _srv = serve_spread(_vs, _vy, _vw,
+                        cap=int(getattr(config, "META_VA_MAX_CAL", 4000)))
+    if _srv is not None:
+        log.info("META SERVE-PATH (Venn-Abers, what the gate actually "
+                 "emits): spread %.4f over %d distinct value(s) "
+                 "[p0:%d p1:%d] | isotonic proxy said spread %.4f over %d",
+                 _srv["spread"], _srv["distinct"], _srv["p0_distinct"],
+                 _srv["p1_distinct"], _spread, _distinct)
+        _need_sp = float(getattr(config, "META_MIN_SERVE_SPREAD", 0.05))
+        _need_di = int(getattr(config, "META_MIN_SERVE_DISTINCT", 12))
+        if _srv["spread"] < _need_sp or _srv["distinct"] < _need_di:
+            log.error("META NOT PROMOTED: the SERVE path is degenerate — "
+                      "spread %.4f (need %.4f) over %d distinct value(s) "
+                      "(need %d). On 2026-08-10 a model that passed the "
+                      "isotonic check served two values, 0.204 and 0.4557, "
+                      "across 14 655 evaluations and 'optimistic p1 0.20 < "
+                      "p*' became the largest block reason on every index. "
+                      "A gate fed a near-constant is the base rate wearing "
+                      "a model's clothes: it cannot discriminate, so it "
+                      "blocks or passes on p* alone. Keeping the incumbent.",
+                      _srv["spread"], _need_sp, _srv["distinct"], _need_di)
+            return None
     _min_spread = getattr(config, "META_MIN_OOF_SPREAD", None)
     if _spread < 0.02:
         log.warning("META OUTPUT NEARLY CONSTANT: calibrated OOF p05-p95 "

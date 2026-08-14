@@ -106,7 +106,22 @@ GROUPS = [
                           # cooldown caps the session at ~5 trades, so the
                           # bar chooses WHICH slots fill, never HOW MANY.
                           # Promotion is OFF by default.
-                          "tools/entry_bar_study.py"]),
+                          "tools/entry_bar_study.py",
+                          # v9.9.25: also here, so a weekly-only operator
+                          # still gets the R-target measurement even if
+                          # run_training is not on a nightly schedule.
+                          # Idempotent — it reads a published matrix and
+                          # writes a report; running it twice costs seconds.
+                          "tools/payoff_study.py",
+                          # v9.9.29: 2x2 factorial A/B of the day plan and
+                          # the range gate on the real tape, paired by
+                          # session. Both gates ship OFF; this is what tells
+                          # you what they WOULD have done before either is
+                          # armed. Weekly, not nightly: it replays every
+                          # session four times and changes no artifact the
+                          # brain reads tomorrow.
+                          "tools/gate_ab_study.py",
+                          "tools/label_cert_report.py"]),
     # v9.9.3: the analyst runs LAST — its brief can now digest the forge
     # verdicts and the ₹ exam, and its model no longer squats in RAM ahead
     # of the heaviest stages.
@@ -156,14 +171,58 @@ def _day_is_complete(force: bool = False) -> tuple[bool, str]:
         if newest >= need - _dt.timedelta(minutes=5):
             return (True, f"newest tick {newest:%H:%M:%S} ≥ last close "
                           f"{last_hm} — the day is complete")
-        return (False, f"newest tick for {today} is {newest:%H:%M:%S}, but "
-                       f"the last session closes {last_hm}. The tape is "
-                       f"INCOMPLETE — calibration, the forge retrain and the "
-                       f"bar sweep would all fit a truncated day and none of "
-                       f"them would raise. Wait for the close, or re-run "
-                       f"with --force if this is a deliberate catch-up.")
+        return (False, f"{today} is INCOMPLETE — newest tick {newest:%H:%M:%S}, but "
+                       f"the last session closes {last_hm}. Anything that "
+                       f"fits today's data (calibration, the forge retrain, "
+                       f"the bar sweep) will fit a truncated session, and "
+                       f"none of them would raise.")
     except Exception as e:                                 # noqa: BLE001
         return (True, f"completeness check unavailable ({e}) — proceeding")
+
+
+
+_CADENCE_STAMP = "evening_last_run.json"
+
+
+def _cadence_note(force: bool) -> str:
+    """run_evening is the WEEKLY chain; run_training is the daily one.
+
+    The split is not stylistic. run_training produces the artifacts the
+    brain reads at the next open (calibration, the meta, the regime gates)
+    and finishes in hours. run_evening adds fifteen more steps of evidence
+    and research — harnesses, sweeps, certificates — that change no
+    decision tomorrow morning. Running the heavy chain nightly costs a
+    working day per week and buys nothing the brain uses; running the light
+    one weekly means trading Tuesday through Friday on Monday's model, with
+    nothing that warns you.
+    """
+    import datetime as _dt
+    import json as _json
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import config
+        p = config.STATE_DIR / _CADENCE_STAMP
+        now = _dt.datetime.now()
+        prev = None
+        if p.exists():
+            try:
+                prev = _dt.datetime.fromisoformat(
+                    _json.loads(p.read_text())["last"])
+            except Exception:                              # noqa: BLE001
+                prev = None
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_json.dumps({"last": now.isoformat()}))
+        if prev is None:
+            return "first recorded run — weekly cadence starts now"
+        age = (now - prev).total_seconds() / 86400.0
+        if age < 5.0 and not force:
+            return (f"last full run was {age:.1f} day(s) ago. This is the "
+                    f"WEEKLY chain; run_training.py is the daily one. "
+                    f"Running anyway — most steps will be served from cache.")
+        return f"last full run {age:.1f} day(s) ago — on cadence"
+    except Exception as e:                                 # noqa: BLE001
+        return f"cadence stamp unavailable ({e})"
 
 
 def _load_timings() -> dict:
@@ -282,6 +341,10 @@ def main() -> int:
                     help="max concurrent tools inside a parallel group "
                          "(default 2; each still gets its own day-worker "
                          "pool, sized so the machine-wide total is capped)")
+    ap.add_argument("--strict", action="store_true",
+                    help="refuse to run on an incomplete tape (for "
+                         "unattended/scheduled runs, where nobody is "
+                         "reading the warning)")
     ap.add_argument("--force", action="store_true",
                     help="run even if today's tape is incomplete (catch-up "
                          "or a deliberate partial-day analysis)")
@@ -294,11 +357,29 @@ def main() -> int:
                 par and not a.serial) else "serial"
             print(f"[{name:8s}] {mode:12s} {', '.join(steps)}")
         return 0
+    # v9.9.22: WARN, do not block. The first version of this exited 2 on a
+    # partial tape, which was the wrong call: run_evening is overwhelmingly
+    # EVIDENCE tooling over the 38 complete days already in the vault, and
+    # one incomplete day at the end does not corrupt them — it only adds a
+    # short sample the operator should know about. Refusing to start also
+    # breaks the legitimate case of re-running mid-afternoon after a fix.
+    # The information is what matters; the decision is the operator's.
+    # `--strict` restores the hard block for unattended/scheduled runs,
+    # where nobody is reading the warning.
+    print(f"[cadence] {_cadence_note(getattr(a, 'force', False))}")
     ok, why = _day_is_complete(getattr(a, "force", False))
-    if not ok and not getattr(a, "force", False):
+    if not ok:
+        print("[preflight] WARNING: " + why)
+        if getattr(a, "strict", False) and not getattr(a, "force", False):
+            print("[preflight] --strict is set — refusing to run on a "
+                  "partial tape. Drop --strict, or pass --force.")
+            return 2
+        print("[preflight] proceeding anyway. The 38 complete day(s) in the "
+              "vault are unaffected; only today's short sample is in "
+              "question. Use --days N on the individual tools if you want "
+              "it excluded.")
+    else:
         print(f"[preflight] {why}")
-        return 2
-    print(f"[preflight] {why}")
     global _MASTER
     _timings = _load_timings()
     LOG_DIR.mkdir(parents=True, exist_ok=True)

@@ -58,6 +58,8 @@ from core.exit_policies import (PolicySpec, PolicyState, TradeCtx, step,
 
 log = logging.getLogger("shadow_book")
 
+_SNAP_EVERY_S = 30.0   # snapshot deadline; see mark()
+
 SHADOW_FIELDS = ["ts", "event", "shadow_id", "index", "symbol", "token",
                  "kind", "side", "qty", "entry_px", "entry_ts",
                  "real_exit_px", "real_exit_ts", "real_pnl", "real_reason",
@@ -165,6 +167,7 @@ class ShadowBook:
         self.open: dict[str, ShadowTrade] = {}
         self.done: list[ShadowTrade] = []
         self._last_mark = 0.0
+        self._last_snap = 0.0
         self._dirty = False
         self._specs = PolicySpec.family()
         self._ledger = Path(ledger_path or getattr(
@@ -243,9 +246,34 @@ class ShadowBook:
             age = time.time() - float(body.get("_saved_ts") or 0)
             max_age = float(getattr(config, "SHADOW_SNAPSHOT_MAX_AGE_S", 900))
             if age > max_age:
+                # Discarding is right — a stale snapshot's peaks and MFE
+                # describe a tape we stopped watching, and marking on from
+                # them would be worse than not marking. But VANISHING is
+                # not right: on 2026-08-10 two shadows disappeared leaving
+                # only this warning, so the study saw two trades that were
+                # never opened. Record the abandonment so the absence is
+                # explicit and countable.
+                lost = body.get("open", []) or []
                 log.warning("shadow snapshot is %.0fs old (> %.0fs) — "
-                            "discarded; the tape moved unobserved",
-                            age, max_age)
+                            "discarded; %d shadow(s) ABANDONED (recorded, "
+                            "not hidden)", age, max_age, len(lost))
+                for d in lost:
+                    try:
+                        self._row(ts=f"{time.time():.3f}",
+                                  event="SHADOW_ABANDONED",
+                                  shadow_id=d.get("shadow_id", ""),
+                                  index=d.get("index", self.index),
+                                  symbol=d.get("symbol", ""),
+                                  token=d.get("token", ""),
+                                  kind=d.get("kind", ""),
+                                  entry_px=(d.get("ctx") or {}).get("entry"),
+                                  entry_ts=d.get("entry_ts"),
+                                  real_pnl=d.get("real_pnl"),
+                                  real_reason=d.get("real_reason"),
+                                  coverage=f"{age:.0f}s_stale",
+                                  config_hash=config.CONFIG_HASH)
+                    except Exception:                      # noqa: BLE001
+                        pass
                 p.unlink(missing_ok=True)
                 return 0
             for d in body.get("open", []):
@@ -340,9 +368,27 @@ class ShadowBook:
                 if t.all_closed():
                     self._finish(t, now)
                     finished += 1
-            if finished or (self.open and int(now) % 30 == 0):
+            # v9.9.17: DEADLINE, not coincidence. This was
+            # `int(now) % 30 == 0`, which requires a mark to land inside a
+            # specific one-second window. The brain loop is not aligned to
+            # integer seconds and does not tick at exactly 1 Hz, so whole
+            # seconds get skipped and multiples of 30 are missed outright.
+            # On 2026-08-10 the last snapshot before the 10:58 restart was
+            # written at 10:31 — 1672s stale — so the age fence discarded it
+            # and TWO live shadows were lost mid-session. A deadline cannot
+            # be skipped: it fires on the first mark past the interval.
+            if finished or (self.open and
+                            (now - self._last_snap) >= _SNAP_EVERY_S):
+                self._last_snap = now
                 self._dirty = True
                 self.snapshot()
+                # Pins carry a TTL (core.token_pins.PIN_TTL_S) so a crashed
+                # process cannot starve the subscription budget forever.
+                # That means they must be REFRESHED while we are still
+                # marking — publishing once at entry lets the pin expire
+                # mid-trade and the harvester prunes the very leg we are
+                # measuring. Coverage on 2026-08-10 was 22%.
+                self._republish_pins()
             return finished
         except Exception as e:                             # noqa: BLE001
             log.warning("shadow mark failed (%s) — trading is unaffected", e)
@@ -454,6 +500,14 @@ class ShadowBook:
             return 0
 
     # ------------------------------------------------------------- pins
+    def _republish_pins(self) -> None:
+        """Refresh this book's pins so they never age out while marking."""
+        try:
+            from core import token_pins as TP
+            TP.publish(f"shadow:{self.index}", self.pinned_tokens())
+        except Exception as e:                             # noqa: BLE001
+            log.debug("pin republish failed (%s)", e)
+
     def pinned_tokens(self) -> set[int]:
         """Tokens the harvester must NOT prune: a shadow marking a leg
         that has been unsubscribed is measuring a corpse."""

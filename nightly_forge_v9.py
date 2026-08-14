@@ -868,6 +868,54 @@ def train_meta(con, days: list[str]):
                  float(np.mean(w)) if w else float("nan"))
     n = sum(len(x) for _, x, _, _ in perday)
     diag = {"n": n, "per_day": {d: len(x) for d, x, _, _ in perday}}
+
+    # ---- v9.9.25: publish the training matrix for the PAYOFF target.
+    # core/payoff_target.py predicts R = P&L / initial risk instead of
+    # P(win). The equity meta scored AUC 0.5210 on 2026-08-11 against a
+    # detectability floor of 0.587-0.658 at this n_eff — sign prediction on
+    # index options is not resolvable here, while dispersion is (the same
+    # reason rv_forecaster shows skill and the meta does not).
+    #
+    # Everything that target needs is ALREADY computed above and then
+    # discarded: `ret` is the per-sample barrier P&L and ECON carries
+    # (entry_ask, tp, sl, lot) — the payoff geometry the label was graded
+    # on. Risk is (entry_ask - sl) * lot, so R = ret / risk needs no new
+    # replay and no join to the shadow ledger. Writing it costs one file.
+    try:
+        import numpy as _np
+        _Xs, _rets, _risks, _days, _ws = [], [], [], [], []
+        for _d in days:
+            _x, _y, _w, _r, _ret, _ec = _gen_meta_samples_cached(con, _d)
+            for _i in range(len(_x)):
+                try:
+                    _ea, _tp, _sl, _lot = _ec[_i]
+                    _risk = abs(float(_ea) - float(_sl)) * float(_lot)
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if _risk <= 0:
+                    continue
+                _Xs.append(_x[_i]); _rets.append(float(_ret[_i]))
+                _risks.append(_risk); _days.append(_d); _ws.append(float(_w[_i]))
+        if _Xs:
+            _mp = config.STATE_DIR / "meta_train_matrix.npz"
+            _mp.parent.mkdir(parents=True, exist_ok=True)
+            _tmp = _mp.with_suffix(".tmp.npz")
+            # np.savez appends .npz to a name that lacks it — the 2026-08-05
+            # WinError 5 that broke every atomic cache publication. The name
+            # already ends in .npz, so os.replace sees the file it expects.
+            _np.savez(_tmp, X=_np.asarray(_Xs, _np.float32),
+                      ret=_np.asarray(_rets, _np.float64),
+                      risk=_np.asarray(_risks, _np.float64),
+                      day=_np.asarray(_days), w=_np.asarray(_ws, _np.float64),
+                      config_hash=_np.asarray([config.CONFIG_HASH]))
+            import os as _os
+            _os.replace(_tmp, _mp)
+            log.info("payoff matrix published: %d row(s) x %d feature(s) "
+                     "over %d day(s) -> %s", len(_Xs),
+                     _np.asarray(_Xs).shape[1], len(set(_days)), _mp)
+    except Exception as _e:                                # noqa: BLE001
+        log.warning("payoff matrix not published (%s) — the meta path is "
+                    "unaffected; only the R-target study is skipped", _e)
     # DRIFT REFERENCE — the ALL-TICK feature world of the training pool. Built
     # BEFORE the sample-count gate below (v9.1.2 fix): the reference has NO
     # dependency on the meta model — it is the population the live monitor
