@@ -1244,6 +1244,47 @@ SV_CERT_CI              = 0.90    # … bootstrap CI lower bound of ₹/event > 
 # The nightly forge shadow-grades blocked signals on the promotion day through
 # the SAME ask-entry barrier grader and attributes would-be ₹ to the gate that
 # killed each one. Off-policy evaluation of the rulebook; report-only.
+# ---- EPISODE RANKER (v9.9.35). A different unit, target and question.
+# Four classifiers scored at chance on "will this win?" because 63 rows per
+# session are near-duplicates: n=1953 carries n_eff 146-476, and the
+# detectable AUC floor is 0.585-0.655 against an observed 0.5070. The same
+# code promoted the commodity meta at 0.5979 the same night, so the
+# machinery is not the problem.
+# Episodes (non-overlapping), R = P&L/risk, and RANKING WITHIN A SESSION —
+# because MAX_CONCURRENT_POSITIONS=1 makes this a selection problem, not a
+# threshold one. Ranking is a weaker claim than calibration, and weaker
+# claims are what low n_eff can support.
+# ---- SEQUENCE MODEL (v9.9.36). CNN-GRU over the APPROACH — the last few
+# minutes of tape before a signal — rather than the snapshot at the instant
+# it fired. That is the one place a neural net beats the trees already here,
+# and it is an advantage in REPRESENTATION, not capacity: it does not need
+# more sessions, which is exactly what this vault lacks.
+# The architecture is not the deliverable. The CONTROLS are: a shuffled-
+# label run of the identical pipeline (this vault's overfitting floor) and a
+# held-out month never touched by fitting, folds or early stopping.
+SEQ_WINDOW_S           = 300    # seconds of approach fed to the encoder
+SEQ_HOLDOUT_SESSIONS   = 22     # a trading month, removed before anything
+                                # is fitted. Not a CV fold.
+SEQ_CONTROL_RUNS       = 5      # shuffled-label repeats; the SD of these is
+                                # the noise the real margin must clear
+SEQ_MC_PASSES          = 20   # dropout-on forward passes at inference.
+                              # Ensemble variance asks "do seeds agree?";
+                              # MC-dropout asks "is THIS input in a region
+                              # the net knows?" — the distinction the
+                              # constant-0.204 meta could not express.
+SEQ_N_TRIALS           = 25   # forge_report.trials_for_deflation. Every
+                              # study added here raises the real count;
+                              # keep this in step or the DSR flatters.
+SEQ_MIN_DSR            = 0.95 # P(true Sharpe > 0) after deflation
+SEQ_MODEL_ENABLED      = False  # serving switch; the study runs regardless
+
+EPISODE_ALPHA          = 0.05
+EPISODE_MIN_STABILITY  = 0.60   # fraction of folds that must pick the same
+                                # top feature. An unstable selection is a
+                                # different model per fold, and its OOF score
+                                # describes none of them.
+EPISODE_RANKER_ENABLED = False  # serving switch; measurement runs regardless
+
 CF_NEAR_MISS    = 0.05    # bootstrap-bar near-miss band: shadow |conv| ≥ bar−this
 CF_MAX_PER_GATE = 400     # per-gate/day shadow cap (sampling noted in report)
 
@@ -1868,6 +1909,11 @@ _HASH_EXCLUDE = frozenset({
     "SV_FLY_WING_STEPS", "SV_FLY_MIN_DEBIT_FRAC", "SV_FLY_MAX_DEBIT_FRAC",
     "SV_FLY_TP_FRAC", "SV_FLY_SL_FRAC",
     "SV_CLOSE_HM", "SV_ATTEMPT_THROTTLE_S", "SV_POP_HAIRCUT", "SV_RISK_PCT",
+    "SEQ_WINDOW_S", "SEQ_HOLDOUT_SESSIONS", "SEQ_CONTROL_RUNS",
+    "SEQ_MC_PASSES", "SEQ_N_TRIALS", "SEQ_MIN_DSR",
+    "SEQ_MODEL_ENABLED",
+    "EPISODE_ALPHA", "EPISODE_MIN_STABILITY",
+    "EPISODE_RANKER_ENABLED",
     "CF_NEAR_MISS", "CF_MAX_PER_GATE",
     "LC_WINDOW", "LC_MIN_EVENTS", "MACRO_TERM_STRUCTURE", "TERM_BAND_STEPS",
     "STRESS_SPLIT_HM", "RCT_LIMIT_TIMEOUT_S", "RCT_MIN_FIT",

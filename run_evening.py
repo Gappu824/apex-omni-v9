@@ -113,6 +113,8 @@ GROUPS = [
                           # Idempotent — it reads a published matrix and
                           # writes a report; running it twice costs seconds.
                           "tools/payoff_study.py",
+                          "tools/episode_study.py",
+                          "tools/seq_study.py",
                           # v9.9.29: 2x2 factorial A/B of the day plan and
                           # the range gate on the real tape, paired by
                           # session. Both gates ship OFF; this is what tells

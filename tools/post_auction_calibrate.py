@@ -65,6 +65,7 @@ def main() -> int:
     from simulation.replay_real_day import load_day
     con = sqlite3.connect(str(config.DB_PATH))
     moves, spreads, sessions, spot_ref = [], [], [], []
+    degenerate = 0   # sessions whose window held no REAL spot tick
     try:
         days = [d for d in trading_days(con) if SC.cas_in_force(d)]
         log.info("%d post-reform session(s) in the vault", len(days))
@@ -127,13 +128,40 @@ def main() -> int:
             # 267s of replay. A partial rename is worse than none: it fails
             # late, in the one branch that only runs on post-reform days.
             ti, bidA, askA = ps.ti, ps.bid, ps.ask
-            seg = np.asarray(bidA[k, t35:t40], dtype=float)
-            seg = seg[np.isfinite(seg) & (seg > 0)]
-            if seg.size < 30:
-                log.info("  %s: only %d tick(s) in the window — skipped",
-                         day, seg.size)
+            # COUNT REAL TICKS, NOT CARRIED COPIES.
+            # session_paths forward-fills a quote for up to
+            # SHADOW_MAX_STALE_S. If the spot feed stops at the auction, the
+            # window fills with ~120 IDENTICAL carried samples, sails past a
+            # size>=30 floor, and reports a range of EXACTLY 0.00. On
+            # 2026-08-14 all seven sessions did precisely that (FRESH=1,
+            # usable=121) and the tool then wrote an ADVERSE certificate
+            # shutting the window permanently — on an artifact, not a
+            # market fact. A wrong certificate is worse than no certificate.
+            seg_raw = np.asarray(bidA[k, t35:t40], dtype=float)
+            fresh_m = ps.fresh_mask(stok)
+            fresh_m = (np.asarray(fresh_m[t35:t40], dtype=bool)
+                       if fresh_m is not None
+                       else np.isfinite(seg_raw))
+            seg = seg_raw[fresh_m & np.isfinite(seg_raw) & (seg_raw > 0)]
+            min_fresh = int(getattr(config, "POST_AUCTION_MIN_FRESH", 30))
+            if seg.size < min_fresh:
+                log.warning("  %s: only %d REAL tick(s) in 15:35-15:40 "
+                            "(%d sample(s) survive once carried copies are "
+                            "removed). The spot is not disseminated through "
+                            "this window on this session — NOT counted, and "
+                            "no certificate is issued from it.",
+                            day, int(seg.size),
+                            int((np.isfinite(seg_raw) & (seg_raw > 0)).sum()))
+                degenerate += 1
                 continue
             mv = float(seg.max() - seg.min())
+            if mv <= 0.0:
+                log.warning("  %s: %d real tick(s) but range is EXACTLY 0.00 "
+                            "— a disseminated index does not hold one value "
+                            "for five minutes. Treating as no data.",
+                            day, int(seg.size))
+                degenerate += 1
+                continue
             moves.append(mv)
             spot_ref.append(float(seg[0]))
             # round-trip spread on the tokens that DID quote in the window

@@ -204,6 +204,24 @@ def serve_spread(scores, y, w, cap: int = 4000, probe: int = 1500,
     }
 
 
+
+def _x_schema(width: int) -> str:
+    """Fingerprint of the FEATURE LAYOUT the artifact was trained on.
+
+    Deliberately separate from CONFIG_HASH. CONFIG_HASH answers "is this the
+    same feature WORLD" (and so governs cache invalidation); this answers
+    "is this the same COLUMN LAYOUT" (and so governs whether a stored model
+    may be served). They diverge exactly where a serving-side switch changes
+    the vector without changing the data — META_CROSS_INDEX being the case
+    that broke on 2026-08-14.
+    """
+    import hashlib as _h
+    parts = [f"w={int(width)}",
+             f"xidx={int(bool(getattr(config, 'META_CROSS_INDEX', False)))}",
+             f"news={int(bool(getattr(config, 'NEWS_FEED_META', False)))}"]
+    return _h.sha1("|".join(parts).encode()).hexdigest()[:10]
+
+
 def fit_gbm(perday: list[tuple], min_train: int,
             oof_out: dict | None = None,
             model_path: Path | None = None) -> dict | None:
@@ -497,6 +515,14 @@ def fit_gbm(perday: list[tuple], min_train: int,
             # loudly — LightGBM will happily score garbage. Record the width and
             # refuse a mismatch at serving.
             "x_dim": int(X.shape[1]),
+            # v9.9.34: the SCHEMA, not just the width. CONFIG_HASH cannot
+            # catch this — META_CROSS_INDEX is hash-EXCLUDED (correctly: it
+            # is a serving knob) yet it appends 3 peer columns, so X went
+            # 61 -> 64 on 2026-08-14 with the hash unchanged, the day caches
+            # untouched, and a 61-feature artifact still on disk. The result
+            # was a LightGBMError per evaluation. A model must describe the
+            # feature world it was fitted in, independently of the hash.
+            "x_schema": _x_schema(int(X.shape[1])),
             "model_bytes": _bst_bytes,
             "oof_spread_p05_p95": round(_spread, 5),
             "auc_raw": (None if _auc_raw != _auc_raw
@@ -582,10 +608,46 @@ def _raw_score(meta: dict, x: np.ndarray) -> float | None:
     # LightGBMError instead of degrading. Ask the BOOSTER how wide it is: it is
     # authoritative, present for every artifact old or new, and cannot drift
     # from the model it describes.
-    try:
-        _bwidth = int(bst.num_feature())
-    except Exception:                                      # noqa: BLE001
-        _bwidth = 0
+    # Ask every way the object might answer. `num_feature()` is a raw
+    # lgb.Booster method; a sklearn LGBMClassifier exposes `n_features_in_`
+    # and hides the booster behind `booster_`. When the artifact is the
+    # sklearn form, num_feature() raises, _bwidth falls to 0, the guard below
+    # is skipped by `if _want and ...`, and the LightGBMError surfaces from
+    # predict() instead — per evaluation, thousands of lines.
+    _bwidth = 0
+    for _probe in ("num_feature", "n_features_in_", "num_features"):
+        try:
+            _v = getattr(bst, _probe, None)
+            _v = _v() if callable(_v) else _v
+            if _v:
+                _bwidth = int(_v)
+                break
+        except Exception:                                  # noqa: BLE001
+            continue
+    if not _bwidth:
+        try:
+            _bwidth = int(bst.booster_.num_feature())
+        except Exception:                                  # noqa: BLE001
+            _bwidth = 0
+    # SCHEMA FIRST. The width check below catches 61-vs-64; this catches the
+    # harder case — same width, different layout — which no shape check can
+    # see and which would score silently against the wrong columns.
+    _have_sch = str(meta.get("x_schema") or "")
+    if _have_sch:
+        _now_sch = _x_schema(int(_xa.size))
+        if _have_sch != _now_sch:
+            _k2 = ("schema", _have_sch, _now_sch)
+            if time.time() - _XDIM_WARNED.get(_k2, 0.0) > float(
+                    getattr(config, "XDIM_REMIND_S", 900)):
+                _XDIM_WARNED[_k2] = time.time()
+                log.error("META SCHEMA MISMATCH: artifact was trained under "
+                          "layout %s, the builder now emits %s (width %d, "
+                          "META_CROSS_INDEX=%s). Refusing to score — a model "
+                          "fed the wrong columns produces a confident number "
+                          "about nothing. Re-run the forge.", _have_sch,
+                          _now_sch, int(_xa.size),
+                          bool(getattr(config, "META_CROSS_INDEX", False)))
+            return None
     _want = int(meta.get("x_dim") or 0) or _bwidth
     if _want and int(_want) != int(_xa.size):
         # THROTTLED. This fires on EVERY evaluation — several per second, per
@@ -612,6 +674,15 @@ def _raw_score(meta: dict, x: np.ndarray) -> float | None:
     except Exception as e:                                 # noqa: BLE001
         # Belt to the guard's braces. Nothing in the serving path may take the
         # brain down; a scoring failure degrades to "no meta opinion".
+        _ek = ("predict", str(e)[:60])
+        if time.time() - _XDIM_WARNED.get(_ek, 0.0) > float(
+                getattr(config, "XDIM_REMIND_S", 900)):
+            _XDIM_WARNED[_ek] = time.time()
+            log.error("META ARTIFACT UNUSABLE (%s). Throttled: this runs per "
+                      "evaluation and un-throttled it buries the session log.",
+                      e)
+        return None
+    if False:
         log.error("meta scoring failed (%s) — returning None so the gate "
                   "falls back to the conviction bar", e)
         return None

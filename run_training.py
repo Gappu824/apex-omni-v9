@@ -291,6 +291,8 @@ STEPS = [
     # above it, it measures and only fits if the measurement clears. No
     # switch to flip, no date to remember.
     ("payoff",      "tools/payoff_study.py",            False, None),
+    ("episode",     "tools/episode_study.py",           False, None),
+    ("seq",         "tools/seq_study.py",               False, None),
     # v9.9.33: the 2x2 A/B of the day plan and range gate. Also in the
     # weekly chain; here too so a nightly operator sees the evidence
     # accumulate instead of waiting for Saturday. Idempotent and cached —

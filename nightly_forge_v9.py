@@ -455,6 +455,13 @@ def reward_fn(prem_idx: dict, ts: float, direction: int) -> float:
 # deployed system. Emits ("sec", t, ts) every replayed second and
 # ("signal", dict) for every entry that clears the SAME gates live applies.
 # ====================================================================
+# v9.9.37: set to a list while _gen_meta_samples runs, so the replay loop
+# appends one approach window per signal in the SAME order the feature rows
+# are built. A module global rather than a run() parameter because other
+# tools drive run() and must keep their existing signature.
+_SEQWIN = None
+
+
 class _Replayer:
     def __init__(self, con, day: str, meta, cal, funnel=None, collect_ref=None):
         from collections import deque
@@ -631,6 +638,25 @@ class _Replayer:
                                 break
                         except Exception:                  # noqa: BLE001
                             _econ = None
+                # v9.9.37: the APPROACH WINDOW, captured HERE because this
+                # is the only place the replayer's per-second arrays and the
+                # signal instant coexist. Reconstructing it later would mean
+                # a second data path that could drift from the one the
+                # grader prices labels on.
+                if _SEQWIN is not None:
+                    try:
+                        from core import approach_window as _AW
+                        _wtok = None
+                        try:
+                            _rr = self.mapper.hierarchy(
+                                idx, spot, "CE" if conv > 0 else "PE")
+                            _wtok = int(_rr[0]["token"]) if _rr else None
+                        except Exception:              # noqa: BLE001
+                            _wtok = None
+                        _wnd = _AW.extract(self, t, _wtok, idx)
+                        _SEQWIN.append((idx, t, _wnd))
+                    except Exception as _we:           # noqa: BLE001
+                        _SEQWIN.append((idx, t, None))
                 if on_signal is not None:
                     on_signal(idx, {"t": t, "ts": ts, "conv": conv, "wp": wp,
                                     "direction": "CE" if conv > 0 else "PE",
@@ -733,6 +759,8 @@ def _gen_meta_samples(con, day: str):
     Returns (X, Y, W, R): features, win labels, uniqueness weights, drift rows.
     Affordability uses the static Kelly budget on the ASK we would pay (the
     label-time sizer, as before; the GRADER uses the dynamic governor)."""
+    global _SEQWIN
+    _SEQWIN = []      # one approach window per emitted sample, same order
     RET = []   # v10: barrier P&L per sample
     ECON = []  # v9.9: (entry_ask, tp, sl, lot) per sample — the payoff
     #            geometry the label was graded on; meta_gate_replay prices
@@ -883,9 +911,12 @@ def train_meta(con, days: list[str]):
     # replay and no join to the shadow ledger. Writing it costs one file.
     try:
         import numpy as _np
-        _Xs, _rets, _risks, _days, _ws = [], [], [], [], []
+        _Xs, _rets, _risks, _days, _ws, _tsec = [], [], [], [], [], []
+        _wins, _win_ok = [], 0
         for _d in days:
             _x, _y, _w, _r, _ret, _ec = _gen_meta_samples_cached(con, _d)
+            # windows come back in emission order from the same replay
+            _dw = list(globals().get("_SEQWIN") or [])
             for _i in range(len(_x)):
                 try:
                     _ea, _tp, _sl, _lot = _ec[_i]
@@ -894,7 +925,17 @@ def train_meta(con, days: list[str]):
                     continue
                 if _risk <= 0:
                     continue
+                from core import approach_window as _AW
+                _wnd = (_dw[_i][2] if _i < len(_dw) else None)
+                if _wnd is None:
+                    _wnd = _AW.empty()
+                else:
+                    _win_ok += 1
+                _wins.append(_wnd)
                 _Xs.append(_x[_i]); _rets.append(float(_ret[_i]))
+                # session-second, so core/episode_ranker can enforce real
+                # non-overlap instead of guessing from row order
+                _tsec.append(float(_r[_i]) if _i < len(_r) else float(_i))
                 _risks.append(_risk); _days.append(_d); _ws.append(float(_w[_i]))
         if _Xs:
             _mp = config.STATE_DIR / "meta_train_matrix.npz"
@@ -910,6 +951,11 @@ def train_meta(con, days: list[str]):
                       config_hash=_np.asarray([config.CONFIG_HASH]))
             import os as _os
             _os.replace(_tmp, _mp)
+            try:
+                from core import approach_window as _AW2
+                _AW2.summarise(_win_ok, len(_Xs), log)
+            except Exception:                              # noqa: BLE001
+                pass
             log.info("payoff matrix published: %d row(s) x %d feature(s) "
                      "over %d day(s) -> %s", len(_Xs),
                      _np.asarray(_Xs).shape[1], len(set(_days)), _mp)
