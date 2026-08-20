@@ -264,6 +264,17 @@ def main():
         "asymmetry_fade_minus_into": {
             "mean": round(float(diff.mean()), 6),
             "ci90": [round(ci_lo, 6), round(ci_hi, 6)],
+            # THE CI BELOW IS COMPUTED OVER SECONDS, NOT DAYS.
+            # 40 030 granted seconds across 11 event days are not 40 030
+            # observations. On 2026-08-14 this read [-0.000151, -0.000132]
+            # — a width of 2e-5 resting on 11 independent days, which is the
+            # pooled-second inflation that produced the phantom directional
+            # edge in July. The SIGN (into_wall 0.586 vs fade_to_pin 0.413)
+            # is the finding; the interval is not. Read `edge_confirmed` as
+            # "the sign is consistent", never as "significant at 90%".
+            "n_independent_days": n_days,
+            "ci_basis": "seconds (autocorrelated) — NOT day-clustered; the "
+                        "interval is optimistic by roughly sqrt(DEFF)",
             "edge_confirmed": edge_real},
         "polarity": polarity,
         "polarity_meaning": pol_word,

@@ -938,6 +938,7 @@ def train_meta(con, days: list[str]):
                 _tsec.append(float(_r[_i]) if _i < len(_r) else float(_i))
                 _risks.append(_risk); _days.append(_d); _ws.append(float(_w[_i]))
         if _Xs:
+            from core import approach_window as _AW3
             _mp = config.STATE_DIR / "meta_train_matrix.npz"
             _mp.parent.mkdir(parents=True, exist_ok=True)
             _tmp = _mp.with_suffix(".tmp.npz")
@@ -948,6 +949,19 @@ def train_meta(con, days: list[str]):
                       ret=_np.asarray(_rets, _np.float64),
                       risk=_np.asarray(_risks, _np.float64),
                       day=_np.asarray(_days), w=_np.asarray(_ws, _np.float64),
+                      # v9.9.41: `t` and `seq` were COLLECTED above and then
+                      # never written. episode_study fell back to row order,
+                      # so ts=arange(1953) with a 3600s collapse rule kept
+                      # exactly ONE row per session — 31 "independent
+                      # episodes" from 31 days — and both the episode ranker
+                      # and the sequence model reported "not yet measurable"
+                      # for weeks while the data sat in memory unsaved.
+                      t=_np.asarray(_tsec, _np.float64),
+                      # (n, W, C) float16 approach windows, row-aligned with
+                      # X so the sequence model and the snapshot model
+                      # describe the SAME samples.
+                      seq=_np.asarray(_wins, _np.float16),
+                      seq_channels=_np.asarray(list(_AW3.CHANNELS)),
                       config_hash=_np.asarray([config.CONFIG_HASH]))
             import os as _os
             _os.replace(_tmp, _mp)
@@ -2144,7 +2158,15 @@ def _meta_cache_path(day: str):
 
 def _meta_samples_stamp() -> str:
     h = f"|h{int(_HOLD_OVERRIDE_S)}" if _HOLD_OVERRIDE_S else ""
-    return (f"{_data_stamp()}:{_decision_stamp()}") + "|ret1" + h
+    # "|ret1" is the PUBLICATION SCHEMA marker and it must be bumped
+    # whenever _gen_meta_samples' outputs change shape. It was not bumped
+    # when the approach window and session-second were added, so every day
+    # cache-hit, _gen_meta_samples never ran, _SEQWIN was never populated,
+    # and the matrix shipped without `t` or `seq`. episode_study then read
+    # ts=arange() and collapsed 1953 rows to exactly 31 — one per session —
+    # while reporting it as "independent episodes". Bumping to seq1 forces
+    # ONE rebuild; after that the stamp is stable again.
+    return (f"{_data_stamp()}:{_decision_stamp()}") + "|ret1seq1" + h
 
 
 def _meta_cache_fresh(day: str) -> bool:

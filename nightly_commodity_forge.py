@@ -334,7 +334,20 @@ def main():
                  "heuristic-only. Keep harvesting.")
         return
     from core import meta_gbm as MG
-    out = MG.fit_gbm(perday, min_train)
+    # v9.9.41: WRITE TO OUR OWN BOOSTER FILE.
+    # fit_gbm defaults model_path to MODEL_DIR/meta_gbm.txt — the EQUITY
+    # production booster. The commodity forge promotes (AUC 0.5979) while
+    # equity is refused (0.5015), so every night this overwrote the file
+    # the equity artifact describes. On 2026-08-19 the brain loaded equity
+    # metadata (n=1901, holdout_acc 0.7449, expecting 10 266 bytes) beside a
+    # 6 676-byte COMMODITY booster and raised BOOSTER MISMATCH.
+    # The guard caught it, so nothing was mis-scored — but a research or
+    # sibling process silently corrupting a production artifact is the
+    # failure mode, not the symptom. fit_gbm records model_file=mpath.name,
+    # so the commodity artifact now points at its own file and the two
+    # cannot collide again.
+    out = MG.fit_gbm(perday, min_train,
+                     model_path=config.MODEL_DIR / "commodity_meta_gbm.txt")
     if out is None:
         # AUDIT (2026-07-24 log): this line asserted a CAUSE it cannot know and
         # got it wrong the first night the positives guard fired — it printed

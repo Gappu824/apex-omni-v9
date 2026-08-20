@@ -158,6 +158,26 @@ def _fl_day_worker(day: str):
                 _FL_ART["cal"] = F._eval_cal()
             except Exception:                              # noqa: BLE001
                 _FL_ART["cal"] = {}
+        # v9.9.41 CHEAP PRE-FILTER. A fast-lane entry REQUIRES conviction
+        # at or above FAST_LANE_CONVICTION. core.signal_stream already holds
+        # every signal's conviction for this session at no cost, so a day
+        # whose maximum |conv| never reaches the bar CANNOT produce a
+        # qualifying entry and does not need a full replay.
+        # The 2026-08-18 run graded all 40 sessions in 22 802 s (6.3 h) to
+        # find NINE qualifying entries. This skips only days that are
+        # provably empty — it can never hide an entry, because the bar is a
+        # necessary condition checked against the same conviction the
+        # grading path would compute.
+        try:
+            from core import signal_stream as _SS
+            _st = _SS.load(day)
+            if _st is not None and len(_st):
+                import numpy as _np
+                _bar = float(getattr(config, "FAST_LANE_CONVICTION", 0.8))
+                if float(_np.abs(_st.conv).max()) < _bar:
+                    return []          # provably no qualifying entry
+        except Exception:                                  # noqa: BLE001
+            pass                       # no stream -> fall through and grade
         rows: list[dict] = []
         con = _sq.connect(str(config.DB_PATH))
         try:

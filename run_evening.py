@@ -42,7 +42,8 @@ from pathlib import Path
 
 # ---- dependency groups (order within a group is start order only) ----
 GROUPS = [
-    ("prime",     False, ["tools/prime_day_caches.py"]),
+    ("prime",     False, ["tools/prime_day_caches.py",
+                          "tools/prime_signal_streams.py"]),
     ("evidence",  True,  ["tools/cascade_harness.py",
                           "tools/shortvol_harness.py",
                           "tools/butterfly_harness.py",

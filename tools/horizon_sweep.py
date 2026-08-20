@@ -71,28 +71,67 @@ OVERRIDE = config.STATE_DIR / "horizon_override.json"
 REPORT = config.LOG_DIR / "horizon_sweep_{d}.json"
 
 
-def _samples_at(con, days, hold_min: int):
-    """Regenerate the vault's labels at `hold_min` minutes. Caches are
-    keyed on the override, so this neither reads nor writes production
-    sample caches."""
+def _samples_worker(args):
+    """One (day, hold) unit, in its own process.
+
+    v9.9.40: `_samples_at` looped over days SERIALLY, and the loop is run
+    once PER HORIZON — the sample cache is keyed on |h{hold}, so every
+    horizon regenerates all 40 sessions from scratch. On the 2026-08-16
+    chain this step was still walking the vault 26 hours in, at 11-12
+    minutes per session, while gate_ab_study and entry_bar_study had
+    finished in under two hours each by reading the shared stream.
+
+    The hold override is a MODULE-LEVEL global in nightly_forge_v9, so it
+    must be set inside the worker — setting it in the parent does not
+    cross a spawn boundary, and a worker that inherited the default would
+    silently label at 60 minutes while the caller believed it was
+    measuring 20. That is the same class of failure as the day-plan knob
+    in cascade_harness: a global that looks set and is not.
+    """
+    day, hold_min = args
+    import sqlite3 as _sq
     import nightly_forge_v9 as F
+    con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
     F.set_hold_override(int(hold_min) * 60)
     try:
-        perday, Y, W, SD = [], [], [], []
-        for d in days:
-            try:
-                X, y_, w_, _r, _ret, _e = F._gen_meta_samples_cached(con, d)
-            except Exception as e:                         # noqa: BLE001
-                log.warning("    %s: sample generation failed (%s)", d, e)
-                continue
-            if not X:
-                continue
-            perday.append((d, X, y_, w_))
-            Y += list(y_); W += list(w_); SD += [d] * len(X)
-        return perday, np.asarray(Y, float), np.asarray(W, float), \
-            np.asarray(SD)
+        X, y_, w_, _r, _ret, _e = F._gen_meta_samples_cached(con, day)
+        if not X:
+            return None
+        return (day, list(X), list(y_), list(w_))
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("    %s @ %dm: sample generation failed (%s)", day,
+                    hold_min, e)
+        return None
     finally:
-        F.set_hold_override(None)          # ALWAYS restore, even on error
+        # ALWAYS restore, even on error: a leaked override would poison
+        # every later call in this process.
+        F.set_hold_override(None)
+        try:
+            con.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
+def _samples_at(con, days, hold_min: int):
+    """Regenerate the vault's labels at `hold_min` minutes, across the pool.
+
+    Caches are keyed on the override, so this neither reads nor writes the
+    production sample caches.
+    """
+    from core.parallel_days import map_days
+    res = map_days(_samples_worker, [(d, int(hold_min)) for d in days],
+                   desc=f"horizon {hold_min}m", log_every=5)
+    perday, Y, W, SD = [], [], [], []
+    for r in res:
+        if not r:
+            continue
+        d, X, y_, w_ = r
+        perday.append((d, X, y_, w_))
+        Y += list(y_)
+        W += list(w_)
+        SD += [d] * len(X)
+    return perday, np.asarray(Y, float), np.asarray(W, float), \
+        np.asarray(SD)
 
 
 def _evaluate(hold_min: int, perday, Y, W, SD) -> dict | None:
@@ -240,9 +279,19 @@ def main() -> int:
             else:
                 log.info("  %3d min: n=%-5d base %.3f | AUC %.4f "
                          "(CI90 lo %.4f) | p=%.4f | MDE %.3f | %.0fs",
-                         h, r["n"], r["base_rate"], r["auc"],
-                         r["auc_ci90_lo"], r["p_one_sided"], r["mde_auc"],
-                         r["secs"])
+                         # .get, not []. A per-horizon row that took an
+                         # early-return path carries no "mde_auc", and on
+                         # 2026-08-14 the KeyError killed the tool after
+                         # 33 944s — so the stale a5b65c350f artifact kept
+                         # being served into gemma's digest as if current.
+                         # A REPORTING line must never be able to destroy
+                         # the result it is reporting.
+                         h, r.get("n", 0), r.get("base_rate", float("nan")),
+                         r.get("auc", float("nan")),
+                         r.get("auc_ci90_lo", float("nan")),
+                         r.get("p_one_sided", float("nan")),
+                         r.get("mde_auc", float("nan")),
+                         r.get("secs", 0.0))
     finally:
         con.close()
 

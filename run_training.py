@@ -269,6 +269,11 @@ def _readiness() -> tuple[bool, list[str]]:
 
 STEPS = [
     ("prime",       "tools/prime_day_caches.py",        False, None),
+    # v9.9.39: build every session's decision-loop stream ONCE, in the
+    # pool, before any study needs it. Without this the first study to
+    # run pays for all 40 inside its own serial section while the others
+    # re-derive the same answer beside it.
+    ("streams",     "tools/prime_signal_streams.py",    False, None),
     ("idx_calib",   "tools/nightly_calibration.py",     False,
      fresh_index_calibration),
     ("cmdty_daily", "tools/commodity_backfill.py",      False,

@@ -162,12 +162,48 @@ def _range_fn(spot_by_t, cache):
     return fn
 
 
+def _study_day_worker(args):
+    """ONE session, four arms, in its own process.
+
+    v9.9.39: this was a serial `for d in days` loop and cost 46 448 s
+    (12.9 h) on 2026-08-14 while entry_bar_study re-replayed the SAME 40
+    sessions alongside it. Two changes: the sessions now run across the
+    pool, and the per-second decision loop is served from
+    core.signal_stream, so a second study of the same tape pays for the
+    arrays only — not for 67 500 policy forward passes per session.
+    """
+    day, = args
+    import sqlite3 as _sq
+    from nightly_forge_v9 import _eval_meta, _eval_cal
+    from core.heuristic_policy import HeuristicPolicy
+    con = _sq.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    try:
+        meta, cal = _eval_meta(), _eval_cal()
+        pol = HeuristicPolicy()
+
+        def decide(obs, frame, iidx):
+            return float(pol.predict(frame)[2 * iidx])
+
+        def actions_fn(_o, _f):
+            return pol.predict(_f)
+
+        return study_day(con, day, decide, meta, cal, actions_fn)
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("  %s skipped (%s)", day, e)
+        return None
+    finally:
+        try:
+            con.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
 def study_day(con, day, decide, meta, cal, actions_fn=None) -> dict | None:
-    from nightly_forge_v9 import _Replayer
+    from core import signal_stream as SS
     from simulation.scenario_engine import N
 
-    rep = _Replayer(con, day, meta, cal)
-    if not getattr(rep, "ok", False):
+    stream, rep = SS.build(con, day, decide, meta, cal, actions_fn)
+    if stream is None or not getattr(rep, "ok", False):
         return None
 
     from tools.entry_bar_study import make_adapters
@@ -175,13 +211,24 @@ def study_day(con, day, decide, meta, cal, actions_fn=None) -> dict | None:
 
     curfew = _PlanSim()._t("DAYPLAN_EXIT_HM", "15:05")
     bar = float(config.entry_conviction_bar())
+    # v9.9.42: this read `rep.spot`, which does not exist — the attribute is
+    # `spot_hist`. So spot_by_t was always empty, _range_fn always returned
+    # (True, ""), and the range arm never gated ANYTHING. Combined with the
+    # empty last_tick above, the 2026-08-18 study reported 0 trades in all
+    # four arms and called it "indistinguishable". Two silent failures
+    # stacking into a confident-looking null is exactly what these studies
+    # exist to prevent, so it is worth naming: an arm that measures nothing
+    # must not be reportable as an arm that measured no effect.
     spot_by_t: dict[str, np.ndarray] = {}
     for idx in config.TRADABLE:
-        s = getattr(rep, "spot", None)
-        if isinstance(s, dict):
-            s = s.get(idx)
-        if s is not None:
-            spot_by_t[idx] = np.asarray(s, float)
+        sh = (rep.spot_hist or {}).get(idx)
+        if sh is not None and len(sh):
+            spot_by_t[idx] = np.asarray(list(sh), float)
+    if not spot_by_t:
+        log.warning("  %s: no spot history — the range arm cannot gate and "
+                    "would be identical to the incumbent by accident. "
+                    "Session dropped rather than reported as a null.", day)
+        return None
     rcache: dict = {}
     rfn = _range_fn(spot_by_t, rcache)
 
@@ -194,16 +241,22 @@ def study_day(con, day, decide, meta, cal, actions_fn=None) -> dict | None:
     sw.add_arm("range_gate", bar, range_fn=rfn)
     sw.add_arm("both", bar, day_plan=_PlanSim(), range_fn=rfn)
 
-    def _hook(idx, ctx):
-        sw.offer(Signal(t=int(ctx["t"]), index=idx, conv=float(ctx["conv"]),
-                        wp=float(ctx.get("wp") or 0),
-                        spot=float(ctx.get("spot") or 0)))
-
-    last = 0
-    for ev in rep.run(decide, on_signal=_hook, actions_fn=actions_fn):
-        if ev and ev[0] == "sec":
-            last = int(ev[1])
-            sw.mark(last)
+    # Drive the arms from the CACHED stream. Signals are replayed in
+    # emission order and the book is marked every second between them, so
+    # each arm sees exactly the sequence the live loop would have — the
+    # pairing that makes this a paired test is unaffected.
+    last, si, n_sig = 0, 0, len(stream)
+    sig_t = stream.t
+    end = min(int(stream.n_sec), N - 1)
+    for sec in range(end + 1):
+        while si < n_sig and int(sig_t[si]) == sec:
+            sw.offer(Signal(t=sec, index=str(stream.idx[si]),
+                            conv=float(stream.conv[si]),
+                            wp=float(stream.wp[si]),
+                            spot=float(stream.spot[si])))
+            si += 1
+        sw.mark(sec)
+        last = sec
     sw.finish(min(last, N - 1))
     s = sw.summary(curfew)
     log.info("  %s | %s", day, " | ".join(
@@ -290,15 +343,35 @@ def main() -> int:
             "FROM ticks_v9")})
         if a.days > 0:
             days = days[-a.days:]
-        for d in days:
-            try:
-                s = study_day(con, d, decide, meta, cal, actions_fn)
-                if s and all(x in s for x in ARMS):
-                    per_day[d] = s
-            except Exception as e:                         # noqa: BLE001
-                log.warning("  %s skipped (%s)", d, e)
+    except Exception as e:                                 # noqa: BLE001
+        log.error("could not list sessions (%s)", e)
+        con.close()
+        return 1
     finally:
         con.close()
+
+    from core.parallel_days import map_days
+    from core import signal_stream as SS
+    SS.purge_stale()
+    _res = map_days(_study_day_worker, [(d,) for d in days],
+                    desc="gate A/B (4 arms/session)", log_every=2)
+    for _d, _s in zip(days, _res):
+        if _s and all(x in _s for x in ARMS):
+            per_day[_d] = _s
+
+    # AN EMPTY STUDY IS NOT A NULL RESULT. On 2026-08-18 every arm returned
+    # 0 trades and the report read "indistinguishable (could resolve Rs0)" —
+    # a verdict with no evidence behind it, which is worse than an error
+    # because it looks like an answer.
+    _tot_trades = sum(int(per_day[d][a]["n_trades"])
+                      for d in per_day for a in ARMS if a in per_day[d])
+    if per_day and _tot_trades == 0:
+        log.error("ALL ARMS TOOK ZERO TRADES over %d session(s). That is a "
+                  "plumbing failure, not a null result — the incumbent arm "
+                  "alone took 91 trades on 2026-08-15. Check that the signal "
+                  "stream restored last_tick and spot_hist onto the "
+                  "replayer. NO verdict written.", len(per_day))
+        return 1
 
     v = analyse(per_day)
     if not v.get("ok"):

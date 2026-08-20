@@ -91,7 +91,10 @@ if HAVE and len(X)>=8:
         _i = [(k + _d) % len(X) for k in range(len(X))]
         perday.append((f"2026-07-{_d+1:02d}", [X[k] for k in _i],
                        [Y[k] for k in _i], [W[k] for k in _i]))
-    out = MG.fit_gbm(perday, min_train=8)
+    # A VALIDATOR must never be able to touch a served artifact.
+    import tempfile as _tf
+    _scratch = Path(_tf.mkdtemp()) / "validate_gbm.txt"
+    out = MG.fit_gbm(perday, min_train=8, model_path=_scratch)
     check("fit_gbm trains on commodity samples", out is not None and out.get("engine")=="gbm",
           f"n={out and out.get('n')}")
     if out:
@@ -116,7 +119,8 @@ else:
           f"trainer fail-open path exercised instead")
     from core import meta_gbm as MG
     check("fit_gbm fail-open returns None (no fake model)",
-          MG.fit_gbm([(ds,X,Y,W)], min_train=10**9) is None)
+          MG.fit_gbm([(ds,X,Y,W)], min_train=10**9,
+                     model_path=_scratch) is None)
 
 os.remove(db)
 print("\n"+"="*58)

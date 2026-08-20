@@ -150,6 +150,7 @@ def _sweep_day_worker(args):
     so the worker builds its own, the same way _cascade_day_worker does.
     """
     day, bars, N = args
+    bars = list(bars)          # back to a list for the sweep
     import sqlite3 as _sq
     from nightly_forge_v9 import _Replayer, _eval_meta, _eval_cal
     from core.heuristic_policy import HeuristicPolicy
@@ -182,10 +183,13 @@ def sweep_day(con, day, decide, meta, cal, bars, actions_fn=None) -> dict:
     from nightly_forge_v9 import _Replayer
     from simulation.scenario_engine import N
 
-    rep = _Replayer(con, day, meta, cal)
+    from core import signal_stream as SS
+    stream, rep = SS.build(con, day, decide, meta, cal, actions_fn)
     if not getattr(rep, "ok", False):
         raise RuntimeError("no day cache — run the forge's _prepare_cache "
                            "first")
+    if stream is None:
+        raise RuntimeError("no signal stream")
     chain_fn, quote_fn = make_adapters(rep)
     curfew = _curfew_t()
     sw = BarSweep(bars, chain_fn, quote_fn, session_n=N, curfew_t=curfew,
@@ -204,11 +208,19 @@ def sweep_day(con, day, decide, meta, cal, bars, actions_fn=None) -> dict:
                         ts=float(ctx.get("ts") or 0),
                         dte=float(ctx.get("dte") or 9.0)))
 
-    last_t = 0
-    for ev in rep.run(decide, on_signal=_hook, actions_fn=actions_fn):
-        if ev and ev[0] == "sec":
-            last_t = int(ev[1])
-            sw.mark(last_t)
+    # Fed from the SHARED stream: the decision loop ran once for this
+    # session, in whichever study reached it first.
+    last_t, si, n_sig = 0, 0, len(stream)
+    end = min(int(stream.n_sec), N - 1)
+    for sec in range(end + 1):
+        while si < n_sig and int(stream.t[si]) == sec:
+            _hook(str(stream.idx[si]),
+                  {"t": sec, "conv": float(stream.conv[si]),
+                   "wp": float(stream.wp[si]),
+                   "spot": float(stream.spot[si])})
+            si += 1
+        sw.mark(sec)
+        last_t = sec
     sw.finish(min(last_t, N - 1))
     s = sw.summary(curfew)
     log.info("  %s: %s", day, " | ".join(
@@ -286,7 +298,16 @@ def main() -> int:
 
     from core.parallel_days import map_days
     from simulation.scenario_engine import N as _N
-    _res = map_days(_sweep_day_worker, [(d, bars, _N) for d in days],
+    # TUPLE, not list. core/parallel_days.map_days stores results as
+    # out[unit], so the work unit must be HASHABLE. On 2026-08-14 this was
+    # (day, [0.2, 0.25, ...], 22500) — a tuple containing a list — and every
+    # one of the 40 days completed its full replay and then raised
+    # "unhashable type: 'list'" on the assignment. 59 494 seconds of correct
+    # computation, discarded at the last line, reported only as "day
+    # skipped". The most expensive class of bug there is: it does the work,
+    # loses it, and looks like a data problem.
+    _res = map_days(_sweep_day_worker,
+                    [(d, tuple(bars), _N) for d in days],
                     desc="entry bar sweep", log_every=2)
     for _d, _o in zip(days, _res):
         if _o is None:
@@ -302,6 +323,18 @@ def main() -> int:
         log.info("only %d usable session(s) — nothing to conclude",
                  len(per_day))
         return 0
+
+    # Same guard as gate_ab: a sweep in which no bar took a trade has
+    # measured nothing. Reporting it as a flat grid would be a verdict with
+    # no evidence behind it.
+    _tt = sum(int(v["n_trades"]) for d in per_day for v in per_day[d].values()
+              if isinstance(v, dict) and "n_trades" in v)
+    if per_day and _tt == 0:
+        log.error("EVERY bar took ZERO trades over %d session(s) — a "
+                  "plumbing failure, not a flat grid. Check that the signal "
+                  "stream restored last_tick onto the replayer. NO verdict.",
+                  len(per_day))
+        return 1
 
     v = EBS.evaluate(per_day, n_boot=int(getattr(config, "ENTRY_BAR_BOOT",
                                                  20000)))
