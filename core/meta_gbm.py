@@ -205,6 +205,58 @@ def serve_spread(scores, y, w, cap: int = 4000, probe: int = 1500,
 
 
 
+def _embed_booster(mpath) -> dict:
+    """Read the booster text and package it for the artifact.
+
+    zlib + base64 because the LightGBM text format compresses ~5x and a
+    10 KB model becomes a couple of KB of JSON — small enough that carrying
+    it costs nothing and large enough that losing it costs everything.
+    sha256 over the RAW text, so a same-size corruption is caught where a
+    byte count would miss it.
+    """
+    import base64
+    import hashlib
+    import zlib
+    try:
+        raw = Path(mpath).read_bytes()
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("could not embed the booster (%s) — the artifact will "
+                    "fall back to the external file and remains vulnerable "
+                    "to a sibling overwrite", e)
+        return {}
+    return {"b64": base64.b64encode(zlib.compress(raw, 6)).decode("ascii"),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "raw_bytes": len(raw)}
+
+
+def _extract_booster(meta: dict):
+    """The embedded model text, verified. None if absent or corrupt.
+
+    Verification is not ceremony: the whole point of embedding is that the
+    served model is provably the one the artifact describes, and an
+    unverified extract would just move the drift inside the file.
+    """
+    import base64
+    import hashlib
+    import zlib
+    b64 = meta.get("booster_b64")
+    if not b64:
+        return None
+    try:
+        raw = zlib.decompress(base64.b64decode(b64))
+    except Exception as e:                                 # noqa: BLE001
+        log.error("embedded booster failed to decompress (%s) — refusing "
+                  "to fall back to the external file, which is exactly the "
+                  "path that produced the mismatch this design removes", e)
+        return False
+    want = str(meta.get("booster_sha256") or "")
+    if want and hashlib.sha256(raw).hexdigest() != want:
+        log.error("embedded booster FAILED its sha256 — the artifact is "
+                  "corrupt. Refusing to serve.")
+        return False
+    return raw.decode("utf-8", errors="strict")
+
+
 def _x_schema(width: int) -> str:
     """Fingerprint of the FEATURE LAYOUT the artifact was trained on.
 
@@ -508,7 +560,22 @@ def fit_gbm(perday: list[tuple], min_train: int,
         _bst_bytes = mpath.stat().st_size
     except Exception:                                      # noqa: BLE001
         _bst_bytes = -1
+    # ---- v9.9.43: EMBED THE MODEL IN THE ARTIFACT.
+    # The artifact and the booster were TWO FILES with no atomic binding, so
+    # they could desynchronise for many reasons — a sibling process writing
+    # the shared default path, a partial write, a crash between the two
+    # writes, one restored from backup. `model_bytes` was the only tie, and
+    # a byte count is a weak one: it collides trivially and cannot see
+    # same-size corruption at all.
+    # A model that lives INSIDE its own artifact cannot drift from it. One
+    # file, one atomic replace, one content hash. The .txt is still written
+    # for debuggability but it is no longer the source of truth, so nothing
+    # that overwrites it can change what gets served.
+    _emb = _embed_booster(mpath)
     return {"engine": "gbm", "model_file": mpath.name,
+            "booster_b64": _emb.get("b64"),
+            "booster_sha256": _emb.get("sha256"),
+            "booster_raw_bytes": _emb.get("raw_bytes"),
             # AUDIT (2026-07-28): the artifact never recorded how WIDE its
             # x-vector was. Enabling cross-index peer features takes x from 61
             # to 64, and a 61-dim booster fed a 64-dim vector does not fail
@@ -579,20 +646,37 @@ def _raw_score(meta: dict, x: np.ndarray) -> float | None:
     key = (str(mpath), _mt)
     bst = _BOOSTERS.get(key)
     if bst is None:
-        _want = meta.get("model_bytes")
-        if _want and _want > 0:
-            try:
-                _have = mpath.stat().st_size
-            except Exception:                              # noqa: BLE001
-                _have = -1
-            if _have != _want:
-                log.warning("BOOSTER MISMATCH: %s is %s bytes but the artifact "
-                            "was written against %s. The served model is NOT "
-                            "the one this artifact describes — re-run the "
-                            "forge. (A research tool that fits a model must "
-                            "pass model_path to avoid overwriting this file.)",
-                            mpath.name, _have, _want)
-        bst = lgb.Booster(model_file=str(mpath))
+        # PREFER THE EMBEDDED MODEL. It cannot have drifted from the
+        # artifact because it IS the artifact.
+        _txt = _extract_booster(meta)
+        if _txt is False:
+            return None                       # corrupt: refuse, never guess
+        if _txt:
+            bst = lgb.Booster(model_str=_txt)
+        else:
+            # LEGACY artifact with no embedded model. Keep the byte check —
+            # but REFUSE on mismatch instead of warning and serving anyway.
+            # The old code logged "The served model is NOT the one this
+            # artifact describes" and then loaded it on the very next line,
+            # so every session since 2026-08-14 scored against a booster the
+            # metadata did not describe while the log said so plainly. A
+            # guard that detects a fault and proceeds is worse than no
+            # guard: it produces the audit trail of a system that is
+            # protected, and the behaviour of one that is not.
+            _want = meta.get("model_bytes")
+            if _want and _want > 0:
+                try:
+                    _have = mpath.stat().st_size
+                except Exception:                          # noqa: BLE001
+                    _have = -1
+                if _have != _want:
+                    log.error("BOOSTER MISMATCH: %s is %s bytes, artifact "
+                              "says %s. REFUSING to serve — the gate falls "
+                              "back to the conviction bar. Re-run the forge "
+                              "to write a self-contained artifact.",
+                              mpath.name, _have, _want)
+                    return None
+            bst = lgb.Booster(model_file=str(mpath))
         _BOOSTERS.clear()          # only ever one live model; don't leak
         _BOOSTERS[key] = bst
     # AUDIT (2026-07-28): x_dim guard. My first attempt anchored on a line that

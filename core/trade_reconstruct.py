@@ -69,8 +69,14 @@ log = logging.getLogger("trade_reconstruct")
 
 # Events that OPEN and CLOSE, per book. The sign is the direction of the
 # position the event creates, not the direction of the order.
+# v9.9.44: SPREAD_OPEN is SHORT premium, not long.
+# core/shortvol.py writes `price: sp.credit` and
+# `direction: SHORT_{side}_SPREAD` — the structure is sold, so the book is
+# short. Mapping it to +1 made every spread a long trade, which is why the
+# 2026-08-21 reconstruction read "long 210 / short 0" while 90 of those 210
+# were credit spreads. A butterfly is a DEBIT structure and stays +1.
 _OPEN_EVENTS = {"BUY_FILL": +1, "SELL_FILL": -1,
-                "FLY_OPEN": +1, "SPREAD_OPEN": +1}
+                "FLY_OPEN": +1, "SPREAD_OPEN": -1}
 _CLOSE_EVENTS = {"FLY_CLOSE", "SPREAD_CLOSE"}
 _KIND_OF = {"BUY_FILL": "SINGLE", "SELL_FILL": "SINGLE",
             "FLY_OPEN": "FLY", "FLY_CLOSE": "FLY",
@@ -164,14 +170,36 @@ def day_of(ts: float) -> str:
 def split_legs(symbol: str, side: int) -> list[Leg]:
     """Explode a composite multi-leg symbol into signed legs.
 
-    The butterfly writes wing_in + body x2 + wing_out. A long fly is long
-    the wings and SHORT the doubled body — the sign pattern is structural,
-    so it is derived here rather than parsed out of a string that does not
-    carry it.
+    TWO SEPARATORS, because the two books write different formats and this
+    function only ever knew one of them:
+
+      butterfly  "WING_IN+BODYx2+WING_OUT"        (core/butterfly.py:313)
+      shortvol   "SHORT_SYM/-LONG_SYM"            (core/shortvol.py:323)
+
+    Splitting on "+" alone meant a spread symbol never split at all: the
+    whole composite string was looked up as ONE instrument, found nothing,
+    and the trade carried token 0. On 2026-08-21 that silently excluded 90
+    of 210 trades — the entire spread book — from every path study, while
+    the log reported only "2 symbol/day pair(s) had no instrument
+    snapshot", because 2 was the number of DISTINCT composite strings, not
+    the number of trades they cost.
+
+    The "/-" marks the leg that is SHORT relative to the structure, which
+    is information the "+" format carries positionally (the doubled body of
+    a long fly is its short leg) and the "/-" format carries in the
+    separator itself.
     """
-    parts = [p for p in str(symbol).split("+") if p]
+    s = str(symbol)
+    if "/-" in s:
+        # shortvol: first leg is short-the-structure, second is long
+        parts = [p for p in s.split("/-") if p]
+        if len(parts) < 2:
+            return [Leg(symbol=s, side=side, mult=1)]
+        return [Leg(symbol=parts[0], side=side, mult=1),
+                Leg(symbol=parts[1], side=-side, mult=1)]
+    parts = [p for p in s.split("+") if p]
     if len(parts) <= 1:
-        return [Leg(symbol=str(symbol), side=side, mult=1)]
+        return [Leg(symbol=s, side=side, mult=1)]
     legs: list[Leg] = []
     for p in parts:
         m = _LEG_RE.match(p)
@@ -367,9 +395,20 @@ def reconstruct(ledger_path: Path | str | None = None,
                                    "qty": lot.qty, "ts": lot.ts})
     if own_resolver:
         if resolver.misses:
-            log.warning("%d symbol/day pair(s) had no instrument snapshot — "
-                        "token unresolved (e.g. %s)", len(resolver.misses),
-                        sorted(resolver.misses)[:3])
+            # BY TRADE, not by distinct string. The old line reported "2
+            # symbol/day pair(s)" for a failure that cost 90 TRADES — the
+            # count was of unique composite strings, which made a 43% data
+            # loss look like a rounding error.
+            _bad = [x for x in out.trades if not x.resolved]
+            _kinds: dict = {}
+            for x in _bad:
+                _kinds[x.kind] = _kinds.get(x.kind, 0) + 1
+            log.warning("%d symbol/day pair(s) unresolved -> %d TRADE(S) "
+                        "(%.0f%% of %d) excluded from every path study %s. "
+                        "e.g. %s", len(resolver.misses), len(_bad),
+                        100.0 * len(_bad) / max(len(out.trades), 1),
+                        len(out.trades), _kinds,
+                        sorted(resolver.misses)[:2])
         resolver.close()
     return out
 

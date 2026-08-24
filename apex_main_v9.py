@@ -489,9 +489,28 @@ def main():
             slot = int(time.time()) // step
             cur = _range_state.get(idx)
             if cur is None or cur[0] != slot:
-                hist = list(spot_secs.get(idx, ()) or ())
-                if len(hist) < 900:
-                    return True, ""          # too early to refuse anything
+                # spot_full, NOT spot_secs: see the declaration above for
+                # why 1800 samples make this gate arithmetically dead.
+                hist = list(spot_full.get(idx, ()) or ())
+                _need = 3 * max(getattr(_RR, "HORIZONS_S", (5400,)))
+                _agree = int(getattr(config, "RANGE_MIN_AGREE", 2))
+                _usable = sum(1 for _h in getattr(_RR, "HORIZONS_S", ())
+                              if len(hist) >= max(3 * _h, 60))
+                if _usable < _agree:
+                    # Not "allow" as a decision — allow because the question
+                    # cannot yet be asked. Logged once per index per session
+                    # so an operator can see the gate is dormant rather than
+                    # permissive.
+                    _k = ("range_warmup", idx)
+                    if _k not in _range_state:
+                        _range_state[_k] = True
+                        log.info("range gate %s: %d/%d horizon(s) usable at "
+                                 "%d sample(s) — dormant until %d samples "
+                                 "(~%.1f h into the session). It is not "
+                                 "allowing signals, it is unable to judge "
+                                 "them yet.", idx, _usable, _agree,
+                                 len(hist), _need, _need / 3600.0)
+                    return True, ""
                 import numpy as _np
                 a = _RR.assess(_np.asarray(hist, float))
                 _range_state[idx] = (slot, _RR.may_trade_directional(a), a)
@@ -605,6 +624,24 @@ def main():
     from core.quant_core import EWMAVol
     rvol: dict[str, EWMAVol] = {i: EWMAVol() for i in config.INDICES}
     realized_vol_ann: dict[str, float] = {}
+    # v9.9.45: a FULL-SESSION spot series for the range gate.
+    # spot_secs is deque(maxlen=1800) and must stay that way — the
+    # persistence checks (lines 1862, 2203) and the ER/chop filters want
+    # recent tape, and a longer buffer would change what they measure.
+    # But core.range_regime's longest horizon is 5400s and a horizon q
+    # needs 3q samples, so 1800 supports EXACTLY ONE horizon (300s) while
+    # RANGE_MIN_AGREE=2 requires two to agree. The verdict is therefore
+    # unreachable: n_range can never exceed 1.
+    # That is the same defect that made gate_ab_study's range arm
+    # byte-identical to the incumbent across 41 sessions with MDE Rs0 — an
+    # arm that could not fire, reported as an arm that found no effect.
+    # Had RANGE_GATE_ENABLED been armed in production it would have allowed
+    # every signal, indistinguishable from having no gate at all, and
+    # nothing in the funnel would have said so.
+    # A session is ~23 400 seconds; one float32 per second per index is
+    # ~280 KB for the day.
+    spot_full: dict[str, deque] = {i: deque(maxlen=26000)
+                                   for i in config.TRADABLE}
     spot_secs: dict[str, deque] = {i: deque(maxlen=1800)
                                    for i in config.TRADABLE}
     # ---- v9.1.2 DECISION CADENCE state: the harvester writes the ring once
@@ -1332,6 +1369,7 @@ def main():
             # byte-identical to the forge grader's _Replayer) ================
             if decide_now:
                 spot_secs[idx].append(spot)
+                spot_full[idx].append(spot)      # range gate: whole session
                 if spot > 0 and idx in rvol:
                     rvol[idx].update(spot, dt_s=1.0)
                     realized_vol_ann[idx] = rvol[idx].annualized()

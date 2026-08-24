@@ -1413,6 +1413,13 @@ NEWS_FEED_META_WORLD      = "fw_news_v1"   # the FEATURE_WORLD value that
                                            # column may enter X
 
 RANGE_GATE_ENABLED        = False
+# The variance-ratio horizons. A horizon q needs 3q samples, so the grid
+# sets when the gate can first reach a verdict:
+#   (300,900,1800,3600,5400) -> fully usable 16 200s = 13:45  (too late:
+#                               the day plan commits at 09:50)
+#   (120,300,600,900,1800)   -> fully usable  5 400s = 10:45
+# Hash-excluded: this changes WHEN a gate can speak, never what a feature is.
+RANGE_HORIZONS_S          = (120, 300, 600, 900, 1800)
 RANGE_Z_ALPHA             = 1.96   # two-sided 5% on the robust z
 RANGE_MIN_AGREE           = 2
 RANGE_ASSESS_EVERY_S      = 300    # re-assess this often. The variance ratio
@@ -1770,7 +1777,8 @@ _HASH_EXCLUDE = frozenset({
     "CAS_BOOK_ENABLED", "CAS_CAPITAL_FRAC", "CAS_MAX_ENTRIES", "GAP_FDR_Q",
     "NEWS_ENABLED", "NEWS_TILT_COMMIT", "NEWS_MODEL",
     "NEWS_FEED_META", "NEWS_FEED_META_WORLD",
-    "RANGE_GATE_ENABLED", "RANGE_Z_ALPHA", "RANGE_MIN_AGREE",
+    "RANGE_GATE_ENABLED", "RANGE_HORIZONS_S", "RANGE_Z_ALPHA",
+    "RANGE_MIN_AGREE",
     "RANGE_ASSESS_EVERY_S",
     "DAYPLAN_ENABLED", "DAYPLAN_ANALYSIS_END_HM", "DAYPLAN_ENTRY_HM",
     "DAYPLAN_COMMIT_END_HM", "DAYPLAN_REVIEW_HM", "DAYPLAN_EXIT_HM",

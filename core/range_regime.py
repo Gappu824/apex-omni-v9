@@ -82,10 +82,28 @@ import config
 
 log = logging.getLogger("range_regime")
 
-# Pre-registered horizons, in seconds. Chosen to bracket the hold budget:
-# the shortest is scalp-scale, the longest exceeds MAX_HOLD_MINUTES so a
-# 60-minute position is judged on a window at least as long as itself.
-HORIZONS_S = (300, 900, 1800, 3600, 5400)
+# Pre-registered horizons, in seconds. Read from config so the grid is a
+# measurable choice rather than a constant nobody can A/B.
+#
+# WHY THE DEFAULT MOVED FROM (300, 900, 1800, 3600, 5400):
+# a horizon q needs 3q samples, so the old grid was not fully usable until
+# 16 200 s — 13:45, four and a half hours into the session. The day plan
+# commits at 09:50. A gate that cannot reach a verdict until long after the
+# decision it is meant to inform is not a conservative gate, it is an
+# absent one, and its `range_bound: 0` looks identical to a market that
+# never went sideways.
+#
+# (120, 300, 600, 900, 1800) is fully usable at 5400 s — 10:45 — and still
+# spans the position: a 60-minute hold is largely determined by the tape's
+# behaviour over the preceding half hour, which the 1800 s horizon covers.
+#
+# THE TRADE-OFF, STATED: shorter horizons are estimable sooner but each is
+# estimated on fewer non-overlapping windows relative to its own q, so the
+# individual z-scores are noisier. That is what RANGE_MIN_AGREE is for —
+# requiring several horizons to concur is precisely the defence against a
+# single noisy one, and it matters more with this grid than the old one.
+HORIZONS_S = tuple(getattr(config, "RANGE_HORIZONS_S",
+                           (120, 300, 600, 900, 1800)))
 
 TRENDING, RANDOM, RANGE = "TRENDING", "RANDOM_WALK", "RANGE_BOUND"
 

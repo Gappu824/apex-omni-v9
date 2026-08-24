@@ -935,7 +935,22 @@ def train_meta(con, days: list[str]):
                 _Xs.append(_x[_i]); _rets.append(float(_ret[_i]))
                 # session-second, so core/episode_ranker can enforce real
                 # non-overlap instead of guessing from row order
-                _tsec.append(float(_r[_i]) if _i < len(_r) else float(_i))
+                # THE SESSION-SECOND COMES FROM _SEQWIN, NOT FROM `_r`.
+                # `_r` is the 4th return of _gen_meta_samples and it is the
+                # DRIFT ROWS — a 2-D array, one row per sample (docstring:
+                # "features, win labels, uniqueness weights, drift rows").
+                # float() on a row raises "only 0-dimensional arrays can be
+                # converted to Python scalars", and because the whole
+                # publication sits in a try/except, that ONE LINE silently
+                # killed it every night from 2026-08-14: no `t`, no `seq`,
+                # and no matrix refresh at all. episode_study then fell back
+                # to row order and collapsed 1953 rows into 31 "independent
+                # episodes" — one per session — for weeks, while reporting
+                # it as a sample-size problem.
+                # _SEQWIN already carries (index, session_second, window) in
+                # emission order, so the clock was there the whole time.
+                _tsec.append(float(_dw[_i][1]) if _i < len(_dw)
+                             else float(_i))
                 _risks.append(_risk); _days.append(_d); _ws.append(float(_w[_i]))
         if _Xs:
             from core import approach_window as _AW3
@@ -974,8 +989,16 @@ def train_meta(con, days: list[str]):
                      "over %d day(s) -> %s", len(_Xs),
                      _np.asarray(_Xs).shape[1], len(set(_days)), _mp)
     except Exception as _e:                                # noqa: BLE001
-        log.warning("payoff matrix not published (%s) — the meta path is "
-                    "unaffected; only the R-target study is skipped", _e)
+        # ERROR, not warning, and it names the consequence. This failed
+        # every night from 2026-08-14 on a one-line float() bug while the
+        # message read "only the R-target study is skipped" — so three
+        # studies sat reporting "not yet measurable" and nobody looked
+        # here. A publication that silently produces nothing must shout.
+        log.error("PAYOFF MATRIX NOT PUBLISHED (%s). episode_study, "
+                  "seq_study and payoff_study all read this file; without "
+                  "it they report 'not yet measurable' FOREVER, and that "
+                  "is a plumbing failure, not a sample-size finding.",
+                  _e, exc_info=True)
     # DRIFT REFERENCE — the ALL-TICK feature world of the training pool. Built
     # BEFORE the sample-count gate below (v9.1.2 fix): the reference has NO
     # dependency on the meta model — it is the population the live monitor

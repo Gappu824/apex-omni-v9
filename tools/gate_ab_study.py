@@ -219,16 +219,39 @@ def study_day(con, day, decide, meta, cal, actions_fn=None) -> dict | None:
     # stacking into a confident-looking null is exactly what these studies
     # exist to prevent, so it is worth naming: an arm that measures nothing
     # must not be reportable as an arm that measured no effect.
+    # THE FULL SESSION SPOT, NOT THE 1800s DEQUE.
+    # rep.spot_hist is deque(maxlen=1800) — by design, the live loop only
+    # needs recent tape. But range_regime's longest horizon is 5400s and a
+    # horizon q needs 3q samples, so 1800 supports EXACTLY ONE horizon
+    # (300s). RANGE_MIN_AGREE=2 then makes the verdict unreachable: n_range
+    # could never exceed 1. That is why the range arm was byte-identical to
+    # the incumbent across all 41 sessions with MDE Rs0 — not "no effect",
+    # but an arm that could not fire by arithmetic.
+    # signal_stream.spot_series carries one value per SECOND for the whole
+    # session, which is what a 5400s horizon requires.
     spot_by_t: dict[str, np.ndarray] = {}
-    for idx in config.TRADABLE:
-        sh = (rep.spot_hist or {}).get(idx)
-        if sh is not None and len(sh):
-            spot_by_t[idx] = np.asarray(list(sh), float)
+    try:
+        for k, name in enumerate(stream.spot_idx):
+            ser = np.asarray(stream.spot_series[k], float)
+            if np.isfinite(ser).sum() >= 3 * max(RR.HORIZONS_S):
+                spot_by_t[str(name)] = ser
+            elif np.isfinite(ser).sum() > 0:
+                spot_by_t[str(name)] = ser      # partial: fewer horizons
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("  %s: no spot series on the stream (%s)", day, e)
     if not spot_by_t:
         log.warning("  %s: no spot history — the range arm cannot gate and "
                     "would be identical to the incumbent by accident. "
                     "Session dropped rather than reported as a null.", day)
         return None
+    _longest = 3 * max(RR.HORIZONS_S)
+    _short = [k for k, v in spot_by_t.items()
+              if int(np.isfinite(v).sum()) < _longest]
+    if _short:
+        log.info("  %s: %s have <%d samples, so the longest horizons are "
+                 "unavailable and the gate needs %d agreeing among fewer",
+                 day, _short, _longest, config.RANGE_MIN_AGREE)
+
     rcache: dict = {}
     rfn = _range_fn(spot_by_t, rcache)
 
