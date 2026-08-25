@@ -327,14 +327,41 @@ def main() -> int:
     # Same guard as gate_ab: a sweep in which no bar took a trade has
     # measured nothing. Reporting it as a flat grid would be a verdict with
     # no evidence behind it.
-    _tt = sum(int(v["n_trades"]) for d in per_day for v in per_day[d].values()
-              if isinstance(v, dict) and "n_trades" in v)
-    if per_day and _tt == 0:
+    #
+    # v9.9.17 — READ `detail`, NOT `per_day`. This guard was lifted from
+    # gate_ab_study, where per_day[d][arm] IS the full summary dict. Here it
+    # is not: sweep_day returns ({bar: pnl}, summary) and main() splits them,
+    # so per_day[d].values() are bare FLOATS. `isinstance(v, dict)` was
+    # therefore False for every element, the generator yielded nothing, and
+    # sum(()) == 0 — the guard evaluated TRUE unconditionally on every run
+    # with >=3 usable sessions. On 2026-08-21 and 2026-08-23 it aborted a
+    # completed 41-session sweep (108 min and 152 min respectively) that had
+    # taken 113+ trades, discarding the verdict, the Westfall-Young
+    # permutation and the report JSON at the last line. Identical failure
+    # mode to the 2026-08-14 'unhashable type' bug documented above: does the
+    # work, loses it, reports it as a data problem.
+    #
+    # The `isinstance` filter is what made it silent — it swallowed the type
+    # mismatch that would otherwise have raised TypeError on the first day.
+    # A guard that cannot tell "no trades" from "wrong container" is not a
+    # guard, so the shape is now asserted rather than filtered.
+    _bad = [d for d in detail for v in detail[d].values()
+            if not isinstance(v, dict) or "n_trades" not in v]
+    if _bad:
+        log.error("summary shape changed — detail[%s] does not carry "
+                  "n_trades. Refusing to infer a trade count from it; fix "
+                  "BarSweep.summary() or this guard. NO verdict.", _bad[0])
+        return 1
+    _tt = sum(int(v["n_trades"]) for d in detail for v in detail[d].values())
+    if detail and _tt == 0:
         log.error("EVERY bar took ZERO trades over %d session(s) — a "
                   "plumbing failure, not a flat grid. Check that the signal "
                   "stream restored last_tick onto the replayer. NO verdict.",
-                  len(per_day))
+                  len(detail))
         return 1
+    log.info("sweep took %d trade(s) across %d session(s) and %d policy "
+             "book(s) — guard clear", _tt, len(detail),
+             len(next(iter(detail.values()))) if detail else 0)
 
     v = EBS.evaluate(per_day, n_boot=int(getattr(config, "ENTRY_BAR_BOOT",
                                                  20000)))

@@ -462,8 +462,23 @@ _RANDOM_RATE = 0.002    # the random reference offers ~1 candidate per 500s
 def _max_slots(curfew_t: int, hold_s: int, cooldown_s: int) -> int:
     """The hard ceiling on trades per session. This is the number that makes
     'lower the bar to get more trades' false: it does not depend on the bar
-    at all."""
-    return max(int(curfew_t // max(hold_s + cooldown_s, 1)), 1)
+    at all.
+
+    v9.9.17 — count entry START opportunities, not COMPLETED slots. An entry
+    is legal at any t <= curfew; the slot it occupies may run past curfew and
+    be closed by the guillotine. With a 21000s window and a 3780s slot the
+    starts are 0, 3780, 7560, 11340, 15120, 18900 — SIX, the last one 2100s
+    inside the window. The old `win // slot` returned 5 and the 2026-08-21
+    and 2026-08-23 sweeps then printed "AT MOST 5 TRADE(S) PER SESSION, at
+    ANY bar" as their headline while their own books took 6 on 92 book-days.
+    The claim the tool exists to make was contradicted by the tool's own
+    output on the same screen.
+
+    Only the printed ceiling was wrong; the books were right to allow the
+    sixth entry, so no sweep result changes. The reframing argument is
+    unaffected — 6 is still a hard bar-independent cap.
+    """
+    return max(int(curfew_t // max(hold_s + cooldown_s, 1)), 0) + 1
 
 
 def _live_equivalent_spec(name: str) -> PolicySpec:
