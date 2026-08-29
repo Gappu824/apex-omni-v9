@@ -156,9 +156,40 @@ def main() -> int:
                 continue
             mv = float(seg.max() - seg.min())
             if mv <= 0.0:
+                # v9.9.18 — DIAGNOSED. tools/post_auction_probe.py compared
+                # 15:35-15:40 against a 14:00-14:05 control across 7 sessions
+                # and 84 session-token pairs on 2026-08-26:
+                #
+                #   equity index   42/42 pairs  CAS distinct=1, CTL distinct=249
+                #   MCX (open)     34/35 pairs  CAS distinct=8,  CTL distinct=16
+                #   _VIX            7/7  pairs  CAS distinct=14, CTL distinct=7
+                #
+                # Write cadence is IDENTICAL in both windows (0.26s) and the
+                # CAS window holds MORE rows than the control (924 vs 898), so
+                # nothing is being carried or invented — the arrivals are real.
+                # MCX and _VIX come down the SAME socket through the SAME
+                # harvester and keep moving, which rules out a timer and rules
+                # out the harvester.
+                #
+                # The broker keeps STREAMING the equity index after the 15:30
+                # cash close with the LTP frozen at the closing value. The
+                # harvester records ~924 genuine tick arrivals carrying one
+                # unchanging number, `last_tick` advances on every one, and
+                # every arrival-based freshness test therefore says "live".
+                #
+                # THIS WINDOW IS NOT OBSERVABLE FROM THE STREAMED INDEX. No
+                # code change makes the number appear; the exchange stops
+                # computing it. A post-auction move can only come from the
+                # official close/auction print or from constituent prints.
+                # Refusing remains correct — but say WHY, so this is not
+                # re-diagnosed every night.
                 log.warning("  %s: %d real tick(s) but range is EXACTLY 0.00 "
                             "— a disseminated index does not hold one value "
-                            "for five minutes. Treating as no data.",
+                            "for five minutes. Treating as no data. "
+                            "DIAGNOSED (v9.9.18): the feed streams the index "
+                            "FROZEN after the 15:30 cash close — arrivals are "
+                            "real, the value is not. Re-confirm any time with "
+                            "`python tools/post_auction_probe.py --days 8`.",
                             day, int(seg.size))
                 degenerate += 1
                 continue

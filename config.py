@@ -1496,6 +1496,20 @@ SHADOW_PROMOTE_HOLDOUT    = 0.30  # last 30% of days held out; sign must agree
 # 60-min guillotine and a 180s cooldown caps the session at ~5 trades. The
 # bar cannot buy volume; it only chooses WHICH ~5 slots get filled. Every
 # report from core.entry_bar_store leads with that arithmetic.
+# v9.9.18 — replicates of the RANDOM_SLOT reference in the entry-bar and
+# gate A/B sweeps. RANDOM is a Monte-Carlo estimate of the random-policy
+# mean; one draw carries a sampling error that was 5.4x the incumbent-to-
+# oracle span it is used to bracket. Averaging R books cuts that error by
+# sqrt(R). R=8 is chosen against measured cost: with the chain-walk memo in
+# core/entry_counterfactual._affordable it projects entry_bar_study at ~77
+# min against today's 103.9, so the replication is paid for out of the memo's
+# saving and the step still gets FASTER. Larger R buys little now that
+# `beats_random` is a paired test — the day-to-day SD of (incumbent - random)
+# is ~Rs2,300/session, so the floor's own Monte-Carlo term is second-order.
+# MEASUREMENT ONLY — excluded from CONFIG_HASH so changing it can never
+# trigger a cache rebuild.
+ENTRY_RANDOM_REPLICATES = 8
+
 ENTRY_BAR_GRID = (0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55,
                   0.60, 0.65, 0.70, 0.75, 0.80, 0.85)
 ENTRY_BAR_ALPHA          = 0.05   # family-wise alpha on the max statistic
@@ -1971,6 +1985,13 @@ _HASH_EXCLUDE = frozenset({
     "FLY_MIN_HOLD_BEFORE_DISP_S", "DISP_MIN_MINUTES_LEFT",
     "DISP_CONV_MARGIN", "DISP_CONV_MARGIN_STRONG", "DISP_ER_MIN",
     "DISP_CAND_SUSTAIN_S", "DISP_FLY_PROGRESS_MAX",
+    # v9.9.18 — MEASUREMENT ONLY. The number of RANDOM_SLOT replicates
+    # averaged by core/entry_counterfactual.BarSweep changes the precision
+    # of a REFERENCE, never a trading decision: no book, gate or exit reads
+    # it. _compute_config_hash includes every public UPPERCASE constant by
+    # default, so leaving it out here would rotate CONFIG_HASH and trigger a
+    # full 12-hour cache rebuild for a knob that cannot move a trade.
+    "ENTRY_RANDOM_REPLICATES",
 })
 
 # names ending in any of these are filesystem locations / log toggles → excluded

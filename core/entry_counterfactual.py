@@ -79,6 +79,12 @@ ORACLE = "ORACLE_TOPK"
 RANDOM = "RANDOM_SLOT"
 
 
+def _rand_rep(i: int) -> str:
+    """Internal name of one RANDOM_SLOT replicate. summary() collapses these
+    back into a single RANDOM entry, so no caller ever sees them."""
+    return f"{RANDOM}#{i:02d}"
+
+
 @dataclass
 class Signal:
     """One second's candidate, exactly as the replayer produced it."""
@@ -179,7 +185,8 @@ class BarSweep:
                  curfew_t: int | None = None,
                  session_n: int | None = None,
                  costs_fn=None, seed: int = 0,
-                 include_reference: bool = True):
+                 include_reference: bool = True,
+                 n_random: int | None = None):
         self.chain_fn = chain_fn
         self.quote_fn = quote_fn
         self.capital = float(capital if capital is not None
@@ -190,7 +197,28 @@ class BarSweep:
         self.session_n = int(session_n or 22500)
         self.curfew_t = int(curfew_t if curfew_t is not None
                             else self.session_n)
-        self.rng = np.random.default_rng(seed)
+        # v9.9.18 — RANDOM_SLOT is a MONTE-CARLO ESTIMATE, so it gets
+        # replicates. One draw is one sample of the random-policy mean, and
+        # its sampling error was swamping the quantity it exists to bound:
+        # across the 2026-08-21/23/25 runs — same tape, same 41 sessions,
+        # same incumbent Rs-519.9 every time — the floor printed Rs-510.6,
+        # Rs-770.6 and Rs-745.6. A Rs260 swing on a reference used to judge
+        # a Rs47.8 incumbent-to-oracle span, i.e. 5.4x the effect. The
+        # `selection_beats_random` gate is `incumbent_mean > random_mean`,
+        # so it read FAIL on 2026-08-21 and PASS on the other two from
+        # nothing but the draw.
+        #
+        # Averaging R independent books cuts that standard error by sqrt(R):
+        # R=16 leaves a quarter of it. Each replicate has its OWN generator
+        # spawned from the same root, so the streams are provably
+        # independent (numpy SeedSequence.spawn) rather than merely
+        # differently-seeded.
+        self.n_random = int(n_random if n_random is not None
+                            else getattr(config, "ENTRY_RANDOM_REPLICATES", 16))
+        _ss = np.random.SeedSequence(int(seed))
+        self._rngs = [np.random.default_rng(c)
+                      for c in _ss.spawn(max(self.n_random, 1))]
+        self.rng = self._rngs[0]          # back-compat for any other caller
         if costs_fn is None:
             try:
                 from core.execution_engine import round_trip_costs
@@ -206,10 +234,14 @@ class BarSweep:
         self._arm_mode = False
         self.reference = include_reference
         if include_reference:
-            self.books[RANDOM] = Book(name=RANDOM, bar=0.0)
+            for _i in range(max(self.n_random, 1)):
+                self.books[_rand_rep(_i)] = Book(name=_rand_rep(_i), bar=0.0)
             # ORACLE needs the whole day before it can choose, so it is not
             # a streaming book — it is resolved in finish().
         self._all_signals: list[Signal] = []
+        self._chain_memo: dict = {}
+        self._chain_hits = 0
+        self._chain_misses = 0
 
     def add_arm(self, name: str, bar: float, day_plan=None, range_fn=None
                 ) -> Book:
@@ -236,8 +268,12 @@ class BarSweep:
         for name, bk in self.books.items():
             if name == ORACLE:
                 continue
-            eligible = (sig.strength >= bk.bar if name != RANDOM
-                        else self.rng.random() < _RANDOM_RATE)
+            if name.startswith(RANDOM):
+                # each replicate draws from its OWN spawned stream
+                _i = int(name.rsplit("#", 1)[1]) if "#" in name else 0
+                eligible = self._rngs[_i].random() < _RANDOM_RATE
+            else:
+                eligible = sig.strength >= bk.bar
             if not eligible:
                 continue
             bk.offered += 1
@@ -288,12 +324,36 @@ class BarSweep:
 
     def _affordable(self, sig: Signal):
         """First rung that is quoted two-sided, inside the spread cap, and
-        that the capital can actually hold. The live first_affordable walk."""
+        that the capital can actually hold. The live first_affordable walk.
+
+        v9.9.18 — MEMOISED per (index, direction, t, spot). This walk is a
+        pure function of the tape: `chain_fn` reads the vault at a fixed
+        second, and the loop below only READS the rows (the winner is stored
+        on the book but never mutated — see _try_enter and mark()). Every
+        book in the sweep is offered the SAME signal at the SAME second, so
+        without a memo the bar grid, the arms and each RANDOM replicate each
+        pay for an identical vault walk.
+
+        This is what makes replication affordable. Measured on a 10k-signal
+        session, going from 1 to 16 RANDOM replicates raised chain walks
+        94 -> 162 (+72%), which projected to +75 min on entry_bar_study's
+        103.9. With the memo the extra replicates reuse walks the grid has
+        already paid for, and the BASELINE gets cheaper too.
+
+        The cache is per-BarSweep, so it is scoped to one session and dies
+        with it — no cross-day leakage, no unbounded growth.
+        """
+        key = (sig.index, sig.direction, int(sig.t), round(float(sig.spot), 2))
+        if key in self._chain_memo:
+            self._chain_hits += 1
+            return self._chain_memo[key]
         try:
             rows = self.chain_fn(sig.index, sig.spot, sig.direction, sig.t)
         except Exception as e:                             # noqa: BLE001
             log.debug("chain_fn failed (%s)", e)
+            self._chain_memo[key] = None
             return None
+        self._chain_misses += 1
         cap = float(getattr(config, "MAX_ENTRY_SPREAD_PCT", 0.10))
         for r in rows or []:
             b, a = float(r.get("bid") or 0), float(r.get("ask") or 0)
@@ -304,7 +364,9 @@ class BarSweep:
                 continue
             if a * int(r.get("lot") or 0) > self.capital:
                 continue
+            self._chain_memo[key] = r
             return r
+        self._chain_memo[key] = None
         return None
 
     # ---------------------------------------------------------------- mark
@@ -430,6 +492,10 @@ class BarSweep:
 
     # --------------------------------------------------------------- report
     def summary(self, window_s: int | None = None) -> dict:
+        """Per-book results. RANDOM_SLOT replicates are collapsed into ONE
+        averaged entry (with its standard error) so every consumer sees the
+        same key it always did — the replication is an implementation
+        detail of the estimate, not a new policy."""
         w = int(window_s or self.curfew_t)
         out = {}
         for name, bk in self.books.items():
@@ -453,6 +519,27 @@ class BarSweep:
                                                    "SHADOW_MIN_COVERAGE",
                                                    0.6))),
             }
+        reps = sorted(k for k in out if k.startswith(RANDOM + "#"))
+        if reps:
+            pnls = np.array([out[k]["pnl"] for k in reps], float)
+            ntr = np.array([out[k]["n_trades"] for k in reps], float)
+            se = (float(pnls.std(ddof=1) / np.sqrt(len(reps)))
+                  if len(reps) > 1 else 0.0)
+            agg = dict(out[reps[0]])
+            agg.update({
+                "bar": 0.0, "n_trades": int(round(float(ntr.mean()))),
+                "pnl": round(float(pnls.mean()), 2),
+                "replicates": len(reps),
+                # the sampling error of the FLOOR itself. Any comparison
+                # against RANDOM that is smaller than a couple of these is
+                # reading Monte-Carlo noise, and a caller can now see that.
+                "pnl_se": round(se, 2),
+                "pnl_min": round(float(pnls.min()), 2),
+                "pnl_max": round(float(pnls.max()), 2),
+            })
+            for k in reps:
+                out.pop(k)
+            out[RANDOM] = agg
         return out
 
 

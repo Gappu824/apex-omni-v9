@@ -67,6 +67,31 @@ CREATE TABLE IF NOT EXISTS spot_tokens (
 """
 
 _GAP_S = 5.0            # a spot silence longer than this counts as a feed gap
+# v9.9.18 — SILENCE AND FREEZE ARE DIFFERENT FAILURES.
+# _GAP_S catches a feed that stops ARRIVING. It cannot see a feed that keeps
+# arriving with a frozen VALUE, which is the failure tools/post_auction_probe.py
+# measured on 2026-08-26: across 7 sessions the equity index showed 42/42
+# session-token pairs with ONE distinct value in 15:35-15:40 while the same
+# harvester, same socket, same wall-clock window recorded MCX varying normally
+# (34/35) and _VIX varying normally (7/7). Write cadence was identical in both
+# windows (0.26s) and the frozen window held MORE rows than the control
+# (924 vs 898) — the arrivals were real, the value was not.
+#
+# That matters live, not only after the close: during an exchange HALT the
+# index freezes while the socket keeps streaming, and every arrival-based
+# freshness test in this system (`last_tick` + SHADOW_MAX_STALE_S) will read
+# "live" on a mark that has stopped moving.
+#
+# NOTE the asymmetry, because it is the whole reason this is spot-only: an
+# unchanged OPTION quote is not stale — a resting two-sided order is still
+# executable. An unchanged computed INDEX LEVEL over hundreds of prints means
+# the computation stopped. Freeze detection is correct for the second and
+# WRONG for the first, so it is applied to spot tokens only.
+#
+# This COUNTS and REPORTS. It does not gate. Wiring it to a trading gate is a
+# live-behaviour change and belongs to whoever can watch it on a real session.
+_FREEZE_S = 45.0        # spot LTP unchanged this long, while still arriving
+_FREEZE_MIN_TICKS = 30  # ... across at least this many arrivals
 _REPORT_EVERY_S = 60.0  # diagnostics JSON refresh cadence
 
 
@@ -79,7 +104,9 @@ class HarvestDiag:
             list(getattr(config, "HARVEST_COMMODITIES", []))
         self.per_idx: dict[str, dict] = {
             i: {"spot_ticks": 0, "leg_ticks": 0, "leg_oi_nonzero": 0,
-                "leg_depth_2sided": 0, "gap_count": 0, "max_gap_s": 0.0}
+                "leg_depth_2sided": 0, "gap_count": 0, "max_gap_s": 0.0,
+                "freeze_count": 0, "max_freeze_s": 0.0,
+                "freeze_ticks": 0}
             for i in _names}
         # AUDIT (2026-07-27): these counters RESET on every restart while
         # DailyReport(resume=True) resumed only the envelope. On 2026-07-24 the
@@ -115,9 +142,13 @@ class HarvestDiag:
         self.rows_flushed = 0
         self.flushes = 0
         self._last_spot_ts: dict[str, float] = {}
+        self._last_spot_px: dict[str, float] = {}
+        self._freeze_since: dict[str, float] = {}
+        self._freeze_ticks: dict[str, int] = {}
+        self._freeze_open: dict[str, bool] = {}
 
     def tick(self, role: tuple | None, now: float, oi: float,
-             bid: float, ask: float) -> None:
+             bid: float, ask: float, ltp: float = 0.0) -> None:
         if not role:
             return
         idx, leg, _ = role
@@ -137,6 +168,28 @@ class HarvestDiag:
                     if gap > d["max_gap_s"]:
                         d["max_gap_s"] = round(gap, 1)
             self._last_spot_ts[idx] = now
+            # ---- freeze: still arriving, but the value has stopped moving
+            if ltp and ltp > 0:
+                prev = self._last_spot_px.get(idx)
+                if prev is not None and ltp == prev:
+                    since = self._freeze_since.setdefault(idx, now)
+                    self._freeze_ticks[idx] = self._freeze_ticks.get(idx, 0) + 1
+                    held = now - since
+                    if (held >= _FREEZE_S
+                            and self._freeze_ticks[idx] >= _FREEZE_MIN_TICKS):
+                        # one EPISODE, however many arrivals it spans — the
+                        # flag is cleared the moment the value moves again
+                        if not self._freeze_open.get(idx):
+                            self._freeze_open[idx] = True
+                            d["freeze_count"] += 1
+                        if held > d["max_freeze_s"]:
+                            d["max_freeze_s"] = round(held, 1)
+                            d["freeze_ticks"] = int(self._freeze_ticks[idx])
+                else:
+                    self._freeze_since.pop(idx, None)
+                    self._freeze_ticks.pop(idx, None)
+                    self._freeze_open.pop(idx, None)
+                self._last_spot_px[idx] = ltp
         else:
             d["leg_ticks"] += 1
             if oi > 0:
@@ -439,7 +492,7 @@ class Harvester:
                           "iceberg": iceberg}
         self.vault.add((ts_ms, now_ms, tok, ltp, bid, ask, bq, aq,
                         vol_d, oi, iceberg))
-        self.diag.tick(self.token_role.get(tok), now, oi, bid, ask)
+        self.diag.tick(self.token_role.get(tok), now, oi, bid, ask, ltp)
 
     def _assemble_market(self) -> dict:
         market = {}

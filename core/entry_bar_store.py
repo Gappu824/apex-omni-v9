@@ -131,19 +131,87 @@ def evaluate(per_day: dict, incumbent: float | None = None,
     ref = {"incumbent_mean": _mean(inc_key), "oracle_mean": _mean(ORACLE),
            "random_mean": _mean(RANDOM)}
     span = ref["oracle_mean"] - ref["random_mean"]
+
+    def _paired(a, b):
+        """Day-paired difference a - b. Both arms replay the SAME sessions,
+        so the pairing is exact and the day is the unit of evidence."""
+        pr = {d: float(per_day[d][a] - per_day[d][b])
+              for d in days if a in per_day[d] and b in per_day[d]}
+        st = CL.paired_test(pr) if len(pr) >= 3 else {}
+        ci = st.get("ci90") or (None, None)
+        return st, ci, bool(ci[0] is not None and ci[0] > 0)
+
+    _st, _ci, _ = _paired(inc_key, RANDOM)
+    _st_span, _ci_span, _span_sig = _paired(ORACLE, RANDOM)
+    _st_head, _ci_head, _head_sig = _paired(ORACLE, inc_key)
+    ref["span_ci90"] = list(_ci_span) if _ci_span[0] is not None else None
+    ref["headroom_mean"] = float(_st_head.get("mean", float("nan")))
+    ref["headroom_ci90"] = list(_ci_head) if _ci_head[0] is not None else None
+    ref["headroom_p"] = float(_st_head.get("p", 1.0))
     # ORACLE_TOPK is perfect hindsight ON CONVICTION, not on outcome — it is
     # the ceiling of what ANY conviction threshold could reach. So span <= 0
     # is not a numerical edge case, it is a verdict: the highest-conviction
     # signals of the day do WORSE than randomly chosen ones. When that holds,
     # conviction is anti-selective over this sample and NO bar anywhere on
     # the grid can help — the score is the problem, not the threshold.
+    # anti_selective stays a POINT test on purpose: it is a red flag, not a
+    # promotion gate, and a flag should fire on suspicion rather than wait
+    # for significance. `span_ci90` is reported alongside so the reader can
+    # see how firmly the span is established (2026-08-25: +274, CI90
+    # [+10, +532], p 0.087 — positive, but only just).
     ref["anti_selective"] = bool(np.isfinite(span) and span <= 0)
+    ref["span_significant"] = bool(_span_sig)
     ref["headroom_frac"] = (float((ref["oracle_mean"] - ref["incumbent_mean"])
                                   / span) if np.isfinite(span) and span > 0
                             else float("nan"))
-    ref["beats_random"] = bool(ref["incumbent_mean"] > ref["random_mean"])
-    ref["near_oracle"] = bool(np.isfinite(ref["headroom_frac"])
-                              and ref["headroom_frac"] < 0.10)
+    # v9.9.18 — `beats_random` is now a PAIRED TEST, not a point comparison.
+    #
+    # The old form compared two means with no uncertainty attached, so it
+    # inherited every wobble in either. RANDOM_SLOT is a Monte-Carlo estimate
+    # and its seed was process-salted (fixed in v9.9.18), which alone made
+    # this gate read FAIL / PASS / PASS across the 2026-08-21/23/25 runs on
+    # the IDENTICAL tape while the incumbent sat at Rs-519.9 every time.
+    #
+    # Deterministic seeding stops the flip, but it does not make a point
+    # comparison a test. Both arms see the same 41 sessions, so the sessions
+    # pair exactly and the day-level difference is the estimand. On all three
+    # runs its 90% CI straddles zero (e.g. 2026-08-25: mean +226,
+    # CI90 [-74, +524]) — the day-to-day spread of (incumbent - random)
+    # genuinely dwarfs the mean gap. "Conviction selects better than random"
+    # was never supported at this sample size; the point comparison simply
+    # could not say so.
+    #
+    # `beats_random_point` is kept for continuity of the reported bracket.
+    ref["beats_random_point"] = bool(ref["incumbent_mean"]
+                                     > ref["random_mean"])
+    ref["vs_random_mean"] = float(_st.get("mean", float("nan")))
+    ref["vs_random_ci90"] = list(_ci) if _ci[0] is not None else None
+    ref["vs_random_p"] = float(_st.get("p", 1.0))
+    ref["beats_random"] = bool(_ci[0] is not None and _ci[0] > 0)
+    if ref["beats_random_point"] and not ref["beats_random"]:
+        log.info("incumbent is Rs%.0f/session above RANDOM on the point "
+                 "estimate, but the paired CI90 [%s] includes zero — that is "
+                 "'cannot tell', not 'conviction selects'.",
+                 ref["incumbent_mean"] - ref["random_mean"],
+                 ", ".join(f"{x:,.0f}" for x in _ci))
+    # v9.9.18 — `near_oracle` means "there is nothing left to capture, so
+    # moving the bar cannot pay". A point ratio cannot establish that either.
+    # `headroom_frac < 0.10` says the gap is small; a CI that includes zero
+    # says we cannot show there is a gap AT ALL, which is the same verdict
+    # reached more honestly. On 2026-08-25 the gap was Rs48/session with
+    # CI90 [-249, +330] (p 0.800) and the run reported "headroom 17% of the
+    # achievable span" as though that were a finding.
+    ref["near_oracle"] = bool(
+        (np.isfinite(ref["headroom_frac"]) and ref["headroom_frac"] < 0.10)
+        or not _head_sig)
+    if not _head_sig and np.isfinite(ref["headroom_frac"]):
+        log.info("headroom reads %.0f%% of the span on the point estimate, "
+                 "but ORACLE - incumbent is Rs%.0f/session with CI90 "
+                 "[%s] — no demonstrable headroom, so no bar on this grid "
+                 "can be shown to pay.", 100 * ref["headroom_frac"],
+                 ref["headroom_mean"],
+                 ", ".join(f"{x:,.0f}" for x in _ci_head)
+                 if _ci_head[0] is not None else "n/a")
 
     # ---- paired deltas, one vector per day across the candidate grid
     delta_by_day = {d: np.array([per_day[d][c] - per_day[d][inc_key]
